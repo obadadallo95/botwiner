@@ -247,6 +247,9 @@ app.get(["/healthz", "/api/healthz", "/api/health"], (_req, res) => {
   res.json({ status: "ok" });
 });
 
+import { checkExecutionFinished } from "./execution-checker.js";
+export { checkExecutionFinished };
+
 // Protected Session Status Check (requires auth)
 app.get("/api/sessions/status", requireAuth, async (_req, res) => {
   try {
@@ -262,6 +265,7 @@ app.get("/api/sessions/status", requireAuth, async (_req, res) => {
         lastHeartbeatAt?: string;
         startedAt?: string;
         status?: string;
+        executionName?: string | null;
         [key: string]: unknown;
       };
 
@@ -269,16 +273,36 @@ app.get("/api/sessions/status", requireAuth, async (_req, res) => {
         const hbTime = data.lastHeartbeatAt ? new Date(data.lastHeartbeatAt).getTime() : 0;
         const startTime = data.startedAt ? new Date(data.startedAt).getTime() : 0;
         const recentTime = Math.max(hbTime, startTime);
+        const isHeartbeatStale = now - recentTime >= 90_000;
 
-        if (now - recentTime < 90_000) {
+        if (!isHeartbeatStale) {
           active = true;
-          if (data.sessionId) {
-            const sDoc = await firestore.collection("researchSessions").doc(data.sessionId).get();
-            if (sDoc.exists) {
-              activeSession = { id: sDoc.id, ...sDoc.data() };
-            } else {
-              activeSession = data;
+        } else if (data.executionName) {
+          const execStatus = await checkExecutionFinished(executionsClient, data.executionName);
+          if (execStatus.finished) {
+            console.warn(`[API] Status check self-healing dead execution lock for ${data.sessionId} (${data.executionName})`);
+            await lockRef.delete();
+            if (data.sessionId) {
+              await firestore.collection("researchSessions").doc(data.sessionId).update({
+                status: "failed",
+                completedAt: new Date().toISOString(),
+                latestError: `Execution terminated (${execStatus.reason ?? "exit"}) with stale heartbeat`,
+              });
             }
+          } else {
+            active = true;
+          }
+        } else {
+          console.warn(`[API] Status check self-healing orphan lock without executionName for ${data.sessionId}`);
+          await lockRef.delete();
+        }
+
+        if (active && data.sessionId) {
+          const sDoc = await firestore.collection("researchSessions").doc(data.sessionId).get();
+          if (sDoc.exists) {
+            activeSession = { id: sDoc.id, ...sDoc.data() };
+          } else {
+            activeSession = data;
           }
         }
       }
@@ -472,6 +496,51 @@ app.post("/api/sessions/start", requireAuth, async (req, res) => {
     }
 
     const nowIso = new Date().toISOString();
+
+    // 0. Pre-check active lock for dead Cloud Run execution before transaction
+    const preLockDoc = await lockRef.get();
+    if (preLockDoc.exists) {
+      const preData = preLockDoc.data() as {
+        sessionId?: string;
+        lastHeartbeatAt?: string;
+        startedAt?: string;
+        status?: string;
+        executionName?: string | null;
+      };
+
+      if (preData.status === "starting" || preData.status === "running" || preData.status === "reconnecting") {
+        const hbTime = preData.lastHeartbeatAt ? new Date(preData.lastHeartbeatAt).getTime() : 0;
+        const startTime = preData.startedAt ? new Date(preData.startedAt).getTime() : 0;
+        const recentTime = Math.max(hbTime, startTime);
+        const now = Date.now();
+
+        if (now - recentTime >= 90_000) {
+          if (preData.executionName) {
+            const execStatus = await checkExecutionFinished(executionsClient, preData.executionName);
+            if (execStatus.finished) {
+              console.warn(`[API] Auto-clearing terminated execution lock ${preData.executionName} before session start`);
+              await lockRef.delete();
+              if (preData.sessionId) {
+                await firestore.collection("researchSessions").doc(preData.sessionId).update({
+                  status: "failed",
+                  completedAt: new Date().toISOString(),
+                  latestError: `Execution terminated (${execStatus.reason ?? "exit"}) with stale heartbeat`,
+                });
+              }
+            } else {
+              res.status(409).json({
+                error: `Active Cloud Run execution ${preData.executionName} is still running despite delayed heartbeat`,
+                sessionId: preData.sessionId,
+              });
+              return;
+            }
+          } else {
+            console.warn(`[API] Clearing stale orphan lock ${preData.sessionId} without executionName`);
+            await lockRef.delete();
+          }
+        }
+      }
+    }
 
     // 1. Atomic Concurrency Lock Check via Firestore Transaction
     await firestore.runTransaction(async (transaction) => {

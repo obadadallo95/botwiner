@@ -403,6 +403,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
   const controller = new AbortController();
   let stoppedBySignal = false;
   const failureState: { error: Error | undefined } = { error: undefined };
+  let storageShutdownError: unknown = null;
   let sequence = 0;
   const endpointLabel = options.endpointLabel;
   let writer: ResearchSink;
@@ -456,6 +457,10 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       durationSeconds: options.durationSeconds,
       onChunkRotated: (chunk) => {
         telemetryReporter?.updateChunkAndBytes(chunk.index, cloudSink?.getTotalCompressedBytes() ?? 0);
+      },
+      onTerminalError: (err) => {
+        console.error("[Collector] Terminal storage error callback triggered:", err);
+        fail(err);
       },
     });
     writer = cloudSink;
@@ -783,8 +788,15 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       telemetryReporter.updatePaperStats(paperTradingEngine.getStats());
       telemetryReporter.updateMarketParticipantStats(traderPnlTracker.getStats());
     }
+    storageShutdownError = null;
     const finalStatus = failureState.error === undefined && !stoppedBySignal ? "complete" : "aborted";
-    await writer.close(finalStatus);
+    try {
+      await writer.close(finalStatus);
+    } catch (storageErr) {
+      storageShutdownError = storageErr;
+      console.error("[Collector] Storage shutdown error:", storageErr);
+    }
+
     if (cloudSink !== null) {
       try {
         await cloudSink.uploadDerivedSummary("paper-trading-summary", paperTradingEngine.getStats());
@@ -793,14 +805,29 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         console.warn("[Collector] Failed to upload derived summaries to GCS:", err);
       }
     }
+
     if (telemetryReporter !== null) {
-      const finalStatusToReport = stoppedBySignal ? "cancelled" : (finalStatus === "complete" ? "completed" : "failed");
-      await telemetryReporter.close(finalStatusToReport);
+      const hasFailure = failureState.error !== undefined || storageShutdownError !== null;
+      const finalStatusToReport = stoppedBySignal
+        ? "cancelled"
+        : (hasFailure ? "failed" : "completed");
+
+      if (hasFailure) {
+        const errorToReport = failureState.error ?? storageShutdownError;
+        const msg = errorToReport instanceof Error ? errorToReport.message : String(errorToReport);
+        telemetryReporter.reportError(msg);
+      }
+
+      try {
+        await telemetryReporter.close(finalStatusToReport);
+      } catch (telemetryErr) {
+        console.error("[Collector] Telemetry cleanup error during shutdown:", telemetryErr);
+      }
     }
   }
 
   const summary = {
-    status: failureState.error === undefined ? "complete" : "error",
+    status: failureState.error === undefined && storageShutdownError === null ? "complete" : "error",
     dataset: options.outputDirectory,
     counts: writer.snapshotCounts(),
   };
@@ -814,6 +841,11 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     });
   }
   if (failureState.error !== undefined) throw failureState.error;
+  if (storageShutdownError !== null) {
+    throw storageShutdownError instanceof Error
+      ? storageShutdownError
+      : new Error(typeof storageShutdownError === "string" ? storageShutdownError : JSON.stringify(storageShutdownError));
+  }
 }
 
 async function main(): Promise<void> {

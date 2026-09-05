@@ -63,31 +63,163 @@ export interface CloudDatasetManifest {
   readonly limitations: readonly string[];
 }
 
+function extractErrorCodeOrStatus(error: unknown): { code?: string | undefined; status?: number | undefined } {
+  if (!error || typeof error !== "object") return {};
+  const rec = error as Record<string, unknown>;
+  const codeVal = rec.code ?? rec.errno;
+  const statusVal =
+    rec.status ??
+    rec.statusCode ??
+    (rec.response && typeof rec.response === "object" ? (rec.response as Record<string, unknown>).status : undefined);
+  return {
+    code: typeof codeVal === "string" || typeof codeVal === "number" ? String(codeVal) : undefined,
+    status: typeof statusVal === "number" ? statusVal : (typeof rec.code === "number" ? rec.code : undefined),
+  };
+}
+
+export function isRetryableStorageError(error: unknown): boolean {
+  if (!error) return false;
+  const { code, status } = extractErrorCodeOrStatus(error);
+
+  // Check HTTP status code if present
+  if (status !== undefined && status >= 400 && status < 600) {
+    if ([400, 401, 403, 404, 405, 409, 411, 412, 413, 415, 422].includes(status)) {
+      return false;
+    }
+    if ([429, 500, 502, 503, 504].includes(status)) {
+      return true;
+    }
+  }
+
+  // Check system errno / code
+  if (code !== undefined) {
+    const upperCode = code.toUpperCase();
+    const retryableCodes = new Set([
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "EPIPE",
+      "ENOTFOUND",
+      "ECONNREFUSED",
+      "EAI_AGAIN",
+      "UND_ERR_SOCKET",
+      "UND_ERR_CONNECT_TIMEOUT",
+      "UND_ERR_HEADERS_TIMEOUT",
+      "ERR_STREAM_PREMATURE_CLOSE",
+    ]);
+    if (retryableCodes.has(upperCode)) {
+      return true;
+    }
+  }
+
+  // Check message strings for transient network / socket failures
+  const msg =
+    error instanceof Error
+      ? error.message.toLowerCase()
+      : typeof error === "string"
+        ? error.toLowerCase()
+        : JSON.stringify(error).toLowerCase();
+  if (
+    msg.includes("econnreset") ||
+    msg.includes("etimedout") ||
+    msg.includes("epipe") ||
+    msg.includes("socket hang up") ||
+    msg.includes("client network socket disconnected") ||
+    msg.includes("tls connection was established") ||
+    msg.includes("network error") ||
+    msg.includes("service unavailable") ||
+    msg.includes("bad gateway") ||
+    msg.includes("gateway timeout") ||
+    msg.includes("rate limit") ||
+    msg.includes("too many requests") ||
+    msg.includes("connection reset") ||
+    msg.includes("premature close") ||
+    msg.includes("econnrefused")
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+export interface GcsStorageUploaderOptions {
+  readonly maxAttempts?: number;
+  readonly baseDelayMs?: number;
+  readonly maxDelayMs?: number;
+  readonly sleepFn?: (ms: number) => Promise<void>;
+  readonly logger?: {
+    warn: (message: string, meta?: Record<string, unknown>) => void;
+    error: (message: string, meta?: Record<string, unknown>) => void;
+  };
+}
+
 export interface CloudStorageUploader {
   uploadBuffer(destinationPath: string, buffer: Buffer, contentType: string): Promise<void>;
 }
 
 export class GcsStorageUploader implements CloudStorageUploader {
   private readonly bucket: Bucket;
+  private readonly retryOptions: GcsStorageUploaderOptions;
+  private readonly logger: NonNullable<GcsStorageUploaderOptions["logger"]>;
 
-  public constructor(bucketName: string, projectId?: string) {
+  public constructor(bucketName: string, projectId?: string, retryOptions: GcsStorageUploaderOptions = {}) {
     const options: ConstructorParameters<typeof Storage>[0] = {};
     if (projectId !== undefined) {
       options.projectId = projectId;
     }
     const storage = new Storage(options);
     this.bucket = storage.bucket(bucketName);
+    this.retryOptions = retryOptions;
+    this.logger = retryOptions.logger ?? {
+      warn: (msg, meta) => console.warn(msg, meta ? JSON.stringify(meta) : ""),
+      error: (msg, meta) => console.error(msg, meta ? JSON.stringify(meta) : ""),
+    };
   }
 
   public async uploadBuffer(destinationPath: string, buffer: Buffer, contentType: string): Promise<void> {
-    const file = this.bucket.file(destinationPath);
-    await file.save(buffer, {
-      resumable: false,
-      contentType,
-      metadata: {
-        cacheControl: "no-cache",
-      },
-    });
+    const maxAttempts = this.retryOptions.maxAttempts ?? 5;
+    const baseDelayMs = this.retryOptions.baseDelayMs ?? 1000;
+    const maxDelayMs = this.retryOptions.maxDelayMs ?? 8000;
+    const sleep = this.retryOptions.sleepFn ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+
+    let attempt = 0;
+    while (attempt < maxAttempts) {
+      attempt += 1;
+      try {
+        const file = this.bucket.file(destinationPath);
+        await file.save(buffer, {
+          resumable: false,
+          contentType,
+          metadata: {
+            cacheControl: "no-cache",
+          },
+        });
+        return;
+      } catch (error) {
+        const retryable = isRetryableStorageError(error);
+        const isFinalAttempt = attempt >= maxAttempts;
+        const errMessage = error instanceof Error ? error.message : String(error);
+        const errCode = extractErrorCodeOrStatus(error).code ?? "UNKNOWN";
+
+        if (!retryable || isFinalAttempt) {
+          this.logger.error(
+            `[GcsStorageUploader] Permanent upload failure for "${destinationPath}" on attempt ${attempt}/${maxAttempts}: ${errMessage}`,
+            { destinationPath, attempt, maxAttempts, errCode, retryable }
+          );
+          throw error;
+        }
+
+        const backoffMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+        const jitterMs = Math.floor(Math.random() * 200);
+        const delayMs = backoffMs + jitterMs;
+
+        this.logger.warn(
+          `[GcsStorageUploader] Transient upload failure for "${destinationPath}" on attempt ${attempt}/${maxAttempts} (${errCode}). Retrying in ${delayMs}ms...`,
+          { destinationPath, attempt, delayMs, errCode }
+        );
+
+        await sleep(delayMs);
+      }
+    }
   }
 }
 
@@ -99,6 +231,7 @@ export interface CloudResearchSinkOptions extends CreateDatasetOptions {
   readonly chunkIntervalMs?: number | undefined;
   readonly chunkMaxRecords?: number | undefined;
   readonly onChunkRotated?: ((metadata: CloudChunkMetadata) => void) | undefined;
+  readonly onTerminalError?: ((error: Error) => void) | undefined;
 }
 
 function emptyCounts(): DatasetCounts {
@@ -126,8 +259,10 @@ export class CloudResearchSink implements ResearchSink {
   private readonly chunkIntervalMs: number;
   private readonly chunkMaxRecords: number;
   private readonly onChunkRotated?: ((metadata: CloudChunkMetadata) => void) | undefined;
+  private readonly onTerminalError?: ((error: Error) => void) | undefined;
 
   private currentChunkIndex = 1;
+  private lastCommittedChunkIndex = 0;
   private currentEventBuffer: string[] = [];
   private currentRawBuffer: string[] = [];
   private currentDiagnosticsBuffer: DiagnosticRecord[] = [];
@@ -135,7 +270,8 @@ export class CloudResearchSink implements ResearchSink {
   private totalCompressedBytes = 0;
 
   private rotationTimer?: NodeJS.Timeout | undefined;
-  private queue: Promise<void> = Promise.resolve();
+  private queueTail: Promise<void> = Promise.resolve();
+  private terminalError: Error | null = null;
   private closed = false;
   private status: CloudDatasetManifest["status"] = "collecting";
 
@@ -146,6 +282,9 @@ export class CloudResearchSink implements ResearchSink {
     this.chunkMaxRecords = options.chunkMaxRecords ?? 10_000;
     if (options.onChunkRotated !== undefined) {
       this.onChunkRotated = options.onChunkRotated;
+    }
+    if (options.onTerminalError !== undefined) {
+      this.onTerminalError = options.onTerminalError;
     }
 
     if (options.uploader) {
@@ -171,6 +310,18 @@ export class CloudResearchSink implements ResearchSink {
 
   public getCurrentChunkIndex(): number {
     return this.currentChunkIndex;
+  }
+
+  public getLastCommittedChunkIndex(): number {
+    return this.lastCommittedChunkIndex;
+  }
+
+  public getUncommittedEventCount(): number {
+    return this.currentEventBuffer.length;
+  }
+
+  public getTerminalError(): Error | null {
+    return this.terminalError;
   }
 
   public getTotalCompressedBytes(): number {
@@ -255,17 +406,38 @@ export class CloudResearchSink implements ResearchSink {
   public async close(status: "complete" | "aborted" | "failed" = "complete"): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    this.status = status;
+    this.status = this.terminalError !== null ? "failed" : status;
 
     if (this.rotationTimer) {
       clearInterval(this.rotationTimer);
       this.rotationTimer = undefined;
     }
 
-    await this.queue;
-    await this.rotateChunkInternal(true);
-    await this.syncManifest(new Date().toISOString());
-    await this.writeSummary();
+    // Await ongoing queue items to settle without unhandled rejection
+    try {
+      await this.queueTail;
+    } catch {
+      // Terminal error already saved in this.terminalError
+    }
+
+    if (this.terminalError === null) {
+      try {
+        await this.rotateChunkInternal(true);
+        await this.syncManifest(new Date().toISOString());
+        await this.writeSummary();
+      } catch (err) {
+        this.terminalError = err instanceof Error ? err : new Error(String(err));
+        throw err;
+      }
+    } else {
+      // Best effort manifest sync of whatever chunks succeeded
+      try {
+        await this.syncManifest(new Date().toISOString());
+      } catch (manifestErr) {
+        console.warn("[CloudResearchSink] Best-effort manifest sync after terminal error failed:", manifestErr);
+      }
+      throw this.terminalError;
+    }
   }
 
   private scheduleRotationTimer(): void {
@@ -316,8 +488,17 @@ export class CloudResearchSink implements ResearchSink {
         endAtUnixMs: endMs,
       };
 
-      this.chunks.push(chunkMeta);
-      this.totalCompressedBytes += compressedBuffer.byteLength;
+      const existingIdx = this.chunks.findIndex((c) => c.index === chunkIdx);
+      const existingChunk = existingIdx >= 0 ? this.chunks[existingIdx] : undefined;
+      if (existingChunk !== undefined) {
+        this.totalCompressedBytes += compressedBuffer.byteLength - existingChunk.compressedBytes;
+        this.chunks[existingIdx] = chunkMeta;
+      } else {
+        this.chunks.push(chunkMeta);
+        this.totalCompressedBytes += compressedBuffer.byteLength;
+      }
+      this.lastCommittedChunkIndex = chunkIdx;
+
       if (this.onChunkRotated) {
         this.onChunkRotated(chunkMeta);
       }
@@ -342,8 +523,15 @@ export class CloudResearchSink implements ResearchSink {
         sha256,
       };
 
-      this.diagnosticChunks.push(diagMeta);
-      this.totalCompressedBytes += compressedBuffer.byteLength;
+      const existingDiagIdx = this.diagnosticChunks.findIndex((d) => d.index === chunkIdx);
+      const existingDiag = existingDiagIdx >= 0 ? this.diagnosticChunks[existingDiagIdx] : undefined;
+      if (existingDiag !== undefined) {
+        this.totalCompressedBytes += compressedBuffer.byteLength - existingDiag.compressedBytes;
+        this.diagnosticChunks[existingDiagIdx] = diagMeta;
+      } else {
+        this.diagnosticChunks.push(diagMeta);
+        this.totalCompressedBytes += compressedBuffer.byteLength;
+      }
     }
 
     // Reset buffer state
@@ -413,9 +601,42 @@ export class CloudResearchSink implements ResearchSink {
     await this.uploader.uploadBuffer(destinationPath, buffer, "application/json");
   }
 
-  private enqueue(work: () => Promise<void>): Promise<void> {
-    if (this.closed) return Promise.reject(new Error("cloud research sink is closed"));
-    this.queue = this.queue.then(work);
-    return this.queue;
+  private enqueue<T>(work: () => Promise<T>): Promise<T> {
+    if (this.closed) {
+      return Promise.reject(new Error("cloud research sink is closed"));
+    }
+    if (this.terminalError !== null) {
+      return Promise.reject(this.terminalError);
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      this.queueTail = this.queueTail
+        .catch(() => {
+          // Prevent prior failure from permanently poisoning queue sequence
+        })
+        .then(async () => {
+          if (this.terminalError !== null) {
+            throw this.terminalError;
+          }
+          return await work();
+        })
+        .then(
+          (result) => {
+            resolve(result);
+          },
+          (err) => {
+            const error = err instanceof Error ? err : new Error(String(err));
+            this.terminalError = error;
+            if (this.onTerminalError) {
+              try {
+                this.onTerminalError(error);
+              } catch (cbErr) {
+                console.error("[CloudResearchSink] onTerminalError callback error:", cbErr);
+              }
+            }
+            reject(error);
+          },
+        );
+    });
   }
 }

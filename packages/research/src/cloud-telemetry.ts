@@ -259,6 +259,10 @@ export class FirestoreTelemetryReporter {
     this.latestError = error instanceof Error ? error.message : String(error);
   }
 
+  public reportError(error: Error | string): void {
+    this.recordError(error);
+  }
+
   public async close(finalStatus: "completed" | "failed" | "cancelled" = "completed"): Promise<void> {
     if (this.closed) return;
     this.closed = true;
