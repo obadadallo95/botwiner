@@ -22,5 +22,13 @@
   },
   "firestore": {
     "rules": "firestore.rules"
+  },
+  "auth": {
+    "providers": {
+      "googleSignIn": {
+        "oAuthBrandDisplayName": "Botwiner Research",
+        "supportEmail": "obada.dallo95@gmail.com"
+      }
+    }
   }
 }
