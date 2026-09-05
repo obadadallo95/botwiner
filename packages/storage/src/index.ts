@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import {
+  bigintSafeJsonStringify,
   createDiagnostic,
   jsonLine,
   type Commitment,
@@ -289,7 +290,7 @@ export class DatasetWriter implements ResearchSink {
     };
     const path = join(this.directory, MANIFEST_FILE_NAME);
     const temporaryPath = `${path}.tmp`;
-    await writeFile(temporaryPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    await writeFile(temporaryPath, `${bigintSafeJsonStringify(manifest, 2)}\n`, "utf8");
     await rename(temporaryPath, path);
   }
 }

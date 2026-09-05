@@ -8,6 +8,7 @@ export function generateCollisionResistantSessionId(prefix = "session", date = n
   return `${prefix}-${dateStr}-${entropy}`;
 }
 import {
+  bigintSafeJsonStringify,
   createDiagnostic,
   jsonLine,
   type DiagnosticRecord,
@@ -117,7 +118,7 @@ export function isRetryableStorageError(error: unknown): boolean {
       ? error.message.toLowerCase()
       : typeof error === "string"
         ? error.toLowerCase()
-        : JSON.stringify(error).toLowerCase();
+        : bigintSafeJsonStringify(error).toLowerCase();
   if (
     msg.includes("econnreset") ||
     msg.includes("etimedout") ||
@@ -170,8 +171,8 @@ export class GcsStorageUploader implements CloudStorageUploader {
     this.bucket = storage.bucket(bucketName);
     this.retryOptions = retryOptions;
     this.logger = retryOptions.logger ?? {
-      warn: (msg, meta) => console.warn(msg, meta ? JSON.stringify(meta) : ""),
-      error: (msg, meta) => console.error(msg, meta ? JSON.stringify(meta) : ""),
+      warn: (msg, meta) => console.warn(msg, meta ? bigintSafeJsonStringify(meta) : ""),
+      error: (msg, meta) => console.error(msg, meta ? bigintSafeJsonStringify(meta) : ""),
     };
   }
 
@@ -575,7 +576,7 @@ export class CloudResearchSink implements ResearchSink {
     };
 
     const destinationPath = `sessions/${this.options.sessionId}/manifest.json`;
-    const manifestBuffer = Buffer.from(JSON.stringify(manifest, null, 2), "utf8");
+    const manifestBuffer = Buffer.from(bigintSafeJsonStringify(manifest, 2), "utf8");
     await this.uploader.uploadBuffer(destinationPath, manifestBuffer, "application/json");
   }
 
@@ -591,13 +592,13 @@ export class CloudResearchSink implements ResearchSink {
       counts: this.snapshotCounts(),
     };
     const destinationPath = `sessions/${this.options.sessionId}/summary/final-summary.json`;
-    const summaryBuffer = Buffer.from(JSON.stringify(summary, null, 2), "utf8");
+    const summaryBuffer = Buffer.from(bigintSafeJsonStringify(summary, 2), "utf8");
     await this.uploader.uploadBuffer(destinationPath, summaryBuffer, "application/json");
   }
 
   public async uploadDerivedSummary(name: string, data: unknown): Promise<void> {
     const destinationPath = `sessions/${this.options.sessionId}/summary/${name}.json`;
-    const buffer = Buffer.from(JSON.stringify(data, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value, 2), "utf8");
+    const buffer = Buffer.from(bigintSafeJsonStringify(data, 2), "utf8");
     await this.uploader.uploadBuffer(destinationPath, buffer, "application/json");
   }
 

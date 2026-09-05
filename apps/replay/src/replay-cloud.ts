@@ -7,7 +7,7 @@ import { basename, join, resolve } from "node:path";
 import { createGunzip } from "node:zlib";
 import { createInterface } from "node:readline";
 import { Storage } from "@google-cloud/storage";
-import type { NormalizedMarketEvent } from "@botwiner/market-data";
+import { bigintSafeJsonStringify, type NormalizedMarketEvent } from "@botwiner/market-data";
 import {
   PaperTradingEngine,
   MultiPortfolioEngine,
@@ -128,7 +128,7 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
   const auditOutput = createWriteStream(join(sessionCacheDir, "portfolio-audit.jsonl"));
   let auditError: Error | null = null;
   auditOutput.on("error", error => { auditError = error; });
-  const portfolios = new MultiPortfolioEngine(record => { auditOutput.write(JSON.stringify(record) + "\n"); });
+  const portfolios = new MultiPortfolioEngine(record => { auditOutput.write(bigintSafeJsonStringify(record) + "\n"); });
   const paperEngine = new PaperTradingEngine();
   const pnlTracker = new TraderPnlTracker();
 
@@ -168,7 +168,7 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
   portfolios.onSessionEnd();
   await new Promise<void>((resolve, reject) => { auditOutput.once("error", reject); auditOutput.end(resolve); });
   const replayedPortfolios = portfolios.summary();
-  const portfolioMatch = originalPortfolios ? JSON.stringify(originalPortfolios) === JSON.stringify(replayedPortfolios) : null;
+  const portfolioMatch = originalPortfolios ? bigintSafeJsonStringify(originalPortfolios) === bigintSafeJsonStringify(replayedPortfolios) : null;
   paperEngine.onSessionEnd(lastEventTimestampMs);
 
   const replayedPaperSummary = paperEngine.exportSummary();
@@ -206,7 +206,7 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
   };
 
   if (outputPath) {
-    await writeFile(outputPath, JSON.stringify(comparison, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value, 2), "utf8");
+    await writeFile(outputPath, bigintSafeJsonStringify(comparison, 2), "utf8");
     console.log(`[ReplayCloud] Saved comparison report to ${outputPath}`);
   }
 

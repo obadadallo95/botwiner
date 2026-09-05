@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { NormalizedMarketEvent, TradeMarketEvent } from "@botwiner/market-data";
+import { bigintSafeJsonStringify, type NormalizedMarketEvent, type TradeMarketEvent } from "@botwiner/market-data";
 import { PAPER_CONFIG } from "./paper-trading-engine.js";
 import { quotePumpBuy, quotePumpSell } from "./rebound-research.js";
 
@@ -84,7 +84,7 @@ export class MultiPortfolioEngine {
   private record(a: Account, action: string, mint: string | null, detail: Record<string, string | number> = {}): void {
     const record = { sequence: ++this.auditCount, eventOrdinal: this.eventCount, timeMs: this.timeMs,
       accountId: a.id, action, mint, cashLamports: a.cash.toString(), equityLamports: this.equity(a).toString(), detail };
-    this.audit.update(JSON.stringify(record) + "\n");
+    this.audit.update(bigintSafeJsonStringify(record) + "\n");
     this.onAudit?.(record);
   }
   private observe(a: Account): void {

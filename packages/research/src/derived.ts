@@ -1,7 +1,9 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
+  bigintSafeJsonStringify,
   parseLogsNotification,
+  toBigIntSafeObject,
   type DiagnosticRecord,
   type NormalizedMarketEvent,
   type RawLogRecord,
@@ -55,9 +57,7 @@ export const FEED_QUALITY_FILE = "feed-quality.json";
 export const PHASE2_MANIFEST_FILE = "manifest.json";
 
 function jsonSafe(value: unknown): unknown {
-  return JSON.parse(JSON.stringify(value, (_key, item: unknown) =>
-    typeof item === "bigint" ? item.toString() : item,
-  )) as unknown;
+  return toBigIntSafeObject(value);
 }
 
 async function collect<T>(path: string): Promise<T[]> {
@@ -623,7 +623,7 @@ export async function rebuildDerivedResearchStore(
     writeJsonLines(observedTransactionsPath, observedTransactions),
     writeJsonLines(gapsPath, gaps),
   ]);
-  const reportText = `${JSON.stringify(report, null, 2)}\n`;
+  const reportText = `${bigintSafeJsonStringify(report, 2)}\n`;
   await writeFile(reportPath, reportText, "utf8");
   const feedQualitySha256 = sha256(reportText);
   const manifest: Phase2Manifest = {
@@ -668,7 +668,7 @@ export async function rebuildDerivedResearchStore(
       "Observable Jito tips cover direct transfers in the same transaction only; separate bundle transactions and auction state remain unknown.",
     ],
   };
-  await writeFile(join(phase2Root, PHASE2_MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  await writeFile(join(phase2Root, PHASE2_MANIFEST_FILE), `${bigintSafeJsonStringify(manifest, 2)}\n`, "utf8");
   return { transactions, observedTransactions, observedVenueEvents, canonicalVenueEvents, gaps, report, manifest };
 }
 

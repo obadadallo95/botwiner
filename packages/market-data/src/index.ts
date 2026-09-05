@@ -467,6 +467,22 @@ export function createDiagnostic(
   };
 }
 
-export function jsonLine(value: unknown): string {
-  return `${JSON.stringify(value)}\n`;
+export function bigintSafeReplacer(_key: string, value: unknown): unknown {
+  return typeof value === "bigint" ? value.toString() : value;
 }
+
+export function bigintSafeJsonStringify(value: unknown, space?: number | string): string {
+  return JSON.stringify(value, bigintSafeReplacer, space);
+}
+
+export function toBigIntSafeObject<T = Record<string, unknown>>(value: unknown): T {
+  if (value === undefined || value === null) {
+    return value as unknown as T;
+  }
+  return JSON.parse(bigintSafeJsonStringify(value)) as T;
+}
+
+export function jsonLine(value: unknown): string {
+  return `${bigintSafeJsonStringify(value)}\n`;
+}
+

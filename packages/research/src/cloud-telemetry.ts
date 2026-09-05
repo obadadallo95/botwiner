@@ -1,6 +1,7 @@
 import type { PortfolioSummary } from "./portfolio-engine.js";
 import { Firestore } from "@google-cloud/firestore";
 import type { DatasetCounts } from "@botwiner/storage";
+import { toBigIntSafeObject } from "@botwiner/market-data";
 import type { GraduationSummaryCounters, TokenGraduationState } from "./graduation-tracker.js";
 
 export type ResearchSessionStatus =
@@ -63,46 +64,46 @@ export class GoogleFirestoreBackend implements FirestoreBackend {
 
   public async setSessionDoc(sessionId: string, data: Partial<ResearchSessionDocument>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId);
-    await docRef.set(data, { merge: true });
+    await docRef.set(toBigIntSafeObject(data), { merge: true });
   }
 
   public async updateStatsDoc(sessionId: string, stats: GraduationSummaryCounters): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("current");
-    await docRef.set(stats, { merge: true });
+    await docRef.set(toBigIntSafeObject(stats), { merge: true });
   }
 
   public async updatePortfolioStatsDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
-    await this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("portfolios").set(stats);
+    await this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("portfolios").set(toBigIntSafeObject(stats));
   }
 
   public async updatePaperStatsDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("paperTrading");
-    await docRef.set(stats, { merge: true });
+    await docRef.set(toBigIntSafeObject(stats), { merge: true });
   }
 
   public async updateMarketPnlDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("marketPnl");
-    await docRef.set(stats, { merge: true });
+    await docRef.set(toBigIntSafeObject(stats), { merge: true });
   }
 
   public async updateCreatorAnalyticsDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("creatorAnalytics");
-    await docRef.set(stats, { merge: true });
+    await docRef.set(toBigIntSafeObject(stats), { merge: true });
   }
 
   public async savePaperTradeDoc(sessionId: string, tradeId: string, trade: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("paperTrades").doc(tradeId);
-    await docRef.set(trade, { merge: true });
+    await docRef.set(toBigIntSafeObject(trade), { merge: true });
   }
 
   public async setGraduationCandidate(sessionId: string, mint: string, candidate: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("graduations").doc(mint);
-    await docRef.set(candidate, { merge: true });
+    await docRef.set(toBigIntSafeObject(candidate), { merge: true });
   }
 
   public async updateActiveLock(sessionId: string, data: { heartbeatAt: string; status?: string }): Promise<void> {
     const lockRef = this.db.collection("researchControl").doc("activeSession");
-    await lockRef.set({ sessionId, ...data }, { merge: true });
+    await lockRef.set(toBigIntSafeObject({ sessionId, ...data }), { merge: true });
   }
 
   public async releaseActiveLock(sessionId: string): Promise<void> {
@@ -418,11 +419,7 @@ export class FirestoreTelemetryReporter {
 
     if (this.latestPortfolioStats && this.backend.updatePortfolioStatsDoc) {
       try {
-        const safePortfolioStats = JSON.parse(
-          JSON.stringify(this.latestPortfolioStats, (_key, value: unknown) =>
-            typeof value === "bigint" ? value.toString() : value,
-          ),
-        ) as Record<string, unknown>;
+        const safePortfolioStats = toBigIntSafeObject<Record<string, unknown>>(this.latestPortfolioStats);
         await this.backend.updatePortfolioStatsDoc(this.sessionId, safePortfolioStats);
       } catch (err) {
         console.warn("[FirestoreTelemetryReporter] failed to update portfolios:", err);
@@ -432,7 +429,7 @@ export class FirestoreTelemetryReporter {
       try {
         await this.backend.updatePaperStatsDoc(
           this.sessionId,
-          JSON.parse(JSON.stringify(this.latestPaperStats, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)) as Record<string, unknown>,
+          toBigIntSafeObject<Record<string, unknown>>(this.latestPaperStats),
         );
       } catch (err) {
         console.warn("[FirestoreTelemetryReporter] failed to update paper stats:", err);
@@ -442,7 +439,7 @@ export class FirestoreTelemetryReporter {
     if (this.latestMarketParticipantStats) {
       if (this.backend.updateMarketPnlDoc) {
         try {
-          const marketPnlSummary: Record<string, unknown> = { ...this.latestMarketParticipantStats };
+          const marketPnlSummary = toBigIntSafeObject<Record<string, unknown>>(this.latestMarketParticipantStats);
           delete marketPnlSummary["creatorAnalytics"];
           await this.backend.updateMarketPnlDoc(
             this.sessionId,
@@ -456,7 +453,7 @@ export class FirestoreTelemetryReporter {
         try {
           await this.backend.updateCreatorAnalyticsDoc(
             this.sessionId,
-            this.latestMarketParticipantStats.creatorAnalytics as unknown as Record<string, unknown>,
+            toBigIntSafeObject<Record<string, unknown>>(this.latestMarketParticipantStats.creatorAnalytics),
           );
         } catch (err) {
           console.warn("[FirestoreTelemetryReporter] failed to update creator analytics:", err);

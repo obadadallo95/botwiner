@@ -2,6 +2,7 @@ import { basename, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import {
+  bigintSafeJsonStringify,
   type Commitment,
   type FeedTransportType,
   type NormalizedMarketEvent,
@@ -724,7 +725,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
 
   try {
     console.log(
-      JSON.stringify({
+      bigintSafeJsonStringify({
         status: "collecting",
         dataset: options.outputDirectory,
         endpointLabel,
@@ -850,7 +851,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     dataset: options.outputDirectory,
     counts: writer.snapshotCounts(),
   };
-  console.log(JSON.stringify(summary));
+  console.log(bigintSafeJsonStringify(summary));
   if (options.comparison !== null) {
     sendToOrchestrator({
       kind: "collector-complete",
@@ -863,7 +864,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
   if (storageShutdownError !== null) {
     throw storageShutdownError instanceof Error
       ? storageShutdownError
-      : new Error(typeof storageShutdownError === "string" ? storageShutdownError : JSON.stringify(storageShutdownError));
+      : new Error(typeof storageShutdownError === "string" ? storageShutdownError : bigintSafeJsonStringify(storageShutdownError));
   }
 }
 
