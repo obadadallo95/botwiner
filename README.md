@@ -4,7 +4,7 @@ Botwiner is a production-minded research system for testing whether an ultra-sho
 
 ## Current scope
 
-Phase 1 collects and deterministically replays Pump bonding-curve events. Phase 2 enriches captured signatures with finalized transaction evidence, preserves separate observed and canonical views, records failed-transaction congestion inputs, detects bounded reconnect gaps, and produces a rebuildable feed-quality report. It contains no trading, wallet, private-key, transaction-sending, Telegram, dashboard, or strategy code.
+Phase 1 collects and deterministically replays Pump bonding-curve events. Phase 2 enriches captured signatures with finalized transaction evidence, preserves separate observed and canonical views, records failed-transaction congestion inputs, detects bounded reconnect gaps, and produces a rebuildable feed-quality report. Phase 2.5B adds a controlled same-host, separate-process comparison of public Solana and Helius standard WebSockets. It contains no trading, wallet, private-key, transaction-sending, Telegram, dashboard, or strategy code.
 
 The live source remains Solana standard `logsSubscribe`, filtered by the official Pump program ID. The decoder is pinned to the official Pump IDL revision recorded in each dataset. See [Phase 1](docs/phase-1/ARCHITECTURE.md) and [Phase 2](docs/phase-2/ARCHITECTURE.md).
 
@@ -75,6 +75,22 @@ Rebuild derived outputs without touching Phase 1 or raw Phase 2 evidence:
 pnpm phase2:rebuild data/sessions/sample
 ```
 
+## Phase 2.5B feed comparison
+
+With `HELIUS_API_KEY` present only in the local environment, run the bounded five-minute smoke harness:
+
+```bash
+pnpm comparison:run --comparison-id phase-2-5b-smoke --duration-seconds 300
+```
+
+The orchestrator launches two collector processes, calibrates their monotonic clocks over local IPC, applies one shared window, then writes sanitized JSON and Markdown reports under `data/comparisons/<comparison-id>/`. The Helius URL and key are never persisted. Re-analyze an existing completed comparison with:
+
+```bash
+pnpm comparison:analyze data/comparisons/phase-2-5b-smoke
+```
+
+See [Phase 2.5B architecture and methodology](docs/phase-2.5/ARCHITECTURE.md).
+
 ## Validate the code
 
 ```bash
@@ -88,6 +104,7 @@ This runs strict TypeScript checking, the test suite, and ESLint.
 - `apps/collector`: live WebSocket CLI and session lifecycle
 - `apps/replay`: deterministic replay CLI
 - `apps/phase2`: finalized enrichment, rebuild, and quality-report CLIs
+- `apps/comparator`: dual-process orchestration and deterministic comparison analysis
 - `packages/market-data`: schemas and boundary validation
 - `packages/pumpfun`: official-IDL-derived Borsh parsing and normalization
 - `packages/solana`: reconnecting Solana PubSub transport

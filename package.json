@@ -14,6 +14,8 @@
     "phase2:enrich": "node --import tsx apps/phase2/src/enrich.ts",
     "phase2:rebuild": "node --import tsx apps/phase2/src/rebuild.ts",
     "phase2:quality": "node --import tsx apps/phase2/src/quality.ts",
+    "comparison:run": "node --import tsx apps/comparator/src/run-comparison.ts",
+    "comparison:analyze": "node --import tsx apps/comparator/src/analyze-comparison.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "lint": "eslint .",

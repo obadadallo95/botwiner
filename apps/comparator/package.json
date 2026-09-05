@@ -1,0 +1,10 @@
+{
+  "name": "@botwiner/comparator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@botwiner/pumpfun": "workspace:*",
+    "@botwiner/research": "workspace:*"
+  }
+}

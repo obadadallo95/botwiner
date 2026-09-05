@@ -64,6 +64,15 @@ importers:
         specifier: workspace:*
         version: link:../../packages/storage
 
+  apps/comparator:
+    dependencies:
+      '@botwiner/pumpfun':
+        specifier: workspace:*
+        version: link:../../packages/pumpfun
+      '@botwiner/research':
+        specifier: workspace:*
+        version: link:../../packages/research
+
   apps/phase2:
     dependencies:
       '@botwiner/research':

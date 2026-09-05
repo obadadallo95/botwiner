@@ -41,6 +41,15 @@ export interface RawLogRecord {
     readonly programId: string;
     readonly commitment: Commitment;
     readonly endpointLabel: string;
+    /** Present only for controlled same-host feed comparisons. */
+    readonly comparison?: {
+      readonly comparisonId: string;
+      readonly feedId: "public" | "candidate";
+      readonly collectorProcessId: number;
+      readonly calibrationId: string;
+      /** Zero is the initial uninterrupted connection; increments after reconnect. */
+      readonly connectionEpoch: number;
+    };
   };
   readonly capture: CollectorCaptureTime;
   /** The complete parsed JSON-RPC notification, including unrecognized fields. */
@@ -52,6 +61,8 @@ export interface EventSource {
   readonly programId: string;
   readonly commitment: Commitment;
   readonly endpointLabel: string;
+  /** Present only for controlled same-host feed comparisons. */
+  readonly comparison?: RawLogRecord["source"]["comparison"];
 }
 
 export interface EventOrdering {
@@ -236,6 +247,7 @@ export interface DiagnosticRecord {
     | "clock-offset-sampled"
     | "clock-offset-unavailable"
     | "invalid-rpc-message"
+    | "unexpected-rpc-message"
     | "malformed-pump-event"
     | "duplicate-event";
   readonly atUnixMs: number;
@@ -305,6 +317,19 @@ export function parseRawLogRecord(value: unknown): ValidationResult<RawLogRecord
     typeof source.endpointLabel !== "string"
   ) {
     return { ok: false, error: "raw record source is invalid" };
+  }
+  if (source.comparison !== undefined) {
+    const comparison = source.comparison;
+    if (
+      !isRecord(comparison) ||
+      typeof comparison.comparisonId !== "string" ||
+      (comparison.feedId !== "public" && comparison.feedId !== "candidate") ||
+      !isSafeNonNegativeInteger(comparison.collectorProcessId) ||
+      typeof comparison.calibrationId !== "string" ||
+      !isSafeNonNegativeInteger(comparison.connectionEpoch)
+    ) {
+      return { ok: false, error: "raw record comparison metadata is invalid" };
+    }
   }
   const capture = value.capture;
   if (

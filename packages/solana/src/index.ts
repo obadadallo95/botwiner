@@ -1,4 +1,5 @@
 import WebSocket, { type RawData } from "ws";
+import { createHash } from "node:crypto";
 import { createSocket, type Socket } from "node:dgram";
 import {
   createDiagnostic,
@@ -17,6 +18,7 @@ export interface ReceiveClock {
 export interface ReceivedLogsMessage {
   readonly payload: unknown;
   readonly clock: ReceiveClock;
+  readonly connectionEpoch: number;
 }
 
 export interface SolanaLogsSubscriberOptions {
@@ -26,6 +28,9 @@ export interface SolanaLogsSubscriberOptions {
   readonly signal: AbortSignal;
   readonly onNotification: (message: ReceivedLogsMessage) => Promise<void> | void;
   readonly onDiagnostic: (diagnostic: DiagnosticRecord) => Promise<void> | void;
+  /** Sanitized label used in diagnostics; never the credential-bearing URL. */
+  readonly endpointLabel?: string;
+  readonly redactSecrets?: readonly string[];
   readonly initialReconnectDelayMs?: number;
   readonly maximumReconnectDelayMs?: number;
 }
@@ -162,9 +167,18 @@ export function endpointLabelFromUrl(url: string): string {
   }
 }
 
+export function redactSecrets(text: string, secrets: readonly string[] = []): string {
+  let redacted = text;
+  for (const secret of secrets) {
+    if (secret.length > 0) redacted = redacted.replaceAll(secret, "[REDACTED]");
+  }
+  return redacted;
+}
+
 async function runConnection(
   options: SolanaLogsSubscriberOptions,
   pending: Set<Promise<void>>,
+  connectionEpoch: number,
 ): Promise<void> {
   return new Promise((resolvePromise) => {
     const socket = new WebSocket(options.url, {
@@ -196,7 +210,8 @@ async function runConnection(
       settle(
         options.onDiagnostic(
           createDiagnostic("connection-opened", "Solana RPC WebSocket connection opened", {
-            endpointLabel: endpointLabelFromUrl(options.url),
+            endpointLabel: options.endpointLabel ?? endpointLabelFromUrl(options.url),
+            connectionEpoch,
           }),
         ),
         pending,
@@ -226,8 +241,10 @@ async function runConnection(
         settle(
           options.onDiagnostic(
             createDiagnostic("invalid-rpc-message", "WebSocket frame was not valid JSON", {
-              error: error instanceof Error ? error.message : String(error),
+              error: redactSecrets(error instanceof Error ? error.message : String(error), options.redactSecrets),
               byteLength: Buffer.byteLength(text),
+              redactedFrameBase64: Buffer.from(redactSecrets(text, options.redactSecrets), "utf8").toString("base64"),
+              connectionEpoch,
             }),
           ),
           pending,
@@ -268,6 +285,7 @@ async function runConnection(
         settle(
           options.onNotification({
             payload,
+            connectionEpoch,
             clock: {
               receivedAtUnixMs,
               receivedAtIso,
@@ -278,6 +296,23 @@ async function runConnection(
           }),
           pending,
         );
+        return;
+      }
+
+      if (isRecord(reply)) {
+        settle(
+          options.onDiagnostic(
+            createDiagnostic("unexpected-rpc-message", "WebSocket JSON-RPC message was not a logs notification", {
+              method: typeof reply.method === "string" ? reply.method : null,
+              hasId: "id" in reply,
+              byteLength: Buffer.byteLength(text),
+              payloadSha256: createHash("sha256").update(text).digest("hex"),
+              rawPayload: JSON.parse(redactSecrets(text, options.redactSecrets)) as unknown,
+              connectionEpoch,
+            }),
+          ),
+          pending,
+        );
       }
     });
 
@@ -285,7 +320,8 @@ async function runConnection(
       settle(
         options.onDiagnostic(
           createDiagnostic("connection-error", "Solana RPC WebSocket error", {
-            error: error.message,
+            error: redactSecrets(error.message, options.redactSecrets),
+            connectionEpoch,
           }),
         ),
         pending,
@@ -297,8 +333,9 @@ async function runConnection(
         options.onDiagnostic(
           createDiagnostic("connection-closed", "Solana RPC WebSocket connection closed", {
             code,
-            reason: reason.toString("utf8"),
+            reason: redactSecrets(reason.toString("utf8"), options.redactSecrets),
             willReconnect: !options.signal.aborted,
+            connectionEpoch,
           }),
         ),
         pending,
@@ -313,12 +350,14 @@ export async function subscribeToProgramLogs(options: SolanaLogsSubscriberOption
   const maximumDelay = options.maximumReconnectDelayMs ?? 15_000;
   let reconnectDelay = initialDelay;
   const pending = new Set<Promise<void>>();
+  let connectionEpoch = 0;
 
   while (!options.signal.aborted) {
-    await runConnection(options, pending);
+    await runConnection(options, pending, connectionEpoch);
     if (options.signal.aborted) break;
     await delay(reconnectDelay, options.signal);
     reconnectDelay = Math.min(maximumDelay, reconnectDelay * 2);
+    connectionEpoch += 1;
   }
 
   await Promise.allSettled([...pending]);
