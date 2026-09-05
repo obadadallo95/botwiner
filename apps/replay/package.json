@@ -1,0 +1,11 @@
+{
+  "name": "@botwiner/replay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@botwiner/market-data": "workspace:*",
+    "@botwiner/pumpfun": "workspace:*",
+    "@botwiner/storage": "workspace:*"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "botwiner-research",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pump.fun launch and early-trade market-data research pipeline",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=20.10"
+  },
+  "scripts": {
+    "collector:start": "tsx apps/collector/src/main.ts",
+    "replay": "tsx apps/replay/src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/**/*.test.ts",
+    "lint": "eslint .",
+    "check": "pnpm typecheck && pnpm test && pnpm lint"
+  },
+  "devDependencies": {
+    "@botwiner/market-data": "workspace:*",
+    "@botwiner/pumpfun": "workspace:*",
+    "@botwiner/storage": "workspace:*",
+    "@eslint/js": "^9.35.0",
+    "@types/node": "^20.19.13",
+    "@types/ws": "^8.18.1",
+    "eslint": "^9.35.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.42.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}
