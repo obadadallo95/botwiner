@@ -12,6 +12,7 @@ import {
 } from "@botwiner/pumpfun";
 import {
   endpointLabelFromUrl,
+  sampleSntpClock,
   subscribeToProgramLogs,
   type ReceivedLogsMessage,
 } from "@botwiner/solana";
@@ -22,6 +23,7 @@ interface CollectorCliOptions {
   readonly commitment: Commitment;
   readonly outputDirectory: string;
   readonly durationSeconds: number | null;
+  readonly ntpHost: string | null;
 }
 
 function usage(): string {
@@ -33,6 +35,8 @@ function usage(): string {
     "  --duration-seconds <seconds>  Stop cleanly after a bounded interval",
     "  --commitment <level>          processed (default), confirmed, or finalized",
     "  --ws-url <url>                Solana WebSocket URL (prefer SOLANA_WS_URL)",
+    "  --ntp-host <host>             One startup SNTP sample (default: time.cloudflare.com)",
+    "  --disable-ntp                 Record that clock-offset sampling was skipped",
     "  --help                        Show this help",
   ].join("\n");
 }
@@ -58,13 +62,14 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
   let commitment = parseCommitment(process.env.SOLANA_COMMITMENT ?? "processed");
   let outputDirectory = defaultSessionDirectory();
   let durationSeconds: number | null = null;
+  let ntpHost: string | null = process.env.NTP_HOST ?? "time.cloudflare.com";
 
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === "--help") {
       console.log(usage());
       process.exitCode = 0;
-      return { wsUrl, commitment, outputDirectory, durationSeconds: 0 };
+      return { wsUrl, commitment, outputDirectory, durationSeconds: 0, ntpHost };
     }
     if (argument === "--output") {
       outputDirectory = resolve(requireNext(arguments_, index, argument));
@@ -90,6 +95,15 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
       index += 1;
       continue;
     }
+    if (argument === "--ntp-host") {
+      ntpHost = requireNext(arguments_, index, argument);
+      index += 1;
+      continue;
+    }
+    if (argument === "--disable-ntp") {
+      ntpHost = null;
+      continue;
+    }
     throw new Error(`unknown argument: ${argument}`);
   }
 
@@ -97,7 +111,7 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
   if (protocol !== "ws:" && protocol !== "wss:") {
     throw new Error("Solana WebSocket URL must use ws: or wss:");
   }
-  return { wsUrl, commitment, outputDirectory, durationSeconds };
+  return { wsUrl, commitment, outputDirectory, durationSeconds, ntpHost };
 }
 
 function applyFinalCapture(
@@ -132,6 +146,41 @@ async function run(): Promise<void> {
     parsingVersion: PUMP_PARSING_VERSION,
     officialIdlRevision: PUMP_IDL_REVISION,
   });
+
+  if (options.ntpHost === null) {
+    await writer.recordDiagnostic({
+      schemaVersion: 1,
+      kind: "diagnostic",
+      code: "clock-offset-unavailable",
+      atUnixMs: Date.now(),
+      message: "Clock-offset sampling was disabled",
+      sequence: null,
+      details: { reason: "disabled" },
+    });
+  } else {
+    try {
+      const sample = await sampleSntpClock(options.ntpHost);
+      await writer.recordDiagnostic({
+        schemaVersion: 1,
+        kind: "diagnostic",
+        code: "clock-offset-sampled",
+        atUnixMs: sample.completedAtUnixMs,
+        message: "Recorded one SNTP clock-offset sample",
+        sequence: null,
+        details: { ...sample, interpretation: "single-sample evidence; not a synchronization SLA" },
+      });
+    } catch (error) {
+      await writer.recordDiagnostic({
+        schemaVersion: 1,
+        kind: "diagnostic",
+        code: "clock-offset-unavailable",
+        atUnixMs: Date.now(),
+        message: "SNTP clock-offset sample failed",
+        sequence: null,
+        details: { host: options.ntpHost, error: error instanceof Error ? error.message : String(error) },
+      });
+    }
+  }
 
   const stopForSignal = (): void => {
     stoppedBySignal = true;

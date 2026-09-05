@@ -1,5 +1,6 @@
 export const MARKET_EVENT_SCHEMA_VERSION = 1 as const;
 export const RAW_RECORD_SCHEMA_VERSION = 1 as const;
+export const VENUE_EVENT_ENVELOPE_SCHEMA_VERSION = 1 as const;
 
 export type Commitment = "processed" | "confirmed" | "finalized";
 
@@ -165,6 +166,54 @@ export interface TradeMarketEvent extends CommonMarketEvent {
 
 export type NormalizedMarketEvent = LaunchMarketEvent | TradeMarketEvent;
 
+/**
+ * Small venue-neutral boundary consumed by Phase 2 analytics and, later, simulation.
+ * Venue-specific facts remain in venuePayload; no other launchpad is invented here.
+ */
+export interface VenueEventEnvelope {
+  readonly schemaVersion: typeof VENUE_EVENT_ENVELOPE_SCHEMA_VERSION;
+  readonly kind: "venue-event";
+  readonly eventId: string;
+  readonly venue: "pumpfun-bonding-curve";
+  readonly chain: "solana-mainnet";
+  readonly provenance: "live" | "backfilled";
+  readonly instrument: {
+    readonly baseMint: string;
+    readonly quoteMint: string;
+  };
+  readonly eventType: "launch" | "trade";
+  readonly side: "buy" | "sell" | null;
+  readonly signature: string;
+  readonly observed: {
+    readonly collectorSequence: number | null;
+    readonly receivedAtUnixMs: number | null;
+    readonly receivedMonotonicNs: string | null;
+    readonly parseDurationNs: string | null;
+    readonly providerReceivedAtUnixMs: null;
+  };
+  readonly canonical: {
+    readonly slot: number | null;
+    readonly transactionIndex: number | null;
+    readonly outerInstructionIndex: number | null;
+    readonly transactionLogIndex: number;
+    readonly eventIndex: number;
+    readonly blockTimeUnixSeconds: number | null;
+    readonly confirmationStatus: "finalized" | null;
+  };
+  readonly amounts: {
+    readonly baseUnits: string | null;
+    readonly quoteBaseUnits: string | null;
+  };
+  readonly transactionCost: {
+    readonly feeLamports: string | null;
+    readonly computeUnitsConsumed: string | null;
+    readonly requestedComputeUnitLimit: string | null;
+    readonly requestedComputeUnitPriceMicroLamports: string | null;
+    readonly requestedPriorityFeeLamports: string | null;
+  };
+  readonly venuePayload: unknown;
+}
+
 export interface DiagnosticRecord {
   readonly schemaVersion: 1;
   readonly kind: "diagnostic";
@@ -174,6 +223,8 @@ export interface DiagnosticRecord {
     | "connection-error"
     | "subscription-confirmed"
     | "subscription-error"
+    | "clock-offset-sampled"
+    | "clock-offset-unavailable"
     | "invalid-rpc-message"
     | "malformed-pump-event"
     | "duplicate-event";

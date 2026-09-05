@@ -18,6 +18,12 @@ importers:
       '@botwiner/pumpfun':
         specifier: workspace:*
         version: link:packages/pumpfun
+      '@botwiner/research':
+        specifier: workspace:*
+        version: link:packages/research
+      '@botwiner/solana':
+        specifier: workspace:*
+        version: link:packages/solana
       '@botwiner/storage':
         specifier: workspace:*
         version: link:packages/storage
@@ -58,6 +64,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/storage
 
+  apps/phase2:
+    dependencies:
+      '@botwiner/research':
+        specifier: workspace:*
+        version: link:../../packages/research
+
   apps/replay:
     dependencies:
       '@botwiner/market-data':
@@ -77,6 +89,18 @@ importers:
       '@botwiner/market-data':
         specifier: workspace:*
         version: link:../market-data
+
+  packages/research:
+    dependencies:
+      '@botwiner/market-data':
+        specifier: workspace:*
+        version: link:../market-data
+      '@botwiner/pumpfun':
+        specifier: workspace:*
+        version: link:../pumpfun
+      '@botwiner/storage':
+        specifier: workspace:*
+        version: link:../storage
 
   packages/solana:
     dependencies:

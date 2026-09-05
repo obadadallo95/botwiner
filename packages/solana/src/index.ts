@@ -1,4 +1,5 @@
 import WebSocket, { type RawData } from "ws";
+import { createSocket, type Socket } from "node:dgram";
 import {
   createDiagnostic,
   type Commitment,
@@ -27,6 +28,91 @@ export interface SolanaLogsSubscriberOptions {
   readonly onDiagnostic: (diagnostic: DiagnosticRecord) => Promise<void> | void;
   readonly initialReconnectDelayMs?: number;
   readonly maximumReconnectDelayMs?: number;
+}
+
+export interface ClockOffsetSample {
+  readonly host: string;
+  readonly requestedAtUnixMs: number;
+  readonly completedAtUnixMs: number;
+  readonly offsetMs: number;
+  readonly roundTripMs: number;
+  readonly stratum: number;
+  readonly leapIndicator: number;
+  readonly version: number;
+}
+
+const NTP_UNIX_EPOCH_SECONDS = 2_208_988_800;
+
+export function decodeNtpUnixMs(bytes: Buffer, offset: number): number {
+  if (bytes.length < offset + 8) throw new Error("truncated NTP timestamp");
+  const seconds = bytes.readUInt32BE(offset) - NTP_UNIX_EPOCH_SECONDS;
+  const fraction = bytes.readUInt32BE(offset + 4) / 2 ** 32;
+  return (seconds + fraction) * 1_000;
+}
+
+/** One lightweight SNTP sample. It is evidence of offset, not a synchronization guarantee. */
+export async function sampleSntpClock(
+  host = "time.cloudflare.com",
+  timeoutMs = 2_000,
+): Promise<ClockOffsetSample> {
+  const request = Buffer.alloc(48);
+  request[0] = 0x23; // LI=0, VN=4, client mode=3
+  const requestedAtUnixMs = Date.now();
+  const requestedAtMonotonicNs = process.hrtime.bigint();
+
+  return new Promise((resolvePromise, reject) => {
+    let socket: Socket | undefined = createSocket("udp4");
+    let settled = false;
+    const finish = (): Socket | undefined => {
+      const current = socket;
+      socket = undefined;
+      if (current !== undefined) current.close();
+      clearTimeout(timer);
+      return current;
+    };
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      finish();
+      reject(error);
+    };
+    const timer = setTimeout(() => fail(new Error(`NTP sample timed out after ${timeoutMs}ms`)), timeoutMs);
+
+    socket.once("error", fail);
+    socket.once("message", (message) => {
+      if (settled) return;
+      try {
+        if (message.length < 48) throw new Error("NTP response is shorter than 48 bytes");
+        const completedAtUnixMs = Date.now();
+        const elapsedMs = Number(process.hrtime.bigint() - requestedAtMonotonicNs) / 1_000_000;
+        const serverReceivedAtUnixMs = decodeNtpUnixMs(message, 32);
+        const serverTransmittedAtUnixMs = decodeNtpUnixMs(message, 40);
+        const offsetMs =
+          ((serverReceivedAtUnixMs - requestedAtUnixMs) +
+            (serverTransmittedAtUnixMs - completedAtUnixMs)) /
+          2;
+        const roundTripMs = elapsedMs - (serverTransmittedAtUnixMs - serverReceivedAtUnixMs);
+        const header = message[0] ?? 0;
+        settled = true;
+        finish();
+        resolvePromise({
+          host,
+          requestedAtUnixMs,
+          completedAtUnixMs,
+          offsetMs,
+          roundTripMs,
+          stratum: message[1] ?? 0,
+          leapIndicator: header >> 6,
+          version: (header >> 3) & 0x07,
+        });
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    socket.send(request, 123, host, (error) => {
+      if (error !== null) fail(error);
+    });
+  });
 }
 
 interface JsonRpcReply {

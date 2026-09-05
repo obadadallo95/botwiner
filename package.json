@@ -9,16 +9,21 @@
     "node": ">=20.10"
   },
   "scripts": {
-    "collector:start": "tsx apps/collector/src/main.ts",
-    "replay": "tsx apps/replay/src/main.ts",
+    "collector:start": "node --import tsx apps/collector/src/main.ts",
+    "replay": "node --import tsx apps/replay/src/main.ts",
+    "phase2:enrich": "node --import tsx apps/phase2/src/enrich.ts",
+    "phase2:rebuild": "node --import tsx apps/phase2/src/rebuild.ts",
+    "phase2:quality": "node --import tsx apps/phase2/src/quality.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/**/*.test.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
     "lint": "eslint .",
     "check": "pnpm typecheck && pnpm test && pnpm lint"
   },
   "devDependencies": {
     "@botwiner/market-data": "workspace:*",
     "@botwiner/pumpfun": "workspace:*",
+    "@botwiner/research": "workspace:*",
+    "@botwiner/solana": "workspace:*",
     "@botwiner/storage": "workspace:*",
     "@eslint/js": "^9.35.0",
     "@types/node": "^20.19.13",

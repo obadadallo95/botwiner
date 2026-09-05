@@ -21,6 +21,8 @@ test("decodes and normalizes the official CreateEvent layout", () => {
   const located = parsed.events[0];
   assert.ok(located);
   assert.equal(located.event.kind, "create");
+  assert.equal(located.outerInstructionIndex, 0);
+  assert.equal(located.eventIndex, 0);
   if (located.event.kind !== "create") return;
   assert.equal(located.event.name, "Research Token");
   assert.equal(located.event.symbol, "RSRCH");

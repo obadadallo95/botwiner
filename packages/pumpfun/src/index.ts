@@ -87,6 +87,10 @@ export type PumpEvent = PumpCreateEvent | PumpTradeEvent;
 
 export interface LocatedPumpEvent {
   readonly logIndex: number;
+  /** Best-effort outer transaction instruction inferred from depth-1 runtime invokes. */
+  readonly outerInstructionIndex: number | null;
+  /** Index among successfully decoded Pump events in this transaction. */
+  readonly eventIndex: number;
   readonly discriminatorHex: string;
   readonly event: PumpEvent;
 }
@@ -300,6 +304,7 @@ export function parsePumpProgramLogs(logs: readonly string[]): PumpLogParseResul
   const events: LocatedPumpEvent[] = [];
   const failures: PumpParseFailure[] = [];
   const programStack: string[] = [];
+  let outerInstructionIndex = -1;
 
   for (let logIndex = 0; logIndex < logs.length; logIndex += 1) {
     const line = logs[logIndex] ?? "";
@@ -308,6 +313,7 @@ export function parsePumpProgramLogs(logs: readonly string[]): PumpLogParseResul
       const programId = invocation[1] ?? "";
       const depth = Number(invocation[2]);
       if (Number.isSafeInteger(depth) && depth > 0) {
+        if (depth === 1) outerInstructionIndex += 1;
         programStack.length = Math.min(programStack.length, depth - 1);
         programStack[depth - 1] = programId;
       }
@@ -337,6 +343,8 @@ export function parsePumpProgramLogs(logs: readonly string[]): PumpLogParseResul
     try {
       events.push({
         logIndex,
+        outerInstructionIndex: outerInstructionIndex >= 0 ? outerInstructionIndex : null,
+        eventIndex: events.length,
         discriminatorHex,
         event: decoder(bytes.subarray(8)),
       });
