@@ -6,6 +6,7 @@ import type {
   ReboundEntryRule,
   ReboundEvaluationSummary,
   ReboundExitPolicy,
+  ReboundExitReason,
   ReboundPopulationAudit,
   ReboundTradeExecution,
 } from "./rebound-research-types.js";
@@ -333,6 +334,89 @@ export const PREDEFINED_EXIT_POLICIES: readonly ReboundExitPolicy[] = [
   },
 ];
 
+export interface PumpBuyQuote {
+  readonly curveSolInLamports: bigint;
+  readonly tokensReceived: bigint;
+  readonly feeLamports: bigint;
+  readonly totalWalletOutflowLamports: bigint;
+  readonly postVSol: bigint;
+  readonly postVTok: bigint;
+}
+
+export function quotePumpBuy(
+  curveSolInLamports: bigint,
+  vSol: bigint,
+  vTok: bigint,
+  feeBps = 100n,
+): PumpBuyQuote {
+  if (curveSolInLamports <= 0n || vSol <= 0n || vTok <= 0n) {
+    return {
+      curveSolInLamports: 0n,
+      tokensReceived: 0n,
+      feeLamports: 0n,
+      totalWalletOutflowLamports: 0n,
+      postVSol: vSol,
+      postVTok: vTok,
+    };
+  }
+  const k = vSol * vTok;
+  const postVSol = vSol + curveSolInLamports;
+  const postVTok = k / postVSol;
+  const tokensReceived = vTok > postVTok ? vTok - postVTok : 0n;
+  const feeLamports = (curveSolInLamports * feeBps) / 10_000n;
+  const totalWalletOutflowLamports = curveSolInLamports + feeLamports;
+  return {
+    curveSolInLamports,
+    tokensReceived,
+    feeLamports,
+    totalWalletOutflowLamports,
+    postVSol,
+    postVTok,
+  };
+}
+
+export interface PumpSellQuote {
+  readonly tokensIn: bigint;
+  readonly grossCurveSolOutLamports: bigint;
+  readonly feeLamports: bigint;
+  readonly netWalletInflowLamports: bigint;
+  readonly postVSol: bigint;
+  readonly postVTok: bigint;
+}
+
+export function quotePumpSell(
+  tokensIn: bigint,
+  vSol: bigint,
+  vTok: bigint,
+  feeBps = 100n,
+): PumpSellQuote {
+  if (tokensIn <= 0n || vSol <= 0n || vTok <= 0n) {
+    return {
+      tokensIn: 0n,
+      grossCurveSolOutLamports: 0n,
+      feeLamports: 0n,
+      netWalletInflowLamports: 0n,
+      postVSol: vSol,
+      postVTok: vTok,
+    };
+  }
+  const k = vSol * vTok;
+  const postVTok = vTok + tokensIn;
+  const postVSol = k / postVTok;
+  const grossCurveSolOutLamports = vSol > postVSol ? vSol - postVSol : 0n;
+  const feeLamports = (grossCurveSolOutLamports * feeBps) / 10_000n;
+  const netWalletInflowLamports =
+    grossCurveSolOutLamports > feeLamports ? grossCurveSolOutLamports - feeLamports : 0n;
+  return {
+    tokensIn,
+    grossCurveSolOutLamports,
+    feeLamports,
+    netWalletInflowLamports,
+    postVSol,
+    postVTok,
+  };
+}
+
 export function simulateReboundTrade(
   states: CausalTrajectoryState[],
   rule: ReboundEntryRule,
@@ -369,48 +453,66 @@ export function simulateReboundTrade(
   const entryState = states[entryIndex]!;
   const entryTimeMs = entryState.timestampMs;
 
-  // Constant-product bonding curve buy fill:
-  // virtualSol, virtualToken
   const posLamports = BigInt(Math.round(positionSizeSol * 1e9));
-  const vSol = entryState.virtualSolLamports;
-  const vTok = entryState.virtualTokenBaseUnits;
-  const k = vSol * vTok;
+  const pumpFeeBps = BigInt(costScenario.pumpFeeRateBps ?? 100);
 
-  const newVSol = vSol + posLamports;
-  const newVTok = k / newVSol;
-  const tokensReceived = vTok - newVTok;
+  const buyQuote = quotePumpBuy(
+    posLamports,
+    entryState.virtualSolLamports,
+    entryState.virtualTokenBaseUnits,
+    pumpFeeBps,
+  );
 
-  if (tokensReceived <= 0n) return null;
+  if (buyQuote.tokensReceived <= 0n) return null;
 
+  const tokensReceived = buyQuote.tokensReceived;
   const entryFillPrice = Number(posLamports) / Number(tokensReceived);
 
   // Search forward for exit
   let exitIndex = -1;
-  let exitReason: "take-profit" | "stop-loss" | "time-exit" | "right-censored" = "time-exit";
-  let exitPrice = 0;
+  let exitReason: ReboundExitReason = "time-exit";
   let exitTimeMs = entryTimeMs;
+  let finalExecutableGrossReturnPct = 0;
+
+  const targetExitTimeMs = entryTimeMs + exitPolicy.maxHoldDurationMs;
 
   for (let j = entryIndex + 1; j < states.length; j++) {
     const curr = states[j]!;
     const elapsedMs = curr.timestampMs - entryTimeMs;
-    const currPrice = curr.price;
-    const priceChangePct = (currPrice - entryFillPrice) / entryFillPrice;
 
-    // Check Take Profit
-    if (exitPolicy.takeProfitPct !== undefined && priceChangePct >= exitPolicy.takeProfitPct) {
+    // Calculate executable sell quote if selling actual tokensReceived NOW against curr reserve state
+    const sellQuote = quotePumpSell(
+      tokensReceived,
+      curr.virtualSolLamports,
+      curr.virtualTokenBaseUnits,
+      pumpFeeBps,
+    );
+
+    const grossSolOutLamports = sellQuote.grossCurveSolOutLamports;
+    const executableGrossReturnPct =
+      posLamports > 0n ? Number(grossSolOutLamports - posLamports) / Number(posLamports) : 0;
+
+    // Check Take Profit using executable mark-to-exit value
+    if (
+      exitPolicy.takeProfitPct !== undefined &&
+      executableGrossReturnPct >= exitPolicy.takeProfitPct
+    ) {
       exitIndex = j;
       exitReason = "take-profit";
-      exitPrice = currPrice;
       exitTimeMs = curr.timestampMs;
+      finalExecutableGrossReturnPct = executableGrossReturnPct;
       break;
     }
 
-    // Check Stop Loss
-    if (exitPolicy.stopLossPct !== undefined && priceChangePct <= exitPolicy.stopLossPct) {
+    // Check Stop Loss using executable mark-to-exit value
+    if (
+      exitPolicy.stopLossPct !== undefined &&
+      executableGrossReturnPct <= exitPolicy.stopLossPct
+    ) {
       exitIndex = j;
       exitReason = "stop-loss";
-      exitPrice = currPrice;
       exitTimeMs = curr.timestampMs;
+      finalExecutableGrossReturnPct = executableGrossReturnPct;
       break;
     }
 
@@ -418,8 +520,8 @@ export function simulateReboundTrade(
     if (elapsedMs >= exitPolicy.maxHoldDurationMs) {
       exitIndex = j;
       exitReason = "time-exit";
-      exitPrice = currPrice;
       exitTimeMs = curr.timestampMs;
+      finalExecutableGrossReturnPct = executableGrossReturnPct;
       break;
     }
   }
@@ -427,56 +529,60 @@ export function simulateReboundTrade(
   let isRightCensored = false;
 
   if (exitIndex === -1) {
-    // If no exit triggered and dataset ended before maxHoldDurationMs elapsed
-    if (entryTimeMs + exitPolicy.maxHoldDurationMs > datasetEndMs) {
+    if (targetExitTimeMs > datasetEndMs) {
+      // Requested max hold could not be observed because the dataset capture ended
       isRightCensored = true;
-      exitReason = "right-censored";
-      // Use last observed price
-      const lastState = states[states.length - 1]!;
-      exitPrice = lastState.price;
-      exitTimeMs = lastState.timestampMs;
+      exitReason = "dataset-boundary-censored";
     } else {
-      // Token simply stopped trading before max hold duration; use last trade
-      const lastState = states[states.length - 1]!;
-      exitPrice = lastState.price;
-      exitTimeMs = lastState.timestampMs;
-      exitReason = "time-exit";
+      // Dataset continued running past max hold horizon, but token stopped producing trades
+      isRightCensored = true;
+      exitReason = "trajectory-ended-before-exit-horizon";
     }
+    const lastState = states[states.length - 1]!;
+    exitTimeMs = lastState.timestampMs;
   }
 
-  // Sell tokens on bonding curve at exit state
+  // Final sell quote at exit state
   const exitState = exitIndex !== -1 ? states[exitIndex]! : states[states.length - 1]!;
-  const exitVSol = exitState.virtualSolLamports;
-  const exitVTok = exitState.virtualTokenBaseUnits;
-  const exitK = exitVSol * exitVTok;
+  const exitSellQuote = quotePumpSell(
+    tokensReceived,
+    exitState.virtualSolLamports,
+    exitState.virtualTokenBaseUnits,
+    pumpFeeBps,
+  );
 
-  const postSellVTok = exitVTok + tokensReceived;
-  const postSellVSol = exitK / postSellVTok;
-  const grossSolReceivedLamports = exitVSol - postSellVSol;
+  const grossSolReceivedLamports = exitSellQuote.grossCurveSolOutLamports;
   const grossSolReceived = Number(grossSolReceivedLamports) / 1e9;
-
   const grossPnlSol = grossSolReceived - positionSizeSol;
 
-  // Fee model:
-  // Pump fee rate (default 1% = 100 bps)
-  const pumpFeeRate = (costScenario.pumpFeeRateBps ?? 100) / 10_000;
-  const entryPumpFee = positionSizeSol * pumpFeeRate;
-  const exitPumpFee = Math.max(0, grossSolReceived * pumpFeeRate);
+  if (exitIndex === -1) {
+    finalExecutableGrossReturnPct =
+      posLamports > 0n
+        ? Number(grossSolReceivedLamports - posLamports) / Number(posLamports)
+        : 0;
+  }
 
-  // Solana fees and tips (base fee, priority fee, Jito tip)
+  // Exact fee decomposition:
+  // Buy pump fee + Sell pump fee
+  const entryPumpFeeSol = Number(buyQuote.feeLamports) / 1e9;
+  const exitPumpFeeSol = Number(exitSellQuote.feeLamports) / 1e9;
+  const totalPumpFeeSol = entryPumpFeeSol + exitPumpFeeSol;
+
+  // Solana base fee, priority fee, and Jito tip
   const baseFeeSol = Number(costScenario.baseFeeLamports ?? 0) / 1e9;
   const priorityFeeSol = Number(costScenario.priorityFeeLamports ?? 0) / 1e9;
   const jitoTipSol = Number(costScenario.jitoTipLamports ?? 0) / 1e9;
 
   const totalFeesSol =
-    entryPumpFee +
-    exitPumpFee +
+    totalPumpFeeSol +
     baseFeeSol +
     priorityFeeSol +
     jitoTipSol;
 
   const netPnlSol = grossPnlSol - totalFeesSol;
   const returnPct = positionSizeSol > 0 ? (netPnlSol / positionSizeSol) * 100 : 0;
+  const exitFillPrice =
+    tokensReceived > 0n ? Number(grossSolReceivedLamports) / Number(tokensReceived) : entryFillPrice;
 
   return {
     mint: signalState.mint,
@@ -487,12 +593,13 @@ export function simulateReboundTrade(
     exitTimestampMs: exitTimeMs,
     holdDurationMs: exitTimeMs - entryTimeMs,
     positionSizeSol,
-    entryVirtualSol: vSol,
-    entryVirtualToken: vTok,
+    entryVirtualSol: entryState.virtualSolLamports,
+    entryVirtualToken: entryState.virtualTokenBaseUnits,
     tokensReceived,
     entryFillPrice,
-    exitFillPrice: exitPrice > 0 ? exitPrice : entryFillPrice,
+    exitFillPrice,
     exitReason,
+    executableGrossReturnPct: finalExecutableGrossReturnPct * 100,
     grossPnlSol,
     netPnlSol,
     returnPct,
@@ -548,8 +655,18 @@ export function evaluateReboundAcrossSplits(
     const selectedTrades = executions.length;
     const selectionRatePct = eligibleTokens > 0 ? (selectedTrades / eligibleTokens) * 100 : 0;
 
-    // Separate censored vs completed
-    const censoredTrades = executions.filter((e) => e.isRightCensored).length;
+    // Granular right-censoring distinction:
+    // A: dataset boundary censored
+    // B: trajectory ended before exit horizon
+    const datasetBoundaryCensoredTrades = executions.filter(
+      (e) => e.exitReason === "dataset-boundary-censored",
+    ).length;
+    const trajectoryEndedCensoredTrades = executions.filter(
+      (e) => e.exitReason === "trajectory-ended-before-exit-horizon",
+    ).length;
+    const censoredTrades = datasetBoundaryCensoredTrades + trajectoryEndedCensoredTrades;
+
+    // Primary completed PnL metrics strictly exclude all right-censored trades
     const completedTradesList = executions.filter((e) => !e.isRightCensored);
     const completedTrades = completedTradesList.length;
 
@@ -633,6 +750,8 @@ export function evaluateReboundAcrossSplits(
       eligibleTokens,
       selectedTrades,
       censoredTrades,
+      datasetBoundaryCensoredTrades,
+      trajectoryEndedCensoredTrades,
       completedTrades,
       selectionRatePct,
       wins,
@@ -659,4 +778,85 @@ export function evaluateReboundAcrossSplits(
       passedHoldoutGate,
     };
   });
+}
+
+/**
+ * Deterministically selects the best candidate rule using ONLY training (60%) and validation (20%) data.
+ * Holdout data is NEVER accessed or used in this decision.
+ *
+ * Selection hierarchy:
+ * 1. Highest combined train+validation Net EV
+ * 2. Break ties by validation Net EV
+ * 3. Break remaining ties by larger completed trade count
+ * 4. Deterministic lexical tie-breaker by rule name
+ */
+export function selectBestTrainValRule(
+  candidateRules: readonly ReboundEntryRule[],
+  evaluations: readonly ReboundEvaluationSummary[],
+): {
+  selectedRule: ReboundEntryRule;
+  trainEv: number;
+  valEv: number;
+  trainValEv: number;
+  trainValCompletedTrades: number;
+  rankedCandidates: readonly {
+    rule: ReboundEntryRule;
+    trainEv: number;
+    valEv: number;
+    trainValEv: number;
+    trainValCompletedTrades: number;
+  }[];
+} {
+  const candidatesStats = candidateRules.map((rule) => {
+    const trainEval = evaluations.find(
+      (e) => e.ruleName === rule.name && e.split === "train",
+    );
+    const valEval = evaluations.find(
+      (e) => e.ruleName === rule.name && e.split === "validation",
+    );
+
+    const trainCompleted = trainEval?.completedTrades ?? 0;
+    const valCompleted = valEval?.completedTrades ?? 0;
+    const trainValCompletedTrades = trainCompleted + valCompleted;
+
+    const trainNetPnl = trainEval?.totalNetPnlSol ?? 0;
+    const valNetPnl = valEval?.totalNetPnlSol ?? 0;
+    const trainValTotalNetPnl = trainNetPnl + valNetPnl;
+
+    const trainEv = trainCompleted > 0 ? trainNetPnl / trainCompleted : 0;
+    const valEv = valCompleted > 0 ? valNetPnl / valCompleted : 0;
+    const trainValEv =
+      trainValCompletedTrades > 0 ? trainValTotalNetPnl / trainValCompletedTrades : -Infinity;
+
+    return {
+      rule,
+      trainEv,
+      valEv,
+      trainValEv,
+      trainValCompletedTrades,
+    };
+  });
+
+  const sorted = [...candidatesStats].sort((a, b) => {
+    if (Math.abs(b.trainValEv - a.trainValEv) > 1e-9) {
+      return b.trainValEv - a.trainValEv;
+    }
+    if (Math.abs(b.valEv - a.valEv) > 1e-9) {
+      return b.valEv - a.valEv;
+    }
+    if (b.trainValCompletedTrades !== a.trainValCompletedTrades) {
+      return b.trainValCompletedTrades - a.trainValCompletedTrades;
+    }
+    return a.rule.name.localeCompare(b.rule.name);
+  });
+
+  const best = sorted[0]!;
+  return {
+    selectedRule: best.rule,
+    trainEv: best.trainEv,
+    valEv: best.valEv,
+    trainValEv: best.trainValEv,
+    trainValCompletedTrades: best.trainValCompletedTrades,
+    rankedCandidates: sorted,
+  };
 }

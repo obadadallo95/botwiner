@@ -56,6 +56,13 @@ export interface ReboundExitPolicy {
   readonly stopLossPct?: number;   // e.g. -0.10 for -10%
 }
 
+export type ReboundExitReason =
+  | "take-profit"
+  | "stop-loss"
+  | "time-exit"
+  | "dataset-boundary-censored"
+  | "trajectory-ended-before-exit-horizon";
+
 export interface ReboundTradeExecution {
   readonly mint: string;
   readonly ruleName: string;
@@ -70,7 +77,8 @@ export interface ReboundTradeExecution {
   readonly tokensReceived: bigint;
   readonly entryFillPrice: number;
   readonly exitFillPrice: number;
-  readonly exitReason: "take-profit" | "stop-loss" | "time-exit" | "right-censored";
+  readonly exitReason: ReboundExitReason;
+  readonly executableGrossReturnPct: number;
   readonly grossPnlSol: number;
   readonly netPnlSol: number;
   readonly returnPct: number;
@@ -89,6 +97,8 @@ export interface ReboundEvaluationSummary {
   readonly eligibleTokens: number;
   readonly selectedTrades: number;
   readonly censoredTrades: number;
+  readonly datasetBoundaryCensoredTrades: number;
+  readonly trajectoryEndedCensoredTrades: number;
   readonly completedTrades: number;
   readonly selectionRatePct: number;
   readonly wins: number;
@@ -113,6 +123,7 @@ export interface ReboundEvaluationSummary {
   readonly netExTop1ProfitSol: number;
   readonly netExTop5ProfitSol: number;
   readonly passedHoldoutGate: boolean;
+  readonly trainValNetEvSol?: number;
 }
 
 export interface ReboundResearchReport {
@@ -137,9 +148,13 @@ export interface ReboundResearchReport {
   };
   readonly decisionGate:
     | "ROBUST REBOUND EDGE FOUND"
+    | "WEAK / INCONCLUSIVE"
+    | "COST-DESTROYED EDGE"
+    | "OUTLIER-ONLY EDGE"
+    | "NO CAUSAL REBOUND EDGE"
+    | "MODEL/DATA STILL INSUFFICIENT"
     | "PROMISING BUT MORE DATA NEEDED"
     | "EDGE EXISTS BUT REQUIRES FAST EXECUTION"
-    | "NO CAUSAL REBOUND EDGE"
     | "DATA INSUFFICIENT";
   readonly rationale: string;
 }

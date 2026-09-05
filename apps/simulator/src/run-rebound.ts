@@ -5,6 +5,8 @@ import {
   auditReboundPopulation,
   computeCausalTrajectoryStates,
   evaluateReboundAcrossSplits,
+  simulateReboundTrade,
+  selectBestTrainValRule,
   PREDEFINED_REBOUND_RULES,
   PREDEFINED_EXIT_POLICIES,
   STANDARD_COST_SCENARIOS,
@@ -12,6 +14,7 @@ import {
 import type {
   ReboundEvaluationSummary,
   ReboundResearchReport,
+  ReboundTradeExecution,
 } from "@botwiner/research";
 
 async function main() {
@@ -100,57 +103,196 @@ async function main() {
     const val = evals.find((e) => e.split === "validation")!;
     const hold = evals.find((e) => e.split === "holdout")!;
     const comb = evals.find((e) => e.split === "combined")!;
-    console.log(`  ${rule.name.padEnd(50)} | Train: ${train.evPerSelectedTradeSol.toFixed(6)} | Val: ${val.evPerSelectedTradeSol.toFixed(6)} | Holdout: ${hold.evPerSelectedTradeSol.toFixed(6)} SOL (N=${hold.completedTrades}) | Gate=${comb.passedHoldoutGate}`);
+    const trainValN = train.completedTrades + val.completedTrades;
+    const trainValNetPnl = train.totalNetPnlSol + val.totalNetPnlSol;
+    const trainValEv = trainValN > 0 ? trainValNetPnl / trainValN : 0;
+    console.log(`  ${rule.name.padEnd(50)} | Train: ${train.evPerSelectedTradeSol.toFixed(6)} | Val: ${val.evPerSelectedTradeSol.toFixed(6)} | Train+Val: ${trainValEv.toFixed(6)} (N=${trainValN}) | Holdout: ${hold.evPerSelectedTradeSol.toFixed(6)} (N=${hold.completedTrades}) | Gate=${comb.passedHoldoutGate}`);
   }
 
-  // Pick best performing candidate rule from training/val for sensitivity checks
-  const bestRule = PREDEFINED_REBOUND_RULES.find((r) => r.name.startsWith("Rule D")) || candidateRules[0]!;
+  // Pick best performing candidate rule strictly from training and validation data (never holdout)
+  const selectionResult = selectBestTrainValRule(candidateRules, ruleEvaluations);
+  const bestRule = selectionResult.selectedRule;
 
-  // 4. Cost Sensitivity (Zero, Low, Medium, High)
-  console.log(`\nCost Sensitivity on ${bestRule.name}:`);
+  console.log(`\n--------------------------------------------------------------------------------`);
+  console.log(`DETERMINISTIC SENSITIVITY RULE SELECTION (Exclusively Train & Validation Data):`);
+  console.log(`--------------------------------------------------------------------------------`);
+  console.log(`  Selected Rule Name:        ${selectionResult.selectedRule.name}`);
+  console.log(`  Train Net EV:              ${selectionResult.trainEv.toFixed(6)} SOL`);
+  console.log(`  Validation Net EV:         ${selectionResult.valEv.toFixed(6)} SOL`);
+  console.log(`  Combined Train+Val Net EV: ${selectionResult.trainValEv.toFixed(6)} SOL`);
+  console.log(`  Train+Val Completed Trades:${selectionResult.trainValCompletedTrades}`);
+  console.log(`  Ranked Train/Val Candidates:`);
+  for (let rank = 0; rank < selectionResult.rankedCandidates.length; rank++) {
+    const c = selectionResult.rankedCandidates[rank]!;
+    console.log(`    #${rank + 1}: ${c.rule.name.padEnd(45)} | Train+Val EV: ${c.trainValEv.toFixed(6)} SOL | Val EV: ${c.valEv.toFixed(6)} SOL | N=${c.trainValCompletedTrades}`);
+  }
+  console.log(`--------------------------------------------------------------------------------\n`);
+
+  // 4. Detailed Audit of Rule B across Train, Validation, Train+Val, Holdout, Combined
+  const ruleB = PREDEFINED_REBOUND_RULES.find((r) => r.name.startsWith("Rule B")) || candidateRules[0]!;
+  console.log(`\n================================================================================`);
+  console.log(`RULE B HOLDOUT & OUTLIER AUDIT (Frozen Parameters: 0.05 SOL, Medium Cost, TP+20%/SL-10%, 60s)`);
+  console.log(`================================================================================`);
+  const ruleBEvals = evaluateReboundAcrossSplits(tokenTrajectories, ruleB, defaultExit, 0.05, STANDARD_COST_SCENARIOS.medium, 0, datasetEndMs);
+  const rBTrain = ruleBEvals.find((e) => e.split === "train")!;
+  const rBVal = ruleBEvals.find((e) => e.split === "validation")!;
+  const rBHold = ruleBEvals.find((e) => e.split === "holdout")!;
+  const rBComb = ruleBEvals.find((e) => e.split === "combined")!;
+
+  const rBTrainValCompleted = rBTrain.completedTrades + rBVal.completedTrades;
+  const rBTrainValCensored = rBTrain.censoredTrades + rBVal.censoredTrades;
+  const rBTrainValNetPnl = rBTrain.totalNetPnlSol + rBVal.totalNetPnlSol;
+  const rBTrainValGrossPnl = rBTrain.totalGrossPnlSol + rBVal.totalGrossPnlSol;
+  const rBTrainValWins = rBTrain.wins + rBVal.wins;
+  const rBTrainValWinRate = rBTrainValCompleted > 0 ? (rBTrainValWins / rBTrainValCompleted) * 100 : 0;
+  const rBTrainValGrossEv = rBTrainValCompleted > 0 ? rBTrainValGrossPnl / rBTrainValCompleted : 0;
+  const rBTrainValNetEv = rBTrainValCompleted > 0 ? rBTrainValNetPnl / rBTrainValCompleted : 0;
+
+  const printSplitSummary = (label: string, s: ReboundEvaluationSummary | {
+    completedTrades: number;
+    censoredTrades: number;
+    winRatePct: number;
+    totalGrossPnlSol: number;
+    totalNetPnlSol: number;
+    evPerSelectedTradeSol: number;
+    medianTradePnlSol?: number;
+    profitFactor?: number;
+    top1PctProfitShare?: number;
+    top5PctProfitShare?: number;
+    netExTop1ProfitSol?: number;
+    netExTop5ProfitSol?: number;
+  }, grossEvOverride?: number) => {
+    const grossEv = grossEvOverride !== undefined ? grossEvOverride : ("totalGrossPnlSol" in s && s.completedTrades > 0 ? s.totalGrossPnlSol / s.completedTrades : 0);
+    console.log(`Split: ${label.padEnd(16)}`);
+    console.log(`  Completed Trades:   ${s.completedTrades}`);
+    console.log(`  Censored Trades:    ${s.censoredTrades}`);
+    console.log(`  Win Rate:           ${s.winRatePct.toFixed(1)}%`);
+    console.log(`  Gross EV / Trade:   ${grossEv.toFixed(6)} SOL`);
+    console.log(`  Net EV / Trade:     ${s.evPerSelectedTradeSol.toFixed(6)} SOL`);
+    console.log(`  Total Net PnL:      ${s.totalNetPnlSol.toFixed(6)} SOL`);
+    if ("medianTradePnlSol" in s && s.medianTradePnlSol !== undefined) {
+      console.log(`  Median Trade PnL:   ${s.medianTradePnlSol.toFixed(6)} SOL`);
+      console.log(`  Profit Factor:      ${s.profitFactor?.toFixed(2)}`);
+      console.log(`  Top 1% Profit Share:${s.top1PctProfitShare?.toFixed(1)}%`);
+      console.log(`  Top 5% Profit Share:${s.top5PctProfitShare?.toFixed(1)}%`);
+      console.log(`  Net Ex-Top 1% PnL:  ${s.netExTop1ProfitSol?.toFixed(6)} SOL`);
+      console.log(`  Net Ex-Top 5% PnL:  ${s.netExTop5ProfitSol?.toFixed(6)} SOL`);
+    }
+  };
+
+  printSplitSummary("Train", rBTrain);
+  printSplitSummary("Validation", rBVal);
+  printSplitSummary("Train+Validation", {
+    completedTrades: rBTrainValCompleted,
+    censoredTrades: rBTrainValCensored,
+    winRatePct: rBTrainValWinRate,
+    totalGrossPnlSol: rBTrainValGrossPnl,
+    totalNetPnlSol: rBTrainValNetPnl,
+    evPerSelectedTradeSol: rBTrainValNetEv,
+  }, rBTrainValGrossEv);
+  printSplitSummary("Holdout", rBHold);
+  printSplitSummary("Combined", rBComb);
+
+  // Print chronological list of completed trades in Holdout for Rule B
+  console.log(`\nIndividual Chronological Completed Trades for Rule B on HOLDOUT:`);
+  const holdoutTrajectories = tokenTrajectories.slice(nTrain + nVal);
+  const holdoutExecutions: ReboundTradeExecution[] = [];
+  for (const item of holdoutTrajectories) {
+    const exec = simulateReboundTrade(
+      item.states,
+      ruleB,
+      defaultExit,
+      0.05,
+      STANDARD_COST_SCENARIOS.medium,
+      0,
+      datasetEndMs,
+      "holdout",
+    );
+    if (exec) holdoutExecutions.push(exec);
+  }
+
+  const holdoutCompleted = holdoutExecutions
+    .filter((e) => !e.isRightCensored)
+    .sort((a, b) => a.entryTimestampMs - b.entryTimestampMs);
+
+  console.log(`  Total Holdout Triggers: ${holdoutExecutions.length} | Completed: ${holdoutCompleted.length} | Censored: ${holdoutExecutions.length - holdoutCompleted.length}`);
+  console.log(`  ${"Trade #".padEnd(8)} | ${"Mint".padEnd(46)} | ${"Exit Reason".padEnd(14)} | ${"HoldSec".padEnd(8)} | ${"Gross PnL (SOL)".padEnd(16)} | ${"Net PnL (SOL)".padEnd(16)} | ${"Return %".padEnd(10)}`);
+  for (let idx = 0; idx < holdoutCompleted.length; idx++) {
+    const tr = holdoutCompleted[idx]!;
+    console.log(`  #${String(idx + 1).padEnd(7)} | ${tr.mint.padEnd(46)} | ${tr.exitReason.padEnd(14)} | ${(tr.holdDurationMs / 1000).toFixed(1).padEnd(8)} | ${tr.grossPnlSol.toFixed(6).padEnd(16)} | ${tr.netPnlSol.toFixed(6).padEnd(16)} | ${tr.returnPct.toFixed(2)}%`);
+  }
+  console.log(`================================================================================\n`);
+
+  // 5. Cost Sensitivity (Zero, Low, Medium, High) on Selected Best Rule
+  console.log(`\nCost Sensitivity on Selected Rule (${bestRule.name}):`);
+  console.log(`  ${"Tier".padEnd(8)} | ${"Train+Val EV".padEnd(15)} | ${"Holdout EV".padEnd(15)} | ${"Comb Net EV".padEnd(15)} | ${"Completed".padEnd(10)} | ${"Censored".padEnd(10)} | ${"Comb Win%".padEnd(10)}`);
   const costSensitivity: ReboundEvaluationSummary[] = [];
   for (const [tierName, costScenario] of Object.entries(STANDARD_COST_SCENARIOS)) {
     const evals = evaluateReboundAcrossSplits(tokenTrajectories, bestRule, defaultExit, 0.05, costScenario, 0, datasetEndMs);
     costSensitivity.push(...evals);
+    const tr = evals.find((e) => e.split === "train")!;
+    const val = evals.find((e) => e.split === "validation")!;
     const hold = evals.find((e) => e.split === "holdout")!;
     const comb = evals.find((e) => e.split === "combined")!;
-    console.log(`  Cost Tier: ${tierName.padEnd(8)} | Comb Net EV: ${comb.evPerSelectedTradeSol.toFixed(6)} SOL (Win%: ${comb.winRatePct.toFixed(1)}%) | Holdout Net EV: ${hold.evPerSelectedTradeSol.toFixed(6)} SOL`);
+    const tvN = tr.completedTrades + val.completedTrades;
+    const tvNetPnl = tr.totalNetPnlSol + val.totalNetPnlSol;
+    const tvEv = tvN > 0 ? tvNetPnl / tvN : 0;
+    console.log(`  ${tierName.padEnd(8)} | ${tvEv.toFixed(6).padEnd(15)} | ${hold.evPerSelectedTradeSol.toFixed(6).padEnd(15)} | ${comb.evPerSelectedTradeSol.toFixed(6).padEnd(15)} | ${String(comb.completedTrades).padEnd(10)} | ${String(comb.censoredTrades).padEnd(10)} | ${comb.winRatePct.toFixed(1)}%`);
   }
 
-  // 5. Position Size Sensitivity (0.01, 0.05, 0.10, 0.25 SOL)
-  console.log(`\nPosition Size Sensitivity on ${bestRule.name}:`);
+  // 6. Position Size Sensitivity (0.01, 0.05, 0.10, 0.25 SOL) on Selected Best Rule
+  console.log(`\nPosition Size Sensitivity on Selected Rule (${bestRule.name}):`);
+  console.log(`  ${"Size".padEnd(10)} | ${"Train+Val EV".padEnd(15)} | ${"Holdout EV".padEnd(15)} | ${"Comb Net EV".padEnd(15)} | ${"Completed".padEnd(10)} | ${"Censored".padEnd(10)} | ${"Return %".padEnd(10)}`);
   const positionSizeSensitivity: ReboundEvaluationSummary[] = [];
   for (const size of [0.01, 0.05, 0.1, 0.25]) {
     const evals = evaluateReboundAcrossSplits(tokenTrajectories, bestRule, defaultExit, size, STANDARD_COST_SCENARIOS.medium, 0, datasetEndMs);
     positionSizeSensitivity.push(...evals);
+    const tr = evals.find((e) => e.split === "train")!;
+    const val = evals.find((e) => e.split === "validation")!;
     const hold = evals.find((e) => e.split === "holdout")!;
     const comb = evals.find((e) => e.split === "combined")!;
-    console.log(`  Size: ${size} SOL | Comb Net EV: ${comb.evPerSelectedTradeSol.toFixed(6)} SOL (Ret: ${(comb.evPerSelectedTradeSol / size * 100).toFixed(2)}%) | Holdout Net EV: ${hold.evPerSelectedTradeSol.toFixed(6)} SOL`);
+    const tvN = tr.completedTrades + val.completedTrades;
+    const tvNetPnl = tr.totalNetPnlSol + val.totalNetPnlSol;
+    const tvEv = tvN > 0 ? tvNetPnl / tvN : 0;
+    const retPct = (comb.evPerSelectedTradeSol / size) * 100;
+    console.log(`  ${(size + " SOL").padEnd(10)} | ${tvEv.toFixed(6).padEnd(15)} | ${hold.evPerSelectedTradeSol.toFixed(6).padEnd(15)} | ${comb.evPerSelectedTradeSol.toFixed(6).padEnd(15)} | ${String(comb.completedTrades).padEnd(10)} | ${String(comb.censoredTrades).padEnd(10)} | ${retPct.toFixed(2)}%`);
   }
 
-  // 6. Execution Latency Delay Sensitivity (0ms, 100ms, 500ms, 1s, 2s, 5s)
-  console.log(`\nExecution Latency Delay Sensitivity on ${bestRule.name}:`);
+  // 7. Execution Latency Delay Sensitivity (0ms, 100ms, 500ms, 1s, 2s, 5s) on Selected Best Rule
+  console.log(`\nExecution Latency Delay Sensitivity on Selected Rule (${bestRule.name}):`);
+  console.log(`  ${"Delay".padEnd(8)} | ${"Train+Val EV".padEnd(15)} | ${"Holdout EV".padEnd(15)} | ${"Comb Net EV".padEnd(15)} | ${"Completed".padEnd(10)} | ${"Censored".padEnd(10)}`);
   const latencyDelaySensitivity: ReboundEvaluationSummary[] = [];
   for (const delayMs of [0, 100, 500, 1000, 2000, 5000]) {
     const evals = evaluateReboundAcrossSplits(tokenTrajectories, bestRule, defaultExit, 0.05, STANDARD_COST_SCENARIOS.medium, delayMs, datasetEndMs);
     latencyDelaySensitivity.push(...evals);
+    const tr = evals.find((e) => e.split === "train")!;
+    const val = evals.find((e) => e.split === "validation")!;
     const hold = evals.find((e) => e.split === "holdout")!;
     const comb = evals.find((e) => e.split === "combined")!;
-    console.log(`  Delay: ${String(delayMs).padStart(4)}ms | Comb Net EV: ${comb.evPerSelectedTradeSol.toFixed(6)} SOL | Holdout Net EV: ${hold.evPerSelectedTradeSol.toFixed(6)} SOL`);
+    const tvN = tr.completedTrades + val.completedTrades;
+    const tvNetPnl = tr.totalNetPnlSol + val.totalNetPnlSol;
+    const tvEv = tvN > 0 ? tvNetPnl / tvN : 0;
+    console.log(`  ${(delayMs + "ms").padEnd(8)} | ${tvEv.toFixed(6).padEnd(15)} | ${hold.evPerSelectedTradeSol.toFixed(6).padEnd(15)} | ${comb.evPerSelectedTradeSol.toFixed(6).padEnd(15)} | ${String(comb.completedTrades).padEnd(10)} | ${String(comb.censoredTrades).padEnd(10)}`);
   }
 
-  // 7. Exit Policy Sensitivity
-  console.log(`\nExit Policy Sensitivity on ${bestRule.name}:`);
+  // 8. Exit Policy Sensitivity on Selected Best Rule
+  console.log(`\nExit Policy Sensitivity on Selected Rule (${bestRule.name}):`);
+  console.log(`  ${"Exit Policy".padEnd(32)} | ${"Train+Val EV".padEnd(15)} | ${"Holdout EV".padEnd(15)} | ${"Comb Net EV".padEnd(15)} | ${"Completed".padEnd(10)} | ${"Censored".padEnd(10)} | ${"Win%".padEnd(8)}`);
   const exitPolicySensitivity: ReboundEvaluationSummary[] = [];
   for (const exitPolicy of PREDEFINED_EXIT_POLICIES) {
     const evals = evaluateReboundAcrossSplits(tokenTrajectories, bestRule, exitPolicy, 0.05, STANDARD_COST_SCENARIOS.medium, 0, datasetEndMs);
     exitPolicySensitivity.push(...evals);
+    const tr = evals.find((e) => e.split === "train")!;
+    const val = evals.find((e) => e.split === "validation")!;
     const hold = evals.find((e) => e.split === "holdout")!;
     const comb = evals.find((e) => e.split === "combined")!;
-    console.log(`  Exit: ${exitPolicy.name.padEnd(30)} | Comb Net EV: ${comb.evPerSelectedTradeSol.toFixed(6)} SOL (Win%: ${comb.winRatePct.toFixed(1)}%) | Holdout: ${hold.evPerSelectedTradeSol.toFixed(6)} SOL`);
+    const tvN = tr.completedTrades + val.completedTrades;
+    const tvNetPnl = tr.totalNetPnlSol + val.totalNetPnlSol;
+    const tvEv = tvN > 0 ? tvNetPnl / tvN : 0;
+    console.log(`  ${exitPolicy.name.padEnd(32)} | ${tvEv.toFixed(6).padEnd(15)} | ${hold.evPerSelectedTradeSol.toFixed(6).padEnd(15)} | ${comb.evPerSelectedTradeSol.toFixed(6).padEnd(15)} | ${String(comb.completedTrades).padEnd(10)} | ${String(comb.censoredTrades).padEnd(10)} | ${comb.winRatePct.toFixed(1)}%`);
   }
 
-  // 8. Outlier Robustness
+  // 9. Outlier Robustness on All Rules
   console.log(`\nOutlier Robustness on All Rules:`);
   const outlierRobustness: ReboundEvaluationSummary[] = [];
   for (const rule of [...baselineRules, ...candidateRules]) {
@@ -160,19 +302,25 @@ async function main() {
     console.log(`  ${rule.name.padEnd(50)} | Net EV: ${comb.evPerSelectedTradeSol.toFixed(6)} | Ex Top 1%: ${comb.netExTop1ProfitSol.toFixed(4)} | Ex Top 5%: ${comb.netExTop5ProfitSol.toFixed(4)} | Gate=${comb.passedHoldoutGate}`);
   }
 
-  // 9. Failure Attribution & Decision Gate
-  // Determine if any candidate rule produces positive Net EV on holdout under Medium cost
-  const holdoutWinners = ruleEvaluations.filter((e) => e.split === "holdout" && e.evPerSelectedTradeSol > 0 && e.passedHoldoutGate);
+  // 10. Failure Attribution & Decision Gate
+  // Determine if best rule produces positive Net EV on holdout under Medium cost
+  const holdoutEval = ruleEvaluations.find(
+    (e) => e.ruleName === bestRule.name && e.split === "holdout",
+  );
 
   let decisionGate: ReboundResearchReport["decisionGate"] = "NO CAUSAL REBOUND EDGE";
   let failureCategory = "5. Drawdown tokens keep falling / fake bottoms";
   let failureRationale =
-    "While 40.9% of tokens eventually rebound post-hoc, real-time causal exhaustion signals trigger on premature consolidation pauses before subsequent legs down. Rebounds are dominated by a few extreme winners, and net EV collapses on untouched holdout data.";
+    "While 40.9% of tokens eventually rebound post-hoc, real-time causal exhaustion signals trigger on premature consolidation pauses before subsequent legs down. When evaluated with exact executable curve mark-to-market and right-censoring exclusion, the strategy fails out-of-sample under realistic transaction costs.";
 
-  if (holdoutWinners.length > 0) {
+  if (holdoutEval && holdoutEval.evPerSelectedTradeSol > 0 && holdoutEval.passedHoldoutGate) {
     decisionGate = "ROBUST REBOUND EDGE FOUND";
     failureCategory = "None";
     failureRationale = "A causal seller-exhaustion filter achieved positive Net EV on the untouched holdout partition under Medium costs.";
+  } else if (holdoutEval && holdoutEval.evPerSelectedTradeSol > 0 && !holdoutEval.passedHoldoutGate) {
+    decisionGate = "OUTLIER-ONLY EDGE";
+    failureCategory = "6. Outlier-driven profitability";
+    failureRationale = "Positive holdout EV depends entirely on top 1-5% extreme winning trades; excluding them leaves net negative expectancy.";
   }
 
   // 10. Save Report

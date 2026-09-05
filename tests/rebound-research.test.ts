@@ -5,11 +5,18 @@ import {
   computeCausalTrajectoryStates,
   simulateReboundTrade,
   evaluateReboundAcrossSplits,
+  quotePumpBuy,
+  quotePumpSell,
+  selectBestTrainValRule,
   PREDEFINED_REBOUND_RULES,
   PREDEFINED_EXIT_POLICIES,
   STANDARD_COST_SCENARIOS,
 } from "@botwiner/research";
-import type { RawParsedMarketEvent, CausalTrajectoryState } from "@botwiner/research";
+import type {
+  RawParsedMarketEvent,
+  CausalTrajectoryState,
+  ReboundEvaluationSummary,
+} from "@botwiner/research";
 
 function createMockEvent(options: {
   mint: string;
@@ -198,7 +205,7 @@ test("Right-censoring audit: trades reaching dataset boundary without exit are e
 
   assert.ok(exec !== null);
   assert.equal(exec.isRightCensored, true);
-  assert.equal(exec.exitReason, "right-censored");
+  assert.equal(exec.exitReason, "dataset-boundary-censored");
 
   // In split evaluation, censored trades must be accounted in censoredTrades and excluded from completedTrades
   const summaries = evaluateReboundAcrossSplits(
@@ -213,6 +220,8 @@ test("Right-censoring audit: trades reaching dataset boundary without exit are e
   const comb = summaries.find((s) => s.split === "combined")!;
   assert.equal(comb.selectedTrades, 1);
   assert.equal(comb.censoredTrades, 1);
+  assert.equal(comb.datasetBoundaryCensoredTrades, 1);
+  assert.equal(comb.trajectoryEndedCensoredTrades, 0);
   assert.equal(comb.completedTrades, 0);
 });
 
@@ -298,4 +307,229 @@ test("Audit population accurately tracks eligibility and right-censoring counts"
   assert.equal(audit.eligibleLaunches120s, 1);
   assert.equal(audit.rightCensoredLaunches120s, 1);
   assert.equal(audit.launchesWithDrawdown30Pct, 1);
+});
+
+test("quotePumpBuy and quotePumpSell exact integer curve execution and round-trip fee consistency", () => {
+  const vSol = 30_000_000_000n; // 30 SOL
+  const vTok = 1_073_000_000_000_000n; // 1,073M tokens
+  const spendSolLamports = 50_000_000n; // 0.05 SOL
+
+  // 1. Buy quote
+  const buyQuote = quotePumpBuy(spendSolLamports, vSol, vTok, 100n);
+  assert.equal(buyQuote.curveSolInLamports, spendSolLamports);
+  assert.equal(buyQuote.feeLamports, 500_000n); // 1% of 0.05 SOL = 0.0005 SOL
+  assert.equal(buyQuote.totalWalletOutflowLamports, 50_500_000n);
+  assert.ok(buyQuote.tokensReceived > 0n);
+
+  // 2. Sell quote against post-buy reserves
+  const sellQuote = quotePumpSell(
+    buyQuote.tokensReceived,
+    buyQuote.postVSol,
+    buyQuote.postVTok,
+    100n,
+  );
+  // Selling back exact tokens received on unchanged curve must output within 1 lamport of curve SOL input due to integer floor division
+  assert.ok(Math.abs(Number(sellQuote.grossCurveSolOutLamports - spendSolLamports)) <= 1);
+  assert.equal(sellQuote.feeLamports, 500_000n);
+  assert.ok(Math.abs(Number(sellQuote.netWalletInflowLamports - 49_500_000n)) <= 1);
+
+  // Total wallet cashflow = netInflow - totalOutflow
+  // ~49,500,000 - 50,500,000 = -1,000,000 lamports (exactly the 2% round-trip Pump fee within 1 lamport)
+  const netRoundTripPnl = sellQuote.netWalletInflowLamports - buyQuote.totalWalletOutflowLamports;
+  assert.ok(Math.abs(Number(netRoundTripPnl - (-1_000_000n))) <= 1);
+});
+
+test("Executable TP trigger prevents early exit when marginal price spikes but executable sell value does not reach TP", () => {
+  const baseTime = 1_000_000;
+  const mint = "m-tp-executable";
+
+  // Curve starts at 30 SOL, 1,000M tokens
+  // Entry at t=20s with 0.25 SOL (250,000,000 lamports)
+  // At t=30s, token price rises such that marginal price (vSol/vTok) is +20.5% higher than entry fill price,
+  // BUT selling 0.25 SOL worth of tokens has price impact, so executable return is only ~19.4% (below 20% TP).
+  // At t=40s, price rises further so executable return reaches >= 20%.
+  const entryVSol = 30_000_000_000n;
+  const entryVTok = 1_000_000_000_000_000n;
+  const posSizeSol = 0.25;
+
+  const buyQuote = quotePumpBuy(BigInt(Math.round(posSizeSol * 1e9)), entryVSol, entryVTok, 100n);
+  const entryFillPrice = (posSizeSol * 1e9) / Number(buyQuote.tokensReceived);
+
+  // Pick a target marginal price at t=30s: 20.5% higher
+  const targetMarginalPrice = entryFillPrice * 1.205;
+  // Let's set vSol30 and vTok30 matching targetMarginalPrice with invariant k = 3e25
+  const k = entryVSol * entryVTok;
+  const vSol30 = BigInt(Math.round(Math.sqrt(Number(k) * targetMarginalPrice)));
+  const vTok30 = k / vSol30;
+
+  // Check what executable return would be at t=30s
+  const sellQuote30 = quotePumpSell(buyQuote.tokensReceived, vSol30, vTok30, 100n);
+  const execReturn30 =
+    Number(sellQuote30.grossCurveSolOutLamports - BigInt(Math.round(posSizeSol * 1e9))) /
+    (posSizeSol * 1e9);
+
+  // Marginal price change is +20.5% >= 20%, but executable return is lower due to price impact (~19.4% < 20%)
+  const marginalChangePct30 = (Number(vSol30) / Number(vTok30) - entryFillPrice) / entryFillPrice;
+  assert.ok(marginalChangePct30 >= 0.20, "Marginal price change should exceed 20%");
+  assert.ok(execReturn30 < 0.20, "Executable return must NOT reach 20% due to curve impact");
+
+  // At t=40s, price rises enough to cross 20% executable return
+  const vSol40 = vSol30 + 5_000_000_000n;
+  const vTok40 = k / vSol40;
+
+  const trades: RawParsedMarketEvent[] = [
+    createMockEvent({ mint, unixMs: baseTime, side: "buy", virtualSolLamports: "30000000000" }),
+    createMockEvent({ mint, unixMs: baseTime + 10_000, side: "buy", virtualSolLamports: "50000000000" }), // Peak
+    createMockEvent({
+      mint,
+      unixMs: baseTime + 20_000,
+      side: "sell",
+      virtualSolLamports: entryVSol.toString(),
+      virtualTokenBaseUnits: entryVTok.toString(),
+    }), // Entry trigger at -40% dd
+    createMockEvent({
+      mint,
+      unixMs: baseTime + 30_000,
+      side: "buy",
+      virtualSolLamports: vSol30.toString(),
+      virtualTokenBaseUnits: vTok30.toString(),
+    }), // Marginal price > 20%, but executable return < 20%
+    createMockEvent({
+      mint,
+      unixMs: baseTime + 40_000,
+      side: "buy",
+      virtualSolLamports: vSol40.toString(),
+      virtualTokenBaseUnits: vTok40.toString(),
+    }), // Executable return >= 20%
+  ];
+
+  const states = computeCausalTrajectoryStates(mint, baseTime, trades, baseTime + 120_000);
+  const rule = PREDEFINED_REBOUND_RULES[0]!; // Blind buy at -30%
+  const exitPolicyTP20: (typeof PREDEFINED_EXIT_POLICIES)[0] = {
+    name: "TP +20% / SL -10%",
+    maxHoldDurationMs: 60_000,
+    takeProfitPct: 0.20,
+    stopLossPct: -0.10,
+  };
+
+  const exec = simulateReboundTrade(states, rule, exitPolicyTP20, posSizeSol, STANDARD_COST_SCENARIOS.medium);
+  assert.ok(exec !== null);
+  // It must NOT exit at t=30s (where marginal price was > 20% but executable return was < 20%)
+  // It MUST exit at t=40s!
+  assert.equal(exec.exitTimestampMs, baseTime + 40_000);
+  assert.equal(exec.exitReason, "take-profit");
+});
+
+test("Trajectory ended before exit horizon is marked trajectory-ended-before-exit-horizon and excluded from completed PnL", () => {
+  const baseTime = 1_000_000;
+  const mint = "m-dormant-token";
+  const datasetEndMs = baseTime + 300_000; // Dataset has 300s of lifetime
+
+  // Token has trades only up to t=25s, then ceases trading completely
+  const trades: RawParsedMarketEvent[] = [
+    createMockEvent({ mint, unixMs: baseTime, side: "buy", virtualSolLamports: "30000000000" }),
+    createMockEvent({ mint, unixMs: baseTime + 10_000, side: "buy", virtualSolLamports: "60000000000" }),
+    createMockEvent({ mint, unixMs: baseTime + 20_000, side: "sell", virtualSolLamports: "40000000000" }), // Trigger at 20s
+    createMockEvent({ mint, unixMs: baseTime + 25_000, side: "sell", virtualSolLamports: "39000000000" }),
+  ];
+
+  const states = computeCausalTrajectoryStates(mint, baseTime, trades, datasetEndMs);
+  const rule = PREDEFINED_REBOUND_RULES[0]!;
+  // Policy requires 60s hold (exit horizon: t=20s + 60s = t=80s <= datasetEndMs)
+  const exitPolicy60s: (typeof PREDEFINED_EXIT_POLICIES)[0] = {
+    name: "Time Exit 60s",
+    maxHoldDurationMs: 60_000,
+  };
+
+  const exec = simulateReboundTrade(states, rule, exitPolicy60s, 0.05, STANDARD_COST_SCENARIOS.medium, 0, datasetEndMs);
+  assert.ok(exec !== null);
+  assert.equal(exec.isRightCensored, true);
+  assert.equal(exec.exitReason, "trajectory-ended-before-exit-horizon");
+
+  // Split evaluation must account this in trajectoryEndedCensoredTrades and exclude from completedTrades
+  const summaries = evaluateReboundAcrossSplits(
+    [{ mint, states, launchMs: baseTime }],
+    rule,
+    exitPolicy60s,
+    0.05,
+    STANDARD_COST_SCENARIOS.medium,
+    0,
+    datasetEndMs,
+  );
+  const comb = summaries.find((s) => s.split === "combined")!;
+  assert.equal(comb.selectedTrades, 1);
+  assert.equal(comb.censoredTrades, 1);
+  assert.equal(comb.datasetBoundaryCensoredTrades, 0);
+  assert.equal(comb.trajectoryEndedCensoredTrades, 1);
+  assert.equal(comb.completedTrades, 0);
+});
+
+test("selectBestTrainValRule deterministically selects best candidate using train and validation only (holdout never accessed)", () => {
+  const candidateRules = [
+    { name: "Rule Alpha", description: "Rule Alpha", predicate: () => true },
+    { name: "Rule Beta", description: "Rule Beta", predicate: () => true },
+  ];
+
+  // Synthetic evaluation results:
+  // Rule Alpha: Train Net PnL = +0.02 (N=10), Val Net PnL = +0.01 (N=5) -> Train+Val EV = +0.002, Holdout EV = -0.010
+  // Rule Beta:  Train Net PnL = -0.01 (N=10), Val Net PnL = -0.01 (N=5) -> Train+Val EV = -0.00133, Holdout EV = +0.050 (Huge holdout win!)
+  const dummySummary = (
+    ruleName: string,
+    split: "train" | "validation" | "holdout",
+    netPnl: number,
+    count: number,
+  ): ReboundEvaluationSummary => ({
+    ruleName,
+    exitPolicyName: "default",
+    positionSizeSol: 0.05,
+    costTier: "medium",
+    extraLatencyDelayMs: 0,
+    split,
+    eligibleTokens: 50,
+    selectedTrades: count,
+    censoredTrades: 0,
+    datasetBoundaryCensoredTrades: 0,
+    trajectoryEndedCensoredTrades: 0,
+    completedTrades: count,
+    selectionRatePct: 100,
+    wins: netPnl > 0 ? count : 0,
+    losses: netPnl <= 0 ? count : 0,
+    winRatePct: netPnl > 0 ? 100 : 0,
+    totalGrossPnlSol: netPnl,
+    totalNetPnlSol: netPnl,
+    evPerEligibleTokenSol: count > 0 ? netPnl / 50 : 0,
+    evPerSelectedTradeSol: count > 0 ? netPnl / count : 0,
+    medianTradePnlSol: count > 0 ? netPnl / count : 0,
+    p5PnlSol: 0,
+    p25PnlSol: 0,
+    p75PnlSol: 0,
+    p95PnlSol: 0,
+    maxDrawdownSol: 0,
+    averageHoldingTimeSec: 10,
+    profitFactor: 1,
+    averageWinSol: 0,
+    averageLossSol: 0,
+    top1PctProfitShare: 0,
+    top5PctProfitShare: 0,
+    netExTop1ProfitSol: netPnl,
+    netExTop5ProfitSol: netPnl,
+    passedHoldoutGate: false,
+  });
+
+  const evaluations: readonly ReboundEvaluationSummary[] = [
+    dummySummary("Rule Alpha", "train", 0.02, 10),
+    dummySummary("Rule Alpha", "validation", 0.01, 5),
+    dummySummary("Rule Alpha", "holdout", -0.01, 5),
+
+    dummySummary("Rule Beta", "train", -0.01, 10),
+    dummySummary("Rule Beta", "validation", -0.01, 5),
+    dummySummary("Rule Beta", "holdout", 0.05, 5), // High holdout EV
+  ];
+
+  const selection = selectBestTrainValRule(candidateRules, evaluations);
+
+  // Even though Rule Beta has high holdout EV, selection must choose Rule Alpha because Rule Alpha has higher Train+Val EV (+0.002 vs -0.00133)
+  assert.equal(selection.selectedRule.name, "Rule Alpha");
+  assert.ok(selection.trainValEv > 0);
+  assert.equal(selection.trainValCompletedTrades, 15);
 });
