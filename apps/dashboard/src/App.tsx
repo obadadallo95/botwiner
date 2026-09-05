@@ -1798,6 +1798,7 @@ export default function App() {
                 { label: "15m", val: 900 },
                 { label: "1 Hour", val: 3600 },
                 { label: "6 Hours", val: 21600 },
+                { label: "24 Hours", val: 86400 },
               ].map((d) => (
                 <button
                   key={d.val}
