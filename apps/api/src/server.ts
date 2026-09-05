@@ -383,6 +383,16 @@ app.get("/api/sessions/:sessionId/graduations", requireAuth, async (req, res) =>
   }
 });
 
+// Protected capital-aware portfolio summary
+app.get("/api/sessions/:sessionId/stats/portfolios", requireAuth, async (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId || (typeof sessionId !== "string" || !/^[a-zA-Z0-9_-]+$/.test(sessionId))) { res.status(400).json({ error: "Invalid sessionId" }); return; }
+  try {
+    const doc = await firestore.collection("researchSessions").doc(sessionId).collection("stats").doc("portfolios").get();
+    res.json({ portfolios: doc.exists ? doc.data() : null });
+  } catch { res.status(500).json({ error: "Failed to fetch portfolios" }); }
+});
+
 // Protected Paper Trading Stats
 app.get("/api/sessions/:sessionId/stats/paper-trading", requireAuth, async (req, res) => {
   try {

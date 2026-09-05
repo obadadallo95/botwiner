@@ -30,6 +30,7 @@ import {
   GraduationTracker,
   FirestoreTelemetryReporter,
   PaperTradingEngine,
+  MultiPortfolioEngine,
   TraderPnlTracker,
 } from "@botwiner/research";
 
@@ -416,6 +417,15 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     },
   });
 
+  const portfolios = new MultiPortfolioEngine();
+  let portfolioTelemetryAt = 0;
+  const updatePortfolioTelemetry = (): void => {
+    const now = Date.now();
+    if (now - portfolioTelemetryAt >= 5000) {
+      telemetryReporter?.updatePortfolioStats(portfolios.summary(true));
+      portfolioTelemetryAt = now;
+    }
+  };
   const paperTradingEngine = new PaperTradingEngine({
     onPositionOpened: (pos) => {
       telemetryReporter?.queuePaperTrade(pos);
@@ -600,6 +610,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     };
     const finalEvents = applyFinalCapture(normalized.events, raw);
     for (const event of finalEvents) {
+      portfolios.onEvent(event);
       if (event.eventType === "launch") {
         graduationTracker.onLaunch(event);
         paperTradingEngine.onLaunch(event);
@@ -616,6 +627,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         graduationTracker.getSummaryCounters(),
         raw.capture.receivedAtIso,
       );
+      updatePortfolioTelemetry();
       telemetryReporter.updatePaperStats(paperTradingEngine.getStats());
       telemetryReporter.updateMarketParticipantStats(traderPnlTracker.getStats());
     }
@@ -678,6 +690,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     };
     const finalEvents = applyFinalCapture(normalized.events, raw);
     for (const event of finalEvents) {
+      portfolios.onEvent(event);
       if (event.eventType === "launch") {
         graduationTracker.onLaunch(event);
         paperTradingEngine.onLaunch(event);
@@ -694,6 +707,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         graduationTracker.getSummaryCounters(),
         raw.capture.receivedAtIso,
       );
+      updatePortfolioTelemetry();
       telemetryReporter.updatePaperStats(paperTradingEngine.getStats());
       telemetryReporter.updateMarketParticipantStats(traderPnlTracker.getStats());
     }
@@ -784,7 +798,10 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     process.removeListener("SIGINT", stopForSignal);
     process.removeListener("SIGTERM", stopForSignal);
     paperTradingEngine.onSessionEnd(Date.now());
+    portfolios.onSessionEnd();
+    telemetryReporter?.updatePortfolioStats(portfolios.summary(true));
     if (telemetryReporter !== null) {
+      updatePortfolioTelemetry();
       telemetryReporter.updatePaperStats(paperTradingEngine.getStats());
       telemetryReporter.updateMarketParticipantStats(traderPnlTracker.getStats());
     }
@@ -799,9 +816,11 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
 
     if (cloudSink !== null) {
       try {
+        await cloudSink.uploadDerivedSummary("portfolio-summary", portfolios.summary());
         await cloudSink.uploadDerivedSummary("paper-trading-summary", paperTradingEngine.getStats());
         await cloudSink.uploadDerivedSummary("participant-analytics-summary", traderPnlTracker.getStats());
       } catch (err) {
+        storageShutdownError = err;
         console.warn("[Collector] Failed to upload derived summaries to GCS:", err);
       }
     }

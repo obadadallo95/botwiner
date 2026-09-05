@@ -4,6 +4,8 @@ import { gunzipSync } from "node:zlib";
 import { createHash } from "node:crypto";
 import {
   GraduationTracker,
+  PaperTradingEngine,
+  MultiPortfolioEngine,
   FirestoreTelemetryReporter,
   type FirestoreBackend,
   type ResearchSessionDocument,
@@ -405,4 +407,41 @@ test("generateCollisionResistantSessionId produces collision-resistant, well-for
     ids.add(generateCollisionResistantSessionId());
   }
   assert.equal(ids.size, count, "1,000 generated session IDs must all be unique");
+});
+
+test("Cloud summaries preserve nested BigInt strategy definitions as exact decimal strings", async () => {
+  const uploader = new MockStorageUploader();
+  const sink = await CloudResearchSink.create({ directory: "data/sessions/dummy", sessionId: "bigint-summary-test",
+    commitment: "processed", programId: "pump", parsingVersion: "v1", officialIdlRevision: "rev1",
+    endpointLabel: "test", uploader });
+  const value = { definition: { threshold: 50_000_000_000n }, fee: 55_000n };
+  await sink.uploadDerivedSummary("paper-trading-summary", value);
+  const uploaded = uploader.uploads.get("sessions/bigint-summary-test/summary/paper-trading-summary.json")!;
+  assert.deepEqual(JSON.parse(uploaded.buffer.toString()), { definition: { threshold: "50000000000" }, fee: "55000" });
+  assert.equal(value.definition.threshold, 50_000_000_000n);
+  await sink.close("complete");
+});
+
+
+test("Telemetry serializes the unchanged baseline and publishes all portfolio accounts on close", async () => {
+  class SummaryBackend extends MockFirestoreBackend {
+    paper: Record<string, unknown> | null = null;
+    portfolios: Record<string, unknown> | null = null;
+    updatePaperStatsDoc(_id: string, data: Record<string, unknown>): Promise<void> {
+      JSON.stringify(data); this.paper = data; return Promise.resolve();
+    }
+    updatePortfolioStatsDoc(_id: string, data: Record<string, unknown>): Promise<void> {
+      JSON.stringify(data); this.portfolios = data; return Promise.resolve();
+    }
+  }
+  const backend = new SummaryBackend();
+  const reporter = new FirestoreTelemetryReporter({ sessionId: "summary-test", mode: "smoke", provider: "helius",
+    region: "europe-west3", requestedDurationSec: 90, backend });
+  await reporter.initialize();
+  reporter.updatePaperStats(new PaperTradingEngine().getStats());
+  reporter.updatePortfolioStats(new MultiPortfolioEngine().summary(true));
+  await reporter.close("completed");
+  assert.ok(backend.paper);
+  assert.match(JSON.stringify(backend.paper), /50000000000/);
+  assert.equal((backend.portfolios?.portfolios as unknown[]).length, 60);
 });

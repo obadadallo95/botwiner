@@ -1,3 +1,4 @@
+import type { PortfolioSummary } from "./portfolio-engine.js";
 import { Firestore } from "@google-cloud/firestore";
 import type { DatasetCounts } from "@botwiner/storage";
 import type { GraduationSummaryCounters, TokenGraduationState } from "./graduation-tracker.js";
@@ -40,6 +41,7 @@ export interface FirestoreBackend {
   setSessionDoc(sessionId: string, data: Partial<ResearchSessionDocument>): Promise<void>;
   updateStatsDoc(sessionId: string, stats: GraduationSummaryCounters): Promise<void>;
   setGraduationCandidate(sessionId: string, mint: string, candidate: Record<string, unknown>): Promise<void>;
+  updatePortfolioStatsDoc?(sessionId: string, stats: Record<string, unknown>): Promise<void>;
   updatePaperStatsDoc?(sessionId: string, stats: Record<string, unknown>): Promise<void>;
   updateMarketPnlDoc?(sessionId: string, stats: Record<string, unknown>): Promise<void>;
   updateCreatorAnalyticsDoc?(sessionId: string, stats: Record<string, unknown>): Promise<void>;
@@ -67,6 +69,10 @@ export class GoogleFirestoreBackend implements FirestoreBackend {
   public async updateStatsDoc(sessionId: string, stats: GraduationSummaryCounters): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("current");
     await docRef.set(stats, { merge: true });
+  }
+
+  public async updatePortfolioStatsDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
+    await this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("portfolios").set(stats);
   }
 
   public async updatePaperStatsDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
@@ -148,6 +154,7 @@ export class FirestoreTelemetryReporter {
 
   private latestCounts?: DatasetCounts | undefined;
   private latestGraduationCounters?: GraduationSummaryCounters | undefined;
+  private latestPortfolioStats: PortfolioSummary | undefined;
   private latestPaperStats?: PaperTradingStats | undefined;
   private latestMarketParticipantStats?: MarketParticipantStats | undefined;
   private pendingCandidates = new Map<string, TokenGraduationState>();
@@ -241,6 +248,10 @@ export class FirestoreTelemetryReporter {
 
   public queueCandidateUpdate(candidate: TokenGraduationState): void {
     this.pendingCandidates.set(candidate.mint, candidate);
+  }
+
+  public updatePortfolioStats(stats: PortfolioSummary): void {
+    this.latestPortfolioStats = stats;
   }
 
   public updatePaperStats(stats: PaperTradingStats): void {
@@ -405,11 +416,18 @@ export class FirestoreTelemetryReporter {
       }
     }
 
+    if (this.latestPortfolioStats && this.backend.updatePortfolioStatsDoc) {
+      try {
+        await this.backend.updatePortfolioStatsDoc(this.sessionId, this.latestPortfolioStats);
+      } catch (err) {
+        console.warn("[FirestoreTelemetryReporter] failed to update portfolios:", err);
+      }
+    }
     if (this.latestPaperStats && this.backend.updatePaperStatsDoc) {
       try {
         await this.backend.updatePaperStatsDoc(
           this.sessionId,
-          this.latestPaperStats as unknown as Record<string, unknown>,
+          JSON.parse(JSON.stringify(this.latestPaperStats, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)) as Record<string, unknown>,
         );
       } catch (err) {
         console.warn("[FirestoreTelemetryReporter] failed to update paper stats:", err);

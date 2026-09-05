@@ -1,5 +1,8 @@
-import { createReadStream, existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import type { CloudDatasetManifest } from "@botwiner/storage";
+import { createWriteStream, createReadStream, existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { createGunzip } from "node:zlib";
 import { createInterface } from "node:readline";
@@ -7,6 +10,8 @@ import { Storage } from "@google-cloud/storage";
 import type { NormalizedMarketEvent } from "@botwiner/market-data";
 import {
   PaperTradingEngine,
+  MultiPortfolioEngine,
+  type PortfolioSummary,
   TraderPnlTracker,
   type PaperTradingStats,
   type MarketParticipantStats,
@@ -21,6 +26,8 @@ export interface ReplayCloudOptions {
 
 export interface ReplayCloudComparison {
   sessionId: string;
+  portfolioMatch: boolean | null;
+  replayedPortfolios: PortfolioSummary;
   totalEventsProcessed: number;
   launchesProcessed: number;
   tradesProcessed: number;
@@ -61,6 +68,11 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
     throw new Error(`No chunk files found for session ${sessionId} in gs://${bucketName}`);
   }
 
+  const [manifestBytes] = await bucket.file(`sessions/${sessionId}/manifest.json`).download();
+  const manifest = JSON.parse(manifestBytes.toString("utf8")) as CloudDatasetManifest;
+  if (manifest.status === "collecting") throw new Error("Cannot replay an active capture");
+  if (manifest.chunks.length !== files.length) throw new Error("Manifest/chunk count mismatch");
+
   // Sort files chronologically by filename (e.g. events-000001.jsonl.gz)
   files.sort((a, b) => a.name.localeCompare(b.name));
   console.log(`[ReplayCloud] Found ${files.length} event chunks.`);
@@ -76,6 +88,9 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
     } else {
       console.log(`[ReplayCloud] Using cached chunk ${fileName}`);
     }
+    const expected = manifest.chunks.find(c => basename(c.fileName) === fileName);
+    const digest = createHash("sha256").update(await readFile(localPath)).digest("hex");
+    if (!expected || expected.sha256 !== digest) throw new Error(`Evidence checksum mismatch: ${fileName}`);
     localChunkPaths.push(localPath);
   }
 
@@ -107,6 +122,13 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
 
   // 2. Run Replay
   console.log(`[ReplayCloud] Initializing hardened research engines...`);
+  const portfolioFile = bucket.file(`sessions/${sessionId}/summary/portfolio-summary.json`);
+  const [hasPortfolios] = await portfolioFile.exists();
+  const originalPortfolios = hasPortfolios ? JSON.parse((await portfolioFile.download())[0].toString("utf8")) as PortfolioSummary : null;
+  const auditOutput = createWriteStream(join(sessionCacheDir, "portfolio-audit.jsonl"));
+  let auditError: Error | null = null;
+  auditOutput.on("error", error => { auditError = error; });
+  const portfolios = new MultiPortfolioEngine(record => { auditOutput.write(JSON.stringify(record) + "\n"); });
   const paperEngine = new PaperTradingEngine();
   const pnlTracker = new TraderPnlTracker();
 
@@ -125,6 +147,9 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
       if (!line.trim()) continue;
       totalEventsProcessed += 1;
       const event = JSON.parse(line) as NormalizedMarketEvent;
+      portfolios.onEvent(event);
+      if (auditError) throw new Error("Portfolio audit write failed", { cause: auditError });
+      if (auditOutput.writableNeedDrain) await once(auditOutput, "drain");
 
       if (event.eventType === "launch") {
         launchesProcessed += 1;
@@ -140,6 +165,10 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
     }
   }
 
+  portfolios.onSessionEnd();
+  await new Promise<void>((resolve, reject) => { auditOutput.once("error", reject); auditOutput.end(resolve); });
+  const replayedPortfolios = portfolios.summary();
+  const portfolioMatch = originalPortfolios ? JSON.stringify(originalPortfolios) === JSON.stringify(replayedPortfolios) : null;
   paperEngine.onSessionEnd(lastEventTimestampMs);
 
   const replayedPaperSummary = paperEngine.exportSummary();
@@ -154,6 +183,8 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
 
   const comparison: ReplayCloudComparison = {
     sessionId,
+    portfolioMatch,
+    replayedPortfolios,
     totalEventsProcessed,
     launchesProcessed,
     tradesProcessed,
@@ -175,7 +206,7 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
   };
 
   if (outputPath) {
-    await writeFile(outputPath, JSON.stringify(comparison, null, 2), "utf8");
+    await writeFile(outputPath, JSON.stringify(comparison, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value, 2), "utf8");
     console.log(`[ReplayCloud] Saved comparison report to ${outputPath}`);
   }
 
@@ -184,6 +215,8 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
   console.log("=======================================================");
   console.log(`Session:                   ${sessionId}`);
   console.log(`Events Replayed:           ${totalEventsProcessed} (${launchesProcessed} launches, ${tradesProcessed} trades)`);
+  console.log(`Portfolio live/replay match: ${portfolioMatch ?? "legacy session; no original portfolio summary"}`);
+  console.log(`Portfolio accounts: ${replayedPortfolios.portfolios.length} | Audit records: ${replayedPortfolios.auditCount} | SHA256: ${replayedPortfolios.auditSha256}`);
   console.log("\n--- PAPER TRADING AUDIT ---");
   console.log(`Strategy ID:               ${replayedPaperSummary.strategyId}`);
   console.log(`Entries Triggered:         ${replayedPaperSummary.entriesTriggered}`);
@@ -207,6 +240,7 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
   console.log(`Median First Sell Delay:   All: ${replayedParticipantSummary.creatorAnalytics.medianFirstSellDelaySec}s | Clean: ${replayedParticipantSummary.creatorAnalytics.medianCleanFirstSellDelaySec}s`);
   console.log("=======================================================\n");
 
+  if (portfolioMatch === false) throw new Error("Live/replay portfolio mismatch; see comparison report");
   return comparison;
 }
 

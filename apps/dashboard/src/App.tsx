@@ -1,3 +1,5 @@
+import { Portfolios } from "./Portfolios.js";
+import type { PortfolioSummary } from "../../../packages/research/src/portfolio-engine.js";
 import { useEffect, useState } from "react";
 import {
   auth,
@@ -238,6 +240,7 @@ export default function App() {
   const [sessionsHistory, setSessionsHistory] = useState<ResearchSession[]>([]);
   const [gradStats, setGradStats] = useState<GraduationStats | null>(null);
   const [candidates, setCandidates] = useState<GraduationCandidate[]>([]);
+  const [portfolioStats, setPortfolioStats] = useState<PortfolioSummary | null>(null);
   const [paperStats, setPaperStats] = useState<PaperTradingData | null>(null);
   const [marketStats, setMarketStats] = useState<MarketParticipantData | null>(null);
   const [creatorStats, setCreatorStats] = useState<CreatorAnalyticsData | null>(null);
@@ -322,6 +325,11 @@ export default function App() {
             if (isMounted && Array.isArray(gData.graduations)) setCandidates(gData.graduations);
           }
 
+          const portfoliosRes = await fetch(`/api/sessions/${activeSession.sessionId}/stats/portfolios`, { headers: { Authorization: `Bearer ${token}` } });
+          if (portfoliosRes.ok) {
+            const data = await portfoliosRes.json() as { portfolios: PortfolioSummary | null };
+            if (isMounted) setPortfolioStats(data.portfolios);
+          }
           const paperRes = await fetch(`/api/sessions/${activeSession.sessionId}/stats/paper-trading`, {
             headers: { Authorization: `Bearer ${token}` },
           });
@@ -400,6 +408,7 @@ export default function App() {
     if (!activeSession) {
       setGradStats(null);
       setPaperStats(null);
+      setPortfolioStats(null);
       setMarketStats(null);
       setCreatorStats(null);
       setCandidates([]);
@@ -415,6 +424,9 @@ export default function App() {
       (err) => console.warn("Grad stats error:", err.message)
     );
 
+    const unsubPortfolios = onSnapshot(doc(db, "researchSessions", activeSession.sessionId, "stats", "portfolios"),
+      snap => setPortfolioStats(snap.exists() ? snap.data() as PortfolioSummary : null),
+      err => console.warn("Portfolio stats error:", err.message));
     const unsubPaper = onSnapshot(
       doc(db, "researchSessions", activeSession.sessionId, "stats", "paperTrading"),
       (snap) => {
@@ -462,6 +474,7 @@ export default function App() {
     return () => {
       unsubGrad();
       unsubPaper();
+      unsubPortfolios();
       unsubMarket();
       unsubCreator();
       unsubCandidates();
@@ -1010,6 +1023,7 @@ export default function App() {
       )}
 
       {/* TAB 3: LIVE PAPER TRADING */}
+      {activeTab === "paper" && <Portfolios data={portfolioStats} />}
       {activeTab === "paper" && (
         <>
           <div className="research-banner">

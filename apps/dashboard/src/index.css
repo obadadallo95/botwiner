@@ -667,3 +667,11 @@ body {
   gap: 1rem;
   margin-bottom: 1.5rem;
 }
+
+.portfolio-experiment { padding: 1.5rem; margin-bottom: 1.5rem; }
+.portfolio-experiment h3 { margin-top: 1.75rem; }
+.portfolio-experiment p { color: var(--text-secondary); line-height: 1.6; }
+.portfolio-experiment .table-container { overflow-x: auto; margin: 1rem 0; }
+.portfolio-experiment .data-table td { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.portfolio-experiment label { display: flex; flex-direction: column; gap: .5rem; }
+.portfolio-experiment select { background: #111827; color: #e2e8f0; border: 1px solid #475569; border-radius: .5rem; padding: .65rem; max-width: 100%; }

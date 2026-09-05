@@ -597,7 +597,7 @@ export class CloudResearchSink implements ResearchSink {
 
   public async uploadDerivedSummary(name: string, data: unknown): Promise<void> {
     const destinationPath = `sessions/${this.options.sessionId}/summary/${name}.json`;
-    const buffer = Buffer.from(JSON.stringify(data, null, 2), "utf8");
+    const buffer = Buffer.from(JSON.stringify(data, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value, 2), "utf8");
     await this.uploader.uploadBuffer(destinationPath, buffer, "application/json");
   }
 
