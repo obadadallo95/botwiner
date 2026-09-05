@@ -16,8 +16,9 @@ import {
   jsonLine,
   type Commitment,
   type DiagnosticRecord,
+  type FeedTransportType,
   type NormalizedMarketEvent,
-  type RawLogRecord,
+  type RawRecord,
 } from "@botwiner/market-data";
 
 export const RAW_FILE_NAME = "raw.jsonl";
@@ -44,7 +45,7 @@ export interface DatasetManifest {
   readonly startedAt: string;
   readonly endedAt: string | null;
   readonly source: {
-    readonly transport: "solana-rpc-websocket";
+    readonly transport: FeedTransportType;
     readonly endpointLabel: string;
     readonly commitment: Commitment;
     readonly programId: string;
@@ -62,6 +63,7 @@ export interface DatasetManifest {
 export interface CreateDatasetOptions {
   readonly directory: string;
   readonly sessionId: string;
+  readonly transport?: FeedTransportType | undefined;
   readonly endpointLabel: string;
   readonly commitment: Commitment;
   readonly programId: string;
@@ -70,7 +72,7 @@ export interface CreateDatasetOptions {
 }
 
 export interface RecordRawOptions {
-  readonly raw: RawLogRecord;
+  readonly raw: RawRecord;
   readonly events: readonly NormalizedMarketEvent[];
   readonly parseFailures: readonly {
     readonly logIndex: number;
@@ -256,7 +258,7 @@ export class DatasetWriter {
       startedAt: this.startedAt,
       endedAt,
       source: {
-        transport: "solana-rpc-websocket",
+        transport: this.options.transport ?? "solana-rpc-websocket",
         endpointLabel: this.options.endpointLabel,
         commitment: this.options.commitment,
         programId: this.options.programId,

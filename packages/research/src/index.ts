@@ -4,3 +4,7 @@ export * from "./rpc.js";
 export * from "./derived.js";
 export * from "./feed-comparison-types.js";
 export * from "./feed-comparison.js";
+export * from "./simulation-types.js";
+export * from "./simulation.js";
+export * from "./filter-research-types.js";
+export * from "./filter-research.js";

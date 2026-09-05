@@ -3,13 +3,17 @@ import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import {
   type Commitment,
+  type FeedTransportType,
   type NormalizedMarketEvent,
+  type RawGrpcRecord,
   type RawLogRecord,
+  type RawRecord,
 } from "@botwiner/market-data";
 import {
   PUMP_IDL_REVISION,
   PUMP_PARSING_VERSION,
   PUMP_PROGRAM_ID,
+  normalizeRawGrpcRecord,
   normalizeRawLogRecord,
 } from "@botwiner/pumpfun";
 import {
@@ -17,12 +21,18 @@ import {
   redactSecrets,
   sampleSntpClock,
   subscribeToProgramLogs,
+  subscribeToYellowstone,
+  type ReceivedGrpcMessage,
   type ReceivedLogsMessage,
 } from "@botwiner/solana";
 import { DatasetWriter } from "@botwiner/storage";
 
 interface CollectorCliOptions {
+  readonly transport: FeedTransportType;
+  readonly feedProvider: "public" | "helius" | "yellowstone";
   readonly wsUrl: string;
+  readonly grpcEndpoint: string;
+  readonly grpcToken: string | undefined;
   readonly endpointLabel: string;
   readonly commitment: Commitment;
   readonly outputDirectory: string;
@@ -49,7 +59,11 @@ function usage(): string {
     "  --output <directory>          Exact dataset directory",
     "  --duration-seconds <seconds>  Stop cleanly after a bounded interval",
     "  --commitment <level>          processed (default), confirmed, or finalized",
+    "  --provider <name>             public (default), helius, or yellowstone",
+    "  --transport <name>            solana-rpc-websocket or yellowstone-grpc",
     "  --ws-url <url>                Solana WebSocket URL (prefer SOLANA_WS_URL)",
+    "  --grpc-endpoint <endpoint>    Yellowstone gRPC endpoint (prefer YELLOWSTONE_GRPC_ENDPOINT)",
+    "  --grpc-token <token>          Yellowstone gRPC auth token (prefer YELLOWSTONE_GRPC_TOKEN)",
     "  --endpoint-label <label>      Sanitized endpoint identity for persisted metadata",
     "  --ntp-host <host>             SNTP host (default: time.cloudflare.com)",
     "  --ntp-interval-seconds <n>    Repeat clock-offset sampling (default: 300)",
@@ -75,10 +89,19 @@ function parseCommitment(value: string): Commitment {
 }
 
 function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
-  const provider = process.env.BOTWINER_FEED_PROVIDER;
+  let feedProvider: "public" | "helius" | "yellowstone" =
+    process.env.BOTWINER_FEED_PROVIDER === "yellowstone"
+      ? "yellowstone"
+      : process.env.BOTWINER_FEED_PROVIDER === "helius"
+        ? "helius"
+        : "public";
+  let transport: FeedTransportType =
+    feedProvider === "yellowstone" ? "yellowstone-grpc" : "solana-rpc-websocket";
+  let grpcEndpoint = process.env.YELLOWSTONE_GRPC_ENDPOINT ?? "";
+  let grpcToken = process.env.YELLOWSTONE_GRPC_TOKEN;
   const heliusApiKey = process.env.HELIUS_API_KEY;
   let wsUrl =
-    provider === "helius"
+    feedProvider === "helius"
       ? (() => {
           if (heliusApiKey === undefined || heliusApiKey.length === 0) {
             throw new Error("HELIUS_API_KEY is required for the Helius comparison collector");
@@ -90,7 +113,11 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
       : process.env.SOLANA_WS_URL ?? "wss://api.mainnet-beta.solana.com/";
   let endpointLabel =
     process.env.BOTWINER_ENDPOINT_LABEL ??
-    (provider === "helius" ? "helius-mainnet-wss" : endpointLabelFromUrl(wsUrl));
+    (feedProvider === "yellowstone"
+      ? "yellowstone-grpc"
+      : feedProvider === "helius"
+        ? "helius-mainnet-wss"
+        : endpointLabelFromUrl(wsUrl));
   let commitment = parseCommitment(process.env.SOLANA_COMMITMENT ?? "processed");
   let outputDirectory = defaultSessionDirectory();
   let durationSeconds: number | null = null;
@@ -113,7 +140,50 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
     if (argument === "--help") {
       console.log(usage());
       process.exitCode = 0;
-      return { wsUrl, endpointLabel, commitment, outputDirectory, durationSeconds: 0, ntpHost, ntpIntervalSeconds, comparison };
+      return {
+        transport,
+        feedProvider,
+        wsUrl,
+        grpcEndpoint,
+        grpcToken,
+        endpointLabel,
+        commitment,
+        outputDirectory,
+        durationSeconds: 0,
+        ntpHost,
+        ntpIntervalSeconds,
+        comparison,
+      };
+    }
+    if (argument === "--provider") {
+      const p = requireNext(arguments_, index, argument);
+      if (p !== "public" && p !== "helius" && p !== "yellowstone") {
+        throw new Error(`invalid provider: ${p}`);
+      }
+      feedProvider = p;
+      if (feedProvider === "yellowstone") transport = "yellowstone-grpc";
+      index += 1;
+      continue;
+    }
+    if (argument === "--transport") {
+      const t = requireNext(arguments_, index, argument);
+      if (t !== "solana-rpc-websocket" && t !== "yellowstone-grpc") {
+        throw new Error(`invalid transport: ${t}`);
+      }
+      transport = t;
+      index += 1;
+      continue;
+    }
+    if (argument === "--grpc-endpoint") {
+      grpcEndpoint = requireNext(arguments_, index, argument);
+      transport = "yellowstone-grpc";
+      index += 1;
+      continue;
+    }
+    if (argument === "--grpc-token") {
+      grpcToken = requireNext(arguments_, index, argument);
+      index += 1;
+      continue;
     }
     if (argument === "--output") {
       outputDirectory = resolve(requireNext(arguments_, index, argument));
@@ -165,17 +235,45 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
     throw new Error(`unknown argument: ${argument}`);
   }
 
-  const protocol = new URL(wsUrl).protocol;
-  if (protocol !== "ws:" && protocol !== "wss:") {
-    throw new Error("Solana WebSocket URL must use ws: or wss:");
+  if (transport === "yellowstone-grpc") {
+    if (grpcEndpoint.length === 0) {
+      throw new Error("YELLOWSTONE_GRPC_ENDPOINT is required when using Yellowstone gRPC transport");
+    }
+    try {
+      const protocol = new URL(grpcEndpoint).protocol;
+      if (protocol !== "http:" && protocol !== "https:") {
+        throw new Error("Yellowstone gRPC endpoint must use http: or https:");
+      }
+    } catch (error) {
+      throw new Error(`invalid Yellowstone gRPC endpoint: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  } else {
+    const protocol = new URL(wsUrl).protocol;
+    if (protocol !== "ws:" && protocol !== "wss:") {
+      throw new Error("Solana WebSocket URL must use ws: or wss:");
+    }
   }
+
   if (!Number.isFinite(ntpIntervalSeconds) || ntpIntervalSeconds < 30) {
     throw new Error("NTP_INTERVAL_SECONDS must be at least 30 seconds");
   }
   if (endpointLabel.length === 0 || endpointLabel.length > 100 || /[?&#@=\s]/u.test(endpointLabel)) {
     throw new Error("endpoint label must not contain credentials, query parameters, or whitespace");
   }
-  return { wsUrl, endpointLabel, commitment, outputDirectory, durationSeconds, ntpHost, ntpIntervalSeconds, comparison };
+  return {
+    transport,
+    feedProvider,
+    wsUrl,
+    grpcEndpoint,
+    grpcToken,
+    endpointLabel,
+    commitment,
+    outputDirectory,
+    durationSeconds,
+    ntpHost,
+    ntpIntervalSeconds,
+    comparison,
+  };
 }
 
 function sendToOrchestrator(message: Readonly<Record<string, unknown>>): void {
@@ -248,7 +346,7 @@ async function awaitOrchestratedWindow(options: CollectorCliOptions): Promise<Or
 
 function applyFinalCapture(
   events: readonly NormalizedMarketEvent[],
-  raw: RawLogRecord,
+  raw: RawRecord,
 ): readonly NormalizedMarketEvent[] {
   return events.map((event) => ({
     ...event,
@@ -271,6 +369,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
   const writer = await DatasetWriter.create({
     directory: options.outputDirectory,
     sessionId: basename(options.outputDirectory),
+    transport: options.transport,
     endpointLabel,
     commitment: options.commitment,
     programId: PUMP_PROGRAM_ID,
@@ -409,6 +508,63 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       .catch(fail);
   }
 
+  function recordGrpcMessage(message: ReceivedGrpcMessage): Promise<void> {
+    sequence += 1;
+    const provisionalRaw: RawGrpcRecord = {
+      schemaVersion: 1,
+      kind: "solana.grpc-transaction",
+      sequence,
+      source: {
+        transport: "yellowstone-grpc",
+        programId: PUMP_PROGRAM_ID,
+        commitment: options.commitment,
+        endpointLabel,
+        ...(options.comparison === null || orchestratedWindow === null
+          ? {}
+          : {
+              comparison: {
+                comparisonId: options.comparison.comparisonId,
+                feedId: options.comparison.feedId,
+                collectorProcessId: process.pid,
+                calibrationId: orchestratedWindow.calibrationId,
+                connectionEpoch: message.connectionEpoch,
+              },
+            }),
+      },
+      capture: {
+        receivedAtUnixMs: message.clock.receivedAtUnixMs,
+        receivedAtIso: message.clock.receivedAtIso,
+        receivedMonotonicNs: message.clock.receivedMonotonicNs.toString(),
+        parseCompletedAtUnixMs: message.clock.transportParseCompletedAtUnixMs,
+        parseDurationNs: message.clock.transportParseDurationNs.toString(),
+        rpcProviderReceivedAtUnixMs: null,
+      },
+      grpcPayload: message.payload,
+    };
+    const normalized = normalizeRawGrpcRecord(provisionalRaw);
+    const parseCompletedAtUnixMs = Date.now();
+    const parseCompletedMonotonicNs = process.hrtime.bigint();
+    const raw: RawGrpcRecord = {
+      ...provisionalRaw,
+      capture: {
+        ...provisionalRaw.capture,
+        parseCompletedAtUnixMs,
+        parseDurationNs: (
+          parseCompletedMonotonicNs - message.clock.receivedMonotonicNs
+        ).toString(),
+      },
+    };
+    return writer
+      .recordRaw({
+        raw,
+        events: applyFinalCapture(normalized.events, raw),
+        parseFailures: normalized.failures,
+        invalidNotification: normalized.invalidNotification,
+        transactionFailed: normalized.transactionFailed,
+      })
+      .catch(fail);
+  }
+
   try {
     console.log(
       JSON.stringify({
@@ -418,28 +574,53 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         commitment: options.commitment,
         programId: PUMP_PROGRAM_ID,
         durationSeconds: options.durationSeconds,
+        transport: options.transport,
       }),
     );
-    await subscribeToProgramLogs({
-      url: options.wsUrl,
-      programId: PUMP_PROGRAM_ID,
-      commitment: options.commitment,
-      signal: controller.signal,
-      onNotification: recordNotification,
-      endpointLabel,
-      redactSecrets: [process.env.HELIUS_API_KEY ?? ""],
-      onDiagnostic: (diagnostic) => {
-        if (options.comparison !== null) {
-          sendToOrchestrator({
-            kind: "collector-diagnostic",
-            feedId: options.comparison.feedId,
-            code: diagnostic.code,
-            atUnixMs: diagnostic.atUnixMs,
-          });
-        }
-        return writer.recordDiagnostic(diagnostic).catch(fail);
-      },
-    });
+    if (options.transport === "yellowstone-grpc") {
+      await subscribeToYellowstone({
+        endpoint: options.grpcEndpoint,
+        token: options.grpcToken,
+        programId: PUMP_PROGRAM_ID,
+        commitment: options.commitment,
+        signal: controller.signal,
+        onNotification: recordGrpcMessage,
+        endpointLabel,
+        redactSecrets: [options.grpcToken ?? "", process.env.HELIUS_API_KEY ?? ""],
+        onDiagnostic: (diagnostic) => {
+          if (options.comparison !== null) {
+            sendToOrchestrator({
+              kind: "collector-diagnostic",
+              feedId: options.comparison.feedId,
+              code: diagnostic.code,
+              atUnixMs: diagnostic.atUnixMs,
+            });
+          }
+          return writer.recordDiagnostic(diagnostic).catch(fail);
+        },
+      });
+    } else {
+      await subscribeToProgramLogs({
+        url: options.wsUrl,
+        programId: PUMP_PROGRAM_ID,
+        commitment: options.commitment,
+        signal: controller.signal,
+        onNotification: recordNotification,
+        endpointLabel,
+        redactSecrets: [process.env.HELIUS_API_KEY ?? ""],
+        onDiagnostic: (diagnostic) => {
+          if (options.comparison !== null) {
+            sendToOrchestrator({
+              kind: "collector-diagnostic",
+              feedId: options.comparison.feedId,
+              code: diagnostic.code,
+              atUnixMs: diagnostic.atUnixMs,
+            });
+          }
+          return writer.recordDiagnostic(diagnostic).catch(fail);
+        },
+      });
+    }
   } catch (error) {
     fail(error);
   } finally {

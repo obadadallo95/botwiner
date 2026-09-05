@@ -4,10 +4,10 @@ import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import {
   parseLogsNotification,
-  parseRawLogRecord,
+  parseRawRecord,
   type DiagnosticRecord,
   type NormalizedMarketEvent,
-  type RawLogRecord,
+  type RawRecord,
   type SolanaLogsNotification,
 } from "@botwiner/market-data";
 import {
@@ -57,10 +57,9 @@ export function redactSecret(text: string, secret: string | undefined): string {
 }
 
 export function assertSafeEndpointLabel(label: string): void {
-  if (label !== PUBLIC_ENDPOINT_LABEL && label !== CANDIDATE_ENDPOINT_LABEL) {
-    throw new Error(`unsupported comparison endpoint label: ${label}`);
+  if (label.length === 0 || label.length > 100 || /[?&#@=\s]/u.test(label)) {
+    throw new Error(`unsupported or unsafe comparison endpoint label: ${label}`);
   }
-  if (/[?&#@=]/u.test(label)) throw new Error("comparison endpoint label contains URL credential syntax");
 }
 
 export function validateCollectorStartupPair(
@@ -231,8 +230,8 @@ export function summarizeDistribution(values: readonly number[]): DistributionSu
 }
 
 interface FeedObservation {
-  readonly raw: RawLogRecord;
-  readonly notification: SolanaLogsNotification;
+  readonly raw: RawRecord;
+  readonly notification: SolanaLogsNotification | null;
   readonly signature: string;
   readonly slot: number;
   readonly succeeded: boolean;
@@ -317,32 +316,56 @@ async function loadFeedDataset(
 
   for await (const line of readJsonLines<unknown>(join(datasetDirectory, RAW_FILE_NAME))) {
     rawNotifications += 1;
-    const parsedRaw = parseRawLogRecord(line.value);
+    const parsedRaw = parseRawRecord(line.value);
     if (!parsedRaw.ok) {
       malformedRawRecords += 1;
       continue;
     }
-    const parsedNotification = parseLogsNotification(parsedRaw.value.rpcPayload);
-    if (!parsedNotification.ok) continue;
-    validNotifications += 1;
-    arrivalTimes.push(parsedRaw.value.capture.receivedAtUnixMs);
-    const signature = parsedNotification.value.params.result.value.signature;
+    let signature: string;
+    let slot: number;
+    let succeeded: boolean;
+    let payloadFingerprint: string;
+    let logsTruncated: boolean;
+    let notification: SolanaLogsNotification | null = null;
+
+    if (parsedRaw.value.kind === "solana.grpc-transaction") {
+      validNotifications += 1;
+      arrivalTimes.push(parsedRaw.value.capture.receivedAtUnixMs);
+      const payload = parsedRaw.value.grpcPayload;
+      signature = payload.signature;
+      slot = payload.slot;
+      succeeded = payload.err === null;
+      payloadFingerprint = JSON.stringify(payload);
+      logsTruncated = payload.logs.some((l) => l.toLowerCase().includes("log truncated"));
+    } else {
+      const parsedNotification = parseLogsNotification(parsedRaw.value.rpcPayload);
+      if (!parsedNotification.ok) continue;
+      validNotifications += 1;
+      arrivalTimes.push(parsedRaw.value.capture.receivedAtUnixMs);
+      notification = parsedNotification.value;
+      signature = notification.params.result.value.signature;
+      slot = notification.params.result.context.slot;
+      succeeded = notification.params.result.value.err === null;
+      payloadFingerprint = JSON.stringify(notification.params.result);
+      logsTruncated = notification.params.result.value.logs.some((l) =>
+        l.toLowerCase().includes("log truncated"),
+      );
+    }
+
     const comparison = parsedRaw.value.source.comparison;
     const observation: FeedObservation = {
       raw: parsedRaw.value,
-      notification: parsedNotification.value,
+      notification,
       signature,
-      slot: parsedNotification.value.params.result.context.slot,
-      succeeded: parsedNotification.value.params.result.value.err === null,
+      slot,
+      succeeded,
       normalizedTimelineNs: normalizeChildMonotonicNs(
         parsedRaw.value.capture.receivedMonotonicNs,
         calibration,
       ),
       connectionEpoch: comparison?.connectionEpoch ?? 0,
-      payloadFingerprint: JSON.stringify(parsedNotification.value.params.result),
-      logsTruncated: parsedNotification.value.params.result.value.logs.some((line) =>
-        line.toLowerCase().includes("log truncated"),
-      ),
+      payloadFingerprint,
+      logsTruncated,
     };
     const previous = observations.get(signature);
     if (previous === undefined || observation.normalizedTimelineNs < previous.normalizedTimelineNs) {
@@ -667,13 +690,13 @@ export function computeComparisonWindows(
   matches: readonly MatchedSignatureComparison[],
   publicFeed: LoadedFeed,
   candidateFeed: LoadedFeed,
-  commonStartUnixMs: number,
-  commonEndUnixMs: number,
+  windowStartUnixMs: number,
+  windowEndUnixMs: number,
   windowDurationSeconds: number,
 ): readonly ComparisonWindowMetrics[] {
-  const commonDurationMs = Math.max(0, commonEndUnixMs - commonStartUnixMs);
+  const commonDurationMs = Math.max(0, windowEndUnixMs - windowStartUnixMs);
   const targetWindowDurationMs = Math.max(1000, windowDurationSeconds * 1000);
-  const numWindows = Math.max(1, Math.floor(commonDurationMs / targetWindowDurationMs));
+  const numWindows = Math.max(1, Math.round(commonDurationMs / targetWindowDurationMs));
   const windows: ComparisonWindowMetrics[] = [];
 
   const publicExclusives = [...publicFeed.observations.entries()].filter(
@@ -684,18 +707,18 @@ export function computeComparisonWindows(
   );
 
   for (let i = 0; i < numWindows; i += 1) {
-    const windowStart = commonStartUnixMs + i * targetWindowDurationMs;
+    const windowStart = windowStartUnixMs + i * targetWindowDurationMs;
     const isLast = i === numWindows - 1;
-    const windowEnd = isLast ? commonEndUnixMs : windowStart + targetWindowDurationMs;
+    const windowEnd = isLast ? windowEndUnixMs : windowStart + targetWindowDurationMs;
     const startMin = Math.round((i * windowDurationSeconds) / 60);
     const endMin = Math.round(((i + 1) * windowDurationSeconds) / 60);
     const label = numWindows === 1 ? "Window 1 (full window)" : `Window ${i + 1} (${startMin}-${endMin}m)`;
 
     const windowMatches = matches.filter((m) => {
-      if (!m.includedInCleanLatency) return false;
-      const arrival = m.publicArrivalUnixMs;
+      const arrival = Math.min(m.publicArrivalUnixMs, m.candidateArrivalUnixMs);
       return isLast ? arrival >= windowStart && arrival <= windowEnd : arrival >= windowStart && arrival < windowEnd;
     });
+    const windowCleanMatches = windowMatches.filter((m) => m.includedInCleanLatency);
 
     const windowPublicOnly = publicExclusives.filter(([, obs]) => {
       const arrival = obs.raw.capture.receivedAtUnixMs;
@@ -710,10 +733,10 @@ export function computeComparisonWindows(
     const union = windowMatches.length + windowPublicOnly + windowCandidateOnly;
     const jaccard = union === 0 ? 0 : windowMatches.length / union;
 
-    const deltas = windowMatches.map((m) => m.deltaMs);
-    const candidateFaster = windowMatches.filter((m) => m.first === "candidate").length;
-    const publicFaster = windowMatches.filter((m) => m.first === "public").length;
-    const ties = windowMatches.length - candidateFaster - publicFaster;
+    const deltas = windowCleanMatches.map((m) => m.deltaMs);
+    const candidateFaster = windowCleanMatches.filter((m) => m.first === "candidate").length;
+    const publicFaster = windowCleanMatches.filter((m) => m.first === "public").length;
+    const ties = windowCleanMatches.length - candidateFaster - publicFaster;
 
     const dist = summarizeDistribution(deltas);
 
@@ -825,6 +848,9 @@ export function summarizeWindowStability(
   if (windowCount <= 1) {
     stabilityAssessment = "single-window-baseline";
     summary = "Run contains 1 time window. Multi-window stability requires at least 2 windows (e.g. 15-minute run with 3 x 5-minute windows).";
+  } else if (validP50s.length === 1 && windowCount > 1) {
+    stabilityAssessment = "inconsistent-lead";
+    summary = `Candidate led in Window 1, but public feed disconnected or stalled during subsequent windows (${windowCount - validP50s.length} windows without clean latency comparison).`;
   } else if (directionalConsistency && (p50SpreadMs ?? 0) <= 30) {
     stabilityAssessment = "stable-candidate-lead";
     summary = `Candidate lead is directionally consistent across all ${windowCount} windows with tight p50 spread (${p50SpreadMs?.toFixed(2)} ms).`;
@@ -1006,12 +1032,16 @@ export async function analyzeFeedComparison(
   const guardedUnionSize = guardedMatched + guardedPublicOnly + guardedCandidateOnly;
 
   const windowDurationSeconds = manifest.window.windowDurationSeconds ?? 300;
+  const benchmarkStartUnixMs = manifest.window.requestedStartUnixMs ?? commonStartUnixMs;
+  const benchmarkEndUnixMs =
+    manifest.window.requestedEndUnixMs ??
+    (manifest.endedAt !== null ? Date.parse(manifest.endedAt) : commonEndUnixMs);
   const windows = computeComparisonWindows(
     matches,
     publicFeed,
     candidateFeed,
-    commonStartUnixMs,
-    commonEndUnixMs,
+    benchmarkStartUnixMs,
+    benchmarkEndUnixMs,
     windowDurationSeconds,
   );
   const windowStability = summarizeWindowStability(windows, windowDurationSeconds);

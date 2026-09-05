@@ -71,12 +71,12 @@ export interface FeedComparisonManifest {
   readonly feeds: {
     readonly public: {
       readonly dataset: "public";
-      readonly endpointLabel: "solana-public-mainnet-wss";
+      readonly endpointLabel: string;
       readonly processId: number | null;
     };
     readonly candidate: {
       readonly dataset: "candidate";
-      readonly endpointLabel: "helius-mainnet-wss";
+      readonly endpointLabel: string;
       readonly processId: number | null;
     };
   };

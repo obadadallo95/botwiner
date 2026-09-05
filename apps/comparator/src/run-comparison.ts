@@ -34,6 +34,10 @@ interface CliOptions {
   readonly durationSeconds: number;
   readonly windowDurationSeconds: number;
   readonly tieToleranceMs: number;
+  readonly baselineProvider: "public" | "helius";
+  readonly candidateProvider: "helius" | "yellowstone";
+  readonly grpcEndpoint: string;
+  readonly grpcToken: string | undefined;
 }
 
 interface ExitResult {
@@ -49,12 +53,6 @@ interface PendingPing {
   readonly timer: NodeJS.Timeout;
 }
 
-interface ProgressCounts {
-  readonly rawNotifications?: number;
-  readonly normalizedEvents?: number;
-  readonly failedTransactions?: number;
-}
-
 function usage(): string {
   return [
     "Usage: pnpm comparison:run [options]",
@@ -65,6 +63,10 @@ function usage(): string {
     "  --duration-seconds <seconds>           Simultaneous collection window (default: 300)",
     "  --window-duration-seconds <seconds>    Slice duration for stability windows (default: 300)",
     "  --tie-tolerance-ms <ms>                First-arrival tie tolerance (default: 1)",
+    "  --baseline-provider <provider>         public (default) or helius",
+    "  --candidate-provider <provider>        helius (default) or yellowstone",
+    "  --grpc-endpoint <endpoint>             Yellowstone gRPC endpoint (prefer YELLOWSTONE_GRPC_ENDPOINT)",
+    "  --grpc-token <token>                   Yellowstone gRPC token (prefer YELLOWSTONE_GRPC_TOKEN)",
     "  --help                                 Show this help",
   ].join("\n");
 }
@@ -85,6 +87,13 @@ function parseArguments(arguments_: readonly string[]): CliOptions | null {
   let durationSeconds = 300;
   let windowDurationSeconds = 300;
   let tieToleranceMs = DEFAULT_TIE_TOLERANCE_MS;
+  let baselineProvider: "public" | "helius" =
+    process.env.BOTWINER_BASELINE_PROVIDER === "helius" ? "helius" : "public";
+  let candidateProvider: "helius" | "yellowstone" =
+    process.env.BOTWINER_CANDIDATE_PROVIDER === "yellowstone" ? "yellowstone" : "helius";
+  let grpcEndpoint = process.env.YELLOWSTONE_GRPC_ENDPOINT ?? "";
+  let grpcToken = process.env.YELLOWSTONE_GRPC_TOKEN;
+
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === "--help") return null;
@@ -113,6 +122,31 @@ function parseArguments(arguments_: readonly string[]): CliOptions | null {
       index += 1;
       continue;
     }
+    if (argument === "--baseline-provider") {
+      const p = requireNext(arguments_, index, argument);
+      if (p !== "public" && p !== "helius") throw new Error(`invalid baseline provider: ${p}`);
+      baselineProvider = p;
+      index += 1;
+      continue;
+    }
+    if (argument === "--candidate-provider") {
+      const p = requireNext(arguments_, index, argument);
+      if (p !== "helius" && p !== "yellowstone") throw new Error(`invalid candidate provider: ${p}`);
+      candidateProvider = p;
+      index += 1;
+      continue;
+    }
+    if (argument === "--grpc-endpoint") {
+      grpcEndpoint = requireNext(arguments_, index, argument);
+      candidateProvider = "yellowstone";
+      index += 1;
+      continue;
+    }
+    if (argument === "--grpc-token") {
+      grpcToken = requireNext(arguments_, index, argument);
+      index += 1;
+      continue;
+    }
     throw new Error(`unknown argument: ${argument}`);
   }
   if (!/^[a-z0-9][a-z0-9-]{0,79}$/u.test(comparisonId)) {
@@ -133,6 +167,10 @@ function parseArguments(arguments_: readonly string[]): CliOptions | null {
     durationSeconds,
     windowDurationSeconds,
     tieToleranceMs,
+    baselineProvider,
+    candidateProvider,
+    grpcEndpoint,
+    grpcToken,
   };
 }
 
@@ -145,7 +183,7 @@ class ManagedCollector {
   public readonly exit: Promise<ExitResult>;
   public startup: CollectorStartupTuple | null = null;
   public subscriptionConfirmedAtUnixMs: number | null = null;
-  public progress: ProgressCounts = {};
+  public progress: Record<string, unknown> = {};
   private readonly pendingPings = new Map<string, PendingPing>();
   private resolveReady: ((startup: CollectorStartupTuple) => void) | null = null;
   private rejectReady: ((error: Error) => void) | null = null;
@@ -159,16 +197,36 @@ class ManagedCollector {
     public readonly feedId: ComparisonFeedId,
     outputDirectory: string,
     comparisonId: string,
-    heliusApiKey: string,
+    provider: "public" | "helius" | "yellowstone",
+    endpointLabel: string,
+    credentials: {
+      heliusApiKey?: string | undefined;
+      grpcEndpoint?: string | undefined;
+      grpcToken?: string | undefined;
+    },
   ) {
     const environment = { ...process.env };
     environment.BOTWINER_ORCHESTRATED = "1";
     environment.BOTWINER_COMPARISON_ID = comparisonId;
     environment.BOTWINER_FEED_ID = feedId;
-    environment.BOTWINER_ENDPOINT_LABEL =
-      feedId === "public" ? PUBLIC_ENDPOINT_LABEL : CANDIDATE_ENDPOINT_LABEL;
-    environment.BOTWINER_FEED_PROVIDER = feedId === "candidate" ? "helius" : "public";
-    if (feedId === "public") delete environment.HELIUS_API_KEY;
+    environment.BOTWINER_ENDPOINT_LABEL = endpointLabel;
+    environment.BOTWINER_FEED_PROVIDER = provider;
+    if (provider === "yellowstone") {
+      environment.BOTWINER_TRANSPORT = "yellowstone-grpc";
+      if (credentials.grpcEndpoint) environment.YELLOWSTONE_GRPC_ENDPOINT = credentials.grpcEndpoint;
+      if (credentials.grpcToken) environment.YELLOWSTONE_GRPC_TOKEN = credentials.grpcToken;
+      delete environment.HELIUS_API_KEY;
+    } else if (provider === "helius") {
+      environment.BOTWINER_TRANSPORT = "solana-rpc-websocket";
+      if (credentials.heliusApiKey) environment.HELIUS_API_KEY = credentials.heliusApiKey;
+      delete environment.YELLOWSTONE_GRPC_ENDPOINT;
+      delete environment.YELLOWSTONE_GRPC_TOKEN;
+    } else {
+      environment.BOTWINER_TRANSPORT = "solana-rpc-websocket";
+      delete environment.HELIUS_API_KEY;
+      delete environment.YELLOWSTONE_GRPC_ENDPOINT;
+      delete environment.YELLOWSTONE_GRPC_TOKEN;
+    }
     const collectorPath = resolve("apps", "collector", "src", "main.ts");
     this.process = fork(
       collectorPath,
@@ -179,22 +237,8 @@ class ManagedCollector {
         stdio: ["ignore", "pipe", "pipe", "ipc"],
       },
     );
-    this.ready = new Promise((resolvePromise, reject) => {
-      this.resolveReady = resolvePromise;
-      this.rejectReady = reject;
-    });
-    this.active = new Promise((resolvePromise, reject) => {
-      this.resolveActive = resolvePromise;
-      this.rejectActive = reject;
-    });
-    this.process.stdout?.on("data", () => undefined);
-    this.process.stderr?.on("data", (chunk: Buffer) => {
-      this.stderr.push(redactSecret(chunk.toString("utf8"), heliusApiKey));
-    });
-    this.process.on("message", (message: unknown) => this.handleMessage(message));
-    this.exit = new Promise((resolvePromise) => {
+    this.exit = new Promise<ExitResult>((resolveExit) => {
       this.process.once("exit", (code, signal) => {
-        const result = { code, signal, atUnixMs: Date.now() };
         const error = new Error(`${this.feedId} collector exited before completing startup`);
         this.rejectReady?.(error);
         this.rejectActive?.(error);
@@ -203,77 +247,87 @@ class ManagedCollector {
           pending.reject(error);
         }
         this.pendingPings.clear();
-        resolvePromise(result);
+        resolveExit({ code, signal, atUnixMs: Date.now() });
       });
+    });
+    this.ready = new Promise<CollectorStartupTuple>((resolveReady, rejectReady) => {
+      this.resolveReady = resolveReady;
+      this.rejectReady = rejectReady;
+    });
+    this.active = new Promise<number>((resolveActive, rejectActive) => {
+      this.resolveActive = resolveActive;
+      this.rejectActive = rejectActive;
+    });
+    this.process.stderr?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      this.stderr.push(text);
+    });
+    this.process.on("message", (message: unknown) => {
+      if (!isRecord(message)) return;
+      if (message.kind === "collector-ready") {
+        this.startup = message as unknown as CollectorStartupTuple;
+        this.resolveReady?.(this.startup);
+        return;
+      }
+      if (message.kind === "collector-diagnostic" && message.code === "subscription-confirmed") {
+        this.subscriptionConfirmedAtUnixMs = Number(message.atUnixMs);
+        this.resolveActive?.(this.subscriptionConfirmedAtUnixMs);
+        return;
+      }
+      if (message.kind === "collector-progress" && isRecord(message.counts)) {
+        this.progress = message.counts;
+        return;
+      }
+      if (message.kind === "calibration-pong" && typeof message.pingId === "string") {
+        const pending = this.pendingPings.get(message.pingId);
+        if (pending === undefined) return;
+        this.pendingPings.delete(message.pingId);
+        clearTimeout(pending.timer);
+        const parentReceivedMonotonicNs = process.hrtime.bigint();
+        pending.resolve({
+          parentSentMonotonicNs: pending.sentMonotonicNs.toString(),
+          parentReceivedMonotonicNs: parentReceivedMonotonicNs.toString(),
+          childMonotonicNs: String(message.childMonotonicNs),
+          childWallUnixMs: Number(message.childWallUnixMs),
+        });
+      }
     });
   }
 
-  private handleMessage(message: unknown): void {
-    if (!isRecord(message)) return;
-    if (message.kind === "collector-ready") {
-      const startup = message as unknown as CollectorStartupTuple & { readonly kind: string };
-      this.startup = startup;
-      this.resolveReady?.(startup);
-      return;
-    }
-    if (message.kind === "calibration-pong" && typeof message.pingId === "string") {
-      const pending = this.pendingPings.get(message.pingId);
-      if (
-        pending !== undefined &&
-        typeof message.childMonotonicNs === "string" &&
-        typeof message.childWallUnixMs === "number"
-      ) {
-        clearTimeout(pending.timer);
-        this.pendingPings.delete(message.pingId);
-        pending.resolve({
-          parentSentMonotonicNs: pending.sentMonotonicNs.toString(),
-          parentReceivedMonotonicNs: process.hrtime.bigint().toString(),
-          childMonotonicNs: message.childMonotonicNs,
-          childWallUnixMs: message.childWallUnixMs,
-        });
-      }
-      return;
-    }
-    if (
-      message.kind === "collector-diagnostic" &&
-      message.code === "subscription-confirmed" &&
-      typeof message.atUnixMs === "number"
-    ) {
-      this.subscriptionConfirmedAtUnixMs = message.atUnixMs;
-      this.resolveActive?.(message.atUnixMs);
-      return;
-    }
-    if (message.kind === "collector-progress" && isRecord(message.counts)) {
-      this.progress = message.counts;
-    }
-  }
-
-  public async calibrate(rounds = 7): Promise<CalibrationExchange[]> {
+  public async calibrate(rounds = 7): Promise<readonly CalibrationExchange[]> {
     const exchanges: CalibrationExchange[] = [];
-    for (let index = 0; index < rounds; index += 1) {
-      const pingId = `${this.feedId}-${index}-${randomUUID()}`;
-      const sentMonotonicNs = process.hrtime.bigint();
-      const exchange = new Promise<CalibrationExchange>((resolvePromise, reject) => {
-        const timer = setTimeout(() => {
-          this.pendingPings.delete(pingId);
-          reject(new Error(`${this.feedId} collector calibration timed out`));
-        }, 2_000);
-        this.pendingPings.set(pingId, { sentMonotonicNs, resolve: resolvePromise, reject, timer });
-      });
-      this.process.send?.({ kind: "calibration-ping", pingId });
-      exchanges.push(await exchange);
+    for (let round = 0; round < rounds; round += 1) {
+      const exchange = await this.ping();
+      exchanges.push(exchange);
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 50));
     }
     return exchanges;
   }
 
+  private ping(): Promise<CalibrationExchange> {
+    return new Promise<CalibrationExchange>((resolvePing, rejectPing) => {
+      const pingId = randomUUID();
+      const sentMonotonicNs = process.hrtime.bigint();
+      const timer = setTimeout(() => {
+        this.pendingPings.delete(pingId);
+        rejectPing(new Error(`calibration ping timed out for feed ${this.feedId}`));
+      }, 5_000);
+      this.pendingPings.set(pingId, {
+        sentMonotonicNs,
+        resolve: resolvePing,
+        reject: rejectPing,
+        timer,
+      });
+      this.process.send({ kind: "calibration-ping", pingId });
+    });
+  }
+
   public start(startAtUnixMs: number, stopAtUnixMs: number, calibrationId: string): void {
-    this.process.send?.({ kind: "collector-start", startAtUnixMs, stopAtUnixMs, calibrationId });
+    this.process.send({ kind: "collector-start", startAtUnixMs, stopAtUnixMs, calibrationId });
   }
 
   public abort(): void {
-    if (this.process.exitCode !== null || this.process.killed) return;
-    this.process.send?.({ kind: "collector-abort" });
-    this.process.kill("SIGTERM");
+    if (this.process.connected) this.process.send({ kind: "collector-abort" });
   }
 }
 
@@ -294,23 +348,27 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 }
 
 async function writeManifest(directory: string, manifest: FeedComparisonManifest): Promise<void> {
-  const path = join(directory, "comparison-manifest.json");
-  const temporaryPath = `${path}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  await rename(temporaryPath, path);
+  const temporary = join(directory, "comparison-manifest.json.tmp");
+  const target = join(directory, "comparison-manifest.json");
+  await writeFile(temporary, JSON.stringify(manifest, null, 2), "utf8");
+  await rename(temporary, target);
 }
 
 async function pathExists(path: string): Promise<boolean> {
   try {
     await stat(path);
     return true;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
-    throw error;
+  } catch {
+    return false;
   }
 }
 
-function initialManifest(options: CliOptions, baseline: OrchestratorBaseline): FeedComparisonManifest {
+function initialManifest(
+  options: CliOptions,
+  baseline: OrchestratorBaseline,
+  publicEndpointLabel: string,
+  candidateEndpointLabel: string,
+): FeedComparisonManifest {
   return {
     schemaVersion: 1,
     kind: "feed-comparison-manifest",
@@ -340,8 +398,8 @@ function initialManifest(options: CliOptions, baseline: OrchestratorBaseline): F
       calibrationMaximumWallResidualMs: CALIBRATION_MAXIMUM_WALL_RESIDUAL_MS,
     },
     feeds: {
-      public: { dataset: "public", endpointLabel: PUBLIC_ENDPOINT_LABEL, processId: null },
-      candidate: { dataset: "candidate", endpointLabel: CANDIDATE_ENDPOINT_LABEL, processId: null },
+      public: { dataset: "public", endpointLabel: publicEndpointLabel, processId: null },
+      candidate: { dataset: "candidate", endpointLabel: candidateEndpointLabel, processId: null },
     },
     calibrations: { public: null, candidate: null },
     runtimeChecks: {
@@ -352,8 +410,10 @@ function initialManifest(options: CliOptions, baseline: OrchestratorBaseline): F
     },
     failure: null,
     limitations: [
-      "This is a same-host comparison of two standard logsSubscribe feeds, not Yellowstone/gRPC.",
-      "The Helius credential is constructed into the candidate URL only in child-process memory.",
+      options.candidateProvider === "yellowstone"
+        ? "This is a same-host comparison of a WebSocket baseline against an independent Yellowstone gRPC feed."
+        : "This is a same-host comparison of two standard logsSubscribe feeds, not Yellowstone/gRPC.",
+      "Any credentials are passed into child-process memory and redacted from persisted manifests and reports.",
       "Standard logsSubscribe has no replay cursor; reconnect-era records are excluded from clean latency.",
     ],
   };
@@ -366,8 +426,17 @@ async function run(): Promise<void> {
     return;
   }
   const heliusApiKey = process.env.HELIUS_API_KEY;
-  if (heliusApiKey === undefined || heliusApiKey.length === 0) {
-    throw new Error("HELIUS_API_KEY is not present; comparison not started");
+  if (
+    (options.baselineProvider === "helius" || options.candidateProvider === "helius") &&
+    (heliusApiKey === undefined || heliusApiKey.length === 0)
+  ) {
+    throw new Error("HELIUS_API_KEY is required for the Helius comparison collector");
+  }
+  if (
+    options.candidateProvider === "yellowstone" &&
+    options.grpcEndpoint.length === 0
+  ) {
+    throw new Error("YELLOWSTONE_GRPC_ENDPOINT is required when using Yellowstone gRPC candidate");
   }
   const baseline: OrchestratorBaseline = {
     wallUnixMs: Date.now(),
@@ -377,20 +446,35 @@ async function run(): Promise<void> {
     throw new Error("comparison output directory already exists; refusing to overwrite evidence");
   }
   await mkdir(options.outputDirectory, { recursive: true });
-  let manifest = initialManifest(options, baseline);
+
+  const publicEndpointLabel =
+    options.baselineProvider === "helius" ? CANDIDATE_ENDPOINT_LABEL : PUBLIC_ENDPOINT_LABEL;
+  const candidateEndpointLabel =
+    options.candidateProvider === "yellowstone" ? "yellowstone-grpc" : CANDIDATE_ENDPOINT_LABEL;
+
+  let manifest = initialManifest(options, baseline, publicEndpointLabel, candidateEndpointLabel);
   await writeManifest(options.outputDirectory, manifest);
 
+  const credentials = {
+    heliusApiKey,
+    grpcEndpoint: options.grpcEndpoint,
+    grpcToken: options.grpcToken,
+  };
   const publicCollector = new ManagedCollector(
     "public",
     join(options.outputDirectory, "public"),
     options.comparisonId,
-    heliusApiKey,
+    options.baselineProvider,
+    publicEndpointLabel,
+    credentials,
   );
   const candidateCollector = new ManagedCollector(
     "candidate",
     join(options.outputDirectory, "candidate"),
     options.comparisonId,
-    heliusApiKey,
+    options.candidateProvider,
+    candidateEndpointLabel,
+    credentials,
   );
   const collectors = [publicCollector, candidateCollector] as const;
 
@@ -449,7 +533,7 @@ async function run(): Promise<void> {
     console.log(JSON.stringify({
       status: "collecting",
       comparisonId: options.comparisonId,
-      feeds: [PUBLIC_ENDPOINT_LABEL, CANDIDATE_ENDPOINT_LABEL],
+      feeds: [publicEndpointLabel, candidateEndpointLabel],
       durationSeconds: options.durationSeconds,
       apiKey: "present-not-persisted",
     }));
@@ -488,7 +572,16 @@ async function run(): Promise<void> {
         ),
       ),
     ];
-    const apiKeyPersisted = await secretAppearsInFiles(artifactPaths, heliusApiKey);
+    const secretsToCheck = [heliusApiKey, options.grpcToken].filter(
+      (s): s is string => typeof s === "string" && s.length > 0,
+    );
+    let apiKeyPersisted = false;
+    for (const secret of secretsToCheck) {
+      if (await secretAppearsInFiles(artifactPaths, secret)) {
+        apiKeyPersisted = true;
+        break;
+      }
+    }
     manifest = {
       ...manifest,
       status: "complete",
@@ -500,15 +593,17 @@ async function run(): Promise<void> {
       },
     };
     await writeManifest(options.outputDirectory, manifest);
-    if (apiKeyPersisted) throw new Error("security invariant failed: API key was found in a persisted artifact");
+    if (apiKeyPersisted) throw new Error("security invariant failed: secret was found in a persisted artifact");
     const report = await analyzeFeedComparison(options.outputDirectory, manifest);
     await writeFeedComparisonReports(options.outputDirectory, report);
     const reportPaths = [
       join(options.outputDirectory, "feed-comparison-report.json"),
       join(options.outputDirectory, "feed-comparison-report.md"),
     ];
-    if (await secretAppearsInFiles(reportPaths, heliusApiKey)) {
-      throw new Error("security invariant failed: API key was found in a report");
+    for (const secret of secretsToCheck) {
+      if (await secretAppearsInFiles(reportPaths, secret)) {
+        throw new Error("security invariant failed: secret was found in a report");
+      }
     }
     console.log(JSON.stringify({
       status: "complete",
@@ -522,7 +617,13 @@ async function run(): Promise<void> {
   } catch (error) {
     for (const collector of collectors) collector.abort();
     await Promise.allSettled(collectors.map((collector) => collector.exit));
-    const message = redactSecret(error instanceof Error ? error.message : String(error), heliusApiKey);
+    const secretsToCheck = [heliusApiKey, options.grpcToken].filter(
+      (s): s is string => typeof s === "string" && s.length > 0,
+    );
+    let message = error instanceof Error ? error.message : String(error);
+    for (const secret of secretsToCheck) {
+      message = redactSecret(message, secret);
+    }
     manifest = {
       ...manifest,
       status: "aborted",

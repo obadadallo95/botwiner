@@ -3,7 +3,9 @@ import {
   type CommonMarketEvent,
   type LaunchMarketEvent,
   type NormalizedMarketEvent,
+  type RawGrpcRecord,
   type RawLogRecord,
+  type RawRecord,
   type TradeMarketEvent,
   parseLogsNotification,
 } from "@botwiner/market-data";
@@ -460,7 +462,7 @@ export function parsePumpProgramLogs(
 }
 
 function commonFields(
-  raw: RawLogRecord,
+  raw: RawRecord,
   signature: string,
   slot: number,
   located: LocatedPumpEvent,
@@ -495,7 +497,7 @@ function commonFields(
 }
 
 function normalizeCreate(
-  raw: RawLogRecord,
+  raw: RawRecord,
   signature: string,
   slot: number,
   located: LocatedPumpEvent & { readonly event: PumpCreateEvent },
@@ -525,7 +527,7 @@ function normalizeCreate(
 }
 
 function normalizeTrade(
-  raw: RawLogRecord,
+  raw: RawRecord,
   signature: string,
   slot: number,
   located: LocatedPumpEvent & { readonly event: PumpTradeEvent },
@@ -623,4 +625,44 @@ export function normalizeRawLogRecord(raw: RawLogRecord): NormalizeRawResult {
     invalidNotification: null,
     transactionFailed: false,
   };
+}
+
+export function normalizeRawGrpcRecord(raw: RawGrpcRecord): NormalizeRawResult {
+  const payload = raw.grpcPayload;
+  if (payload.err !== null) {
+    return {
+      events: [],
+      failures: [],
+      invalidNotification: null,
+      transactionFailed: true,
+    };
+  }
+
+  const parsed = parsePumpProgramLogs(payload.logs);
+  const events = parsed.events.map((located): NormalizedMarketEvent => {
+    if (located.event.kind === "create") {
+      return normalizeCreate(raw, payload.signature, payload.slot, {
+        ...located,
+        event: located.event,
+      });
+    }
+    return normalizeTrade(raw, payload.signature, payload.slot, {
+      ...located,
+      event: located.event,
+    });
+  });
+
+  return {
+    events,
+    failures: parsed.failures,
+    invalidNotification: null,
+    transactionFailed: false,
+  };
+}
+
+export function normalizeRawRecord(raw: RawRecord): NormalizeRawResult {
+  if (raw.kind === "solana.grpc-transaction") {
+    return normalizeRawGrpcRecord(raw);
+  }
+  return normalizeRawLogRecord(raw);
 }

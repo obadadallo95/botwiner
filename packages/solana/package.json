@@ -6,6 +6,8 @@
   "exports": "./src/index.ts",
   "dependencies": {
     "@botwiner/market-data": "workspace:*",
+    "@botwiner/pumpfun": "workspace:*",
+    "@triton-one/yellowstone-grpc": "^7.0.1",
     "ws": "^8.18.3"
   }
 }

@@ -3,6 +3,7 @@ export const RAW_RECORD_SCHEMA_VERSION = 1 as const;
 export const VENUE_EVENT_ENVELOPE_SCHEMA_VERSION = 1 as const;
 
 export type Commitment = "processed" | "confirmed" | "finalized";
+export type FeedTransportType = "solana-rpc-websocket" | "yellowstone-grpc";
 
 export interface SolanaLogsNotification {
   readonly jsonrpc: "2.0";
@@ -56,8 +57,42 @@ export interface RawLogRecord {
   readonly rpcPayload: unknown;
 }
 
+export const RAW_GRPC_RECORD_SCHEMA_VERSION = 1 as const;
+
+export interface RawGrpcRecord {
+  readonly schemaVersion: typeof RAW_GRPC_RECORD_SCHEMA_VERSION;
+  readonly kind: "solana.grpc-transaction";
+  readonly sequence: number;
+  readonly source: {
+    readonly transport: "yellowstone-grpc";
+    readonly programId: string;
+    readonly commitment: Commitment;
+    readonly endpointLabel: string;
+    readonly comparison?: {
+      readonly comparisonId: string;
+      readonly feedId: "public" | "candidate";
+      readonly collectorProcessId: number;
+      readonly calibrationId: string;
+      readonly connectionEpoch: number;
+    };
+  };
+  readonly capture: CollectorCaptureTime;
+  /** Normalized summary of the gRPC transaction update + audit fields to prevent unbounded memory/disk bloat. */
+  readonly grpcPayload: {
+    readonly slot: number;
+    readonly signature: string;
+    readonly isVote: boolean;
+    readonly err: unknown;
+    readonly logs: readonly string[];
+    readonly accountKeys?: readonly string[] | undefined;
+    readonly index?: number | undefined;
+  };
+}
+
+export type RawRecord = RawLogRecord | RawGrpcRecord;
+
 export interface EventSource {
-  readonly transport: "solana-rpc-websocket";
+  readonly transport: FeedTransportType;
   readonly programId: string;
   readonly commitment: Commitment;
   readonly endpointLabel: string;
@@ -249,7 +284,9 @@ export interface DiagnosticRecord {
     | "invalid-rpc-message"
     | "unexpected-rpc-message"
     | "malformed-pump-event"
-    | "duplicate-event";
+    | "duplicate-event"
+    | "grpc-stream-error"
+    | "grpc-backpressure-warning";
   readonly atUnixMs: number;
   readonly message: string;
   readonly sequence: number | null;
@@ -346,6 +383,71 @@ export function parseRawLogRecord(value: unknown): ValidationResult<RawLogRecord
     return { ok: false, error: "raw record is missing rpcPayload" };
   }
   return { ok: true, value: value as unknown as RawLogRecord };
+}
+
+export function parseRawGrpcRecord(value: unknown): ValidationResult<RawGrpcRecord> {
+  if (!isRecord(value) || value.schemaVersion !== 1 || value.kind !== "solana.grpc-transaction") {
+    return { ok: false, error: "record is not a supported raw grpc record" };
+  }
+  if (!isSafeNonNegativeInteger(value.sequence) || !isRecord(value.source) || !isRecord(value.capture)) {
+    return { ok: false, error: "raw grpc record sequence/source/capture is invalid" };
+  }
+  const source = value.source;
+  if (
+    source.transport !== "yellowstone-grpc" ||
+    typeof source.programId !== "string" ||
+    !isCommitment(source.commitment) ||
+    typeof source.endpointLabel !== "string"
+  ) {
+    return { ok: false, error: "raw grpc record source is invalid" };
+  }
+  if (source.comparison !== undefined) {
+    const comparison = source.comparison;
+    if (
+      !isRecord(comparison) ||
+      typeof comparison.comparisonId !== "string" ||
+      (comparison.feedId !== "public" && comparison.feedId !== "candidate") ||
+      !isSafeNonNegativeInteger(comparison.collectorProcessId) ||
+      typeof comparison.calibrationId !== "string" ||
+      !isSafeNonNegativeInteger(comparison.connectionEpoch)
+    ) {
+      return { ok: false, error: "raw grpc record comparison metadata is invalid" };
+    }
+  }
+  const capture = value.capture;
+  if (
+    !isSafeNonNegativeInteger(capture.receivedAtUnixMs) ||
+    typeof capture.receivedAtIso !== "string" ||
+    typeof capture.receivedMonotonicNs !== "string" ||
+    !isSafeNonNegativeInteger(capture.parseCompletedAtUnixMs) ||
+    typeof capture.parseDurationNs !== "string" ||
+    capture.rpcProviderReceivedAtUnixMs !== null
+  ) {
+    return { ok: false, error: "raw grpc record capture timestamps are invalid" };
+  }
+  if (!isRecord(value.grpcPayload)) {
+    return { ok: false, error: "raw grpc record is missing grpcPayload" };
+  }
+  const payload = value.grpcPayload;
+  if (
+    !isSafeNonNegativeInteger(payload.slot) ||
+    typeof payload.signature !== "string" ||
+    payload.signature.length < 64 ||
+    payload.signature.length > 96 ||
+    typeof payload.isVote !== "boolean" ||
+    !Array.isArray(payload.logs) ||
+    !payload.logs.every((line) => typeof line === "string")
+  ) {
+    return { ok: false, error: "raw grpc record grpcPayload is invalid" };
+  }
+  return { ok: true, value: value as unknown as RawGrpcRecord };
+}
+
+export function parseRawRecord(value: unknown): ValidationResult<RawRecord> {
+  if (isRecord(value) && value.kind === "solana.grpc-transaction") {
+    return parseRawGrpcRecord(value);
+  }
+  return parseRawLogRecord(value);
 }
 
 export function createDiagnostic(

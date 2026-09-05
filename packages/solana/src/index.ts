@@ -362,3 +362,11 @@ export async function subscribeToProgramLogs(options: SolanaLogsSubscriberOption
 
   await Promise.allSettled([...pending]);
 }
+
+export {
+  subscribeToYellowstone,
+  type YellowstoneSubscriberOptions,
+  type ReceivedGrpcMessage,
+  type YellowstoneClientLike,
+  type YellowstoneDuplexStreamLike,
+} from "./yellowstone.js";
