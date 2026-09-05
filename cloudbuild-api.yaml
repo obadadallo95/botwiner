@@ -1,0 +1,13 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'europe-west3-docker.pkg.dev/your-gcp-project-id/botwiner-repo/botwiner-api:latest'
+      - '-f'
+      - 'Dockerfile.api'
+      - '.'
+images:
+  - 'europe-west3-docker.pkg.dev/your-gcp-project-id/botwiner-repo/botwiner-api:latest'
+options:
+  logging: CLOUD_LOGGING_ONLY

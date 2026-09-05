@@ -97,6 +97,10 @@ function emptyCounts(): DatasetCounts {
   };
 }
 
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
+}
+
 async function fileExists(path: string): Promise<boolean> {
   try {
     await stat(path);
@@ -107,11 +111,14 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error;
+export interface ResearchSink {
+  snapshotCounts(): Readonly<DatasetCounts>;
+  recordRaw(options: RecordRawOptions): Promise<void>;
+  recordDiagnostic(diagnostic: DiagnosticRecord): Promise<void>;
+  close(status?: "complete" | "aborted" | "failed"): Promise<void>;
 }
 
-export class DatasetWriter {
+export class DatasetWriter implements ResearchSink {
   private readonly counts = emptyCounts();
   private readonly eventIds: Set<string>;
   private queue: Promise<void> = Promise.resolve();
@@ -332,3 +339,6 @@ export async function readManifest(directory: string): Promise<DatasetManifest> 
   const text = await readFile(join(resolve(directory), MANIFEST_FILE_NAME), "utf8");
   return JSON.parse(text) as DatasetManifest;
 }
+
+export { DatasetWriter as LocalResearchSink };
+export * from "./cloud-sink.js";

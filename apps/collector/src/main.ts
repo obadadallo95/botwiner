@@ -25,7 +25,8 @@ import {
   type ReceivedGrpcMessage,
   type ReceivedLogsMessage,
 } from "@botwiner/solana";
-import { DatasetWriter } from "@botwiner/storage";
+import { DatasetWriter, CloudResearchSink, type ResearchSink } from "@botwiner/storage";
+import { GraduationTracker, FirestoreTelemetryReporter } from "@botwiner/research";
 
 interface CollectorCliOptions {
   readonly transport: FeedTransportType;
@@ -39,6 +40,8 @@ interface CollectorCliOptions {
   readonly durationSeconds: number | null;
   readonly ntpHost: string | null;
   readonly ntpIntervalSeconds: number;
+  readonly sink: "local" | "cloud";
+  readonly sessionId: string;
   readonly comparison: {
     readonly comparisonId: string;
     readonly feedId: "public" | "candidate";
@@ -68,6 +71,8 @@ function usage(): string {
     "  --ntp-host <host>             SNTP host (default: time.cloudflare.com)",
     "  --ntp-interval-seconds <n>    Repeat clock-offset sampling (default: 300)",
     "  --disable-ntp                 Record that clock-offset sampling was skipped",
+    "  --sink <local|cloud>          Destination sink (default: local or cloud if RESEARCH_SESSION_ID/GCS_BUCKET set)",
+    "  --session-id <id>             Explicit session identifier",
     "  --help                        Show this help",
   ].join("\n");
 }
@@ -94,7 +99,9 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
       ? "yellowstone"
       : process.env.BOTWINER_FEED_PROVIDER === "helius"
         ? "helius"
-        : "public";
+        : process.env.HELIUS_API_KEY && process.env.HELIUS_API_KEY.length > 0
+          ? "helius"
+          : "public";
   let transport: FeedTransportType =
     feedProvider === "yellowstone" ? "yellowstone-grpc" : "solana-rpc-websocket";
   let grpcEndpoint = process.env.YELLOWSTONE_GRPC_ENDPOINT ?? "";
@@ -121,6 +128,17 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
   let commitment = parseCommitment(process.env.SOLANA_COMMITMENT ?? "processed");
   let outputDirectory = defaultSessionDirectory();
   let durationSeconds: number | null = null;
+  if (process.env.RESEARCH_DURATION_SECONDS) {
+    const rawSec = Number(process.env.RESEARCH_DURATION_SECONDS);
+    if (Number.isFinite(rawSec) && rawSec > 0) durationSeconds = rawSec;
+  }
+  let sink: "local" | "cloud" =
+    process.env.BOTWINER_SINK === "cloud" ||
+    process.env.RESEARCH_SESSION_ID !== undefined ||
+    process.env.GCS_BUCKET !== undefined
+      ? "cloud"
+      : "local";
+  let sessionId = process.env.RESEARCH_SESSION_ID ?? basename(outputDirectory);
   let ntpHost: string | null = process.env.NTP_HOST ?? "time.cloudflare.com";
   let ntpIntervalSeconds = Number(process.env.NTP_INTERVAL_SECONDS ?? "300");
   const comparisonId = process.env.BOTWINER_COMPARISON_ID;
@@ -152,6 +170,8 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
         durationSeconds: 0,
         ntpHost,
         ntpIntervalSeconds,
+        sink,
+        sessionId,
         comparison,
       };
     }
@@ -228,6 +248,18 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
       index += 1;
       continue;
     }
+    if (argument === "--sink") {
+      const s = requireNext(arguments_, index, argument);
+      if (s !== "local" && s !== "cloud") throw new Error(`invalid sink: ${s}`);
+      sink = s;
+      index += 1;
+      continue;
+    }
+    if (argument === "--session-id") {
+      sessionId = requireNext(arguments_, index, argument);
+      index += 1;
+      continue;
+    }
     if (argument === "--disable-ntp") {
       ntpHost = null;
       continue;
@@ -272,6 +304,8 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
     durationSeconds,
     ntpHost,
     ntpIntervalSeconds,
+    sink,
+    sessionId,
     comparison,
   };
 }
@@ -366,16 +400,62 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
   const failureState: { error: Error | undefined } = { error: undefined };
   let sequence = 0;
   const endpointLabel = options.endpointLabel;
-  const writer = await DatasetWriter.create({
-    directory: options.outputDirectory,
-    sessionId: basename(options.outputDirectory),
-    transport: options.transport,
-    endpointLabel,
-    commitment: options.commitment,
-    programId: PUMP_PROGRAM_ID,
-    parsingVersion: PUMP_PARSING_VERSION,
-    officialIdlRevision: PUMP_IDL_REVISION,
+  let writer: ResearchSink;
+  let cloudSink: CloudResearchSink | null = null;
+  let telemetryReporter: FirestoreTelemetryReporter | null = null;
+
+  const graduationTracker = new GraduationTracker({
+    onCandidateUpdated: (candidate) => {
+      telemetryReporter?.queueCandidateUpdate(candidate);
+    },
   });
+
+  if (options.sink === "cloud") {
+    const bucket = process.env.GCS_BUCKET ?? "your-gcs-bucket";
+    const projectId = process.env.GCP_PROJECT_ID ?? "your-gcp-project-id";
+    telemetryReporter = new FirestoreTelemetryReporter({
+      sessionId: options.sessionId,
+      mode: process.env.RESEARCH_MODE ?? "graduation-research",
+      provider: options.feedProvider,
+      region: process.env.GCP_REGION ?? "europe-west3",
+      requestedDurationSec: options.durationSeconds,
+      gcpProjectId: projectId,
+      firestoreDatabase: process.env.FIRESTORE_DATABASE ?? "(default)",
+      heartbeatIntervalMs: Number(process.env.HEARTBEAT_INTERVAL_SECONDS ?? "15") * 1000,
+      statsIntervalMs: Number(process.env.STATS_FLUSH_INTERVAL_SECONDS ?? "5") * 1000,
+    });
+    await telemetryReporter.initialize();
+
+    cloudSink = await CloudResearchSink.create({
+      directory: options.outputDirectory,
+      sessionId: options.sessionId,
+      transport: options.transport,
+      endpointLabel,
+      commitment: options.commitment,
+      programId: PUMP_PROGRAM_ID,
+      parsingVersion: PUMP_PARSING_VERSION,
+      officialIdlRevision: PUMP_IDL_REVISION,
+      gcsBucket: bucket,
+      gcpProjectId: projectId,
+      durationSeconds: options.durationSeconds,
+      onChunkRotated: (chunk) => {
+        telemetryReporter?.updateChunkAndBytes(chunk.index, cloudSink?.getTotalCompressedBytes() ?? 0);
+      },
+    });
+    writer = cloudSink;
+    telemetryReporter.markRunning();
+  } else {
+    writer = await DatasetWriter.create({
+      directory: options.outputDirectory,
+      sessionId: basename(options.outputDirectory),
+      transport: options.transport,
+      endpointLabel,
+      commitment: options.commitment,
+      programId: PUMP_PROGRAM_ID,
+      parsingVersion: PUMP_PARSING_VERSION,
+      officialIdlRevision: PUMP_IDL_REVISION,
+    });
+  }
 
   let clockSampleQueue = Promise.resolve();
   let clockSampleTimer: NodeJS.Timeout | undefined;
@@ -497,10 +577,25 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         ).toString(),
       },
     };
+    const finalEvents = applyFinalCapture(normalized.events, raw);
+    for (const event of finalEvents) {
+      if (event.eventType === "launch") {
+        graduationTracker.onLaunch(event);
+      } else if (event.eventType === "trade") {
+        graduationTracker.onTrade(event);
+      }
+    }
+    if (telemetryReporter !== null) {
+      telemetryReporter.updateTelemetry(
+        writer.snapshotCounts(),
+        graduationTracker.getSummaryCounters(),
+        raw.capture.receivedAtIso,
+      );
+    }
     return writer
       .recordRaw({
         raw,
-        events: applyFinalCapture(normalized.events, raw),
+        events: finalEvents,
         parseFailures: normalized.failures,
         invalidNotification: normalized.invalidNotification,
         transactionFailed: normalized.transactionFailed,
@@ -554,10 +649,25 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         ).toString(),
       },
     };
+    const finalEvents = applyFinalCapture(normalized.events, raw);
+    for (const event of finalEvents) {
+      if (event.eventType === "launch") {
+        graduationTracker.onLaunch(event);
+      } else if (event.eventType === "trade") {
+        graduationTracker.onTrade(event);
+      }
+    }
+    if (telemetryReporter !== null) {
+      telemetryReporter.updateTelemetry(
+        writer.snapshotCounts(),
+        graduationTracker.getSummaryCounters(),
+        raw.capture.receivedAtIso,
+      );
+    }
     return writer
       .recordRaw({
         raw,
-        events: applyFinalCapture(normalized.events, raw),
+        events: finalEvents,
         parseFailures: normalized.failures,
         invalidNotification: normalized.invalidNotification,
         transactionFailed: normalized.transactionFailed,
@@ -569,7 +679,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     console.log(
       JSON.stringify({
         status: "collecting",
-        dataset: writer.directory,
+        dataset: options.outputDirectory,
         endpointLabel,
         commitment: options.commitment,
         programId: PUMP_PROGRAM_ID,
@@ -588,6 +698,11 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         endpointLabel,
         redactSecrets: [options.grpcToken ?? "", process.env.HELIUS_API_KEY ?? ""],
         onDiagnostic: (diagnostic) => {
+          if (diagnostic.code === "connection-closed") {
+            telemetryReporter?.markReconnecting();
+          } else if (diagnostic.code === "connection-opened") {
+            telemetryReporter?.markRunning();
+          }
           if (options.comparison !== null) {
             sendToOrchestrator({
               kind: "collector-diagnostic",
@@ -609,6 +724,11 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         endpointLabel,
         redactSecrets: [process.env.HELIUS_API_KEY ?? ""],
         onDiagnostic: (diagnostic) => {
+          if (diagnostic.code === "connection-closed") {
+            telemetryReporter?.markReconnecting();
+          } else if (diagnostic.code === "connection-opened") {
+            telemetryReporter?.markRunning();
+          }
           if (options.comparison !== null) {
             sendToOrchestrator({
               kind: "collector-diagnostic",
@@ -630,12 +750,16 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     await clockSampleQueue;
     process.removeListener("SIGINT", stopForSignal);
     process.removeListener("SIGTERM", stopForSignal);
-    await writer.close(failureState.error === undefined && !stoppedBySignal ? "complete" : "aborted");
+    const finalStatus = failureState.error === undefined && !stoppedBySignal ? "complete" : "aborted";
+    await writer.close(finalStatus);
+    if (telemetryReporter !== null) {
+      await telemetryReporter.close(finalStatus === "complete" ? "completed" : "failed");
+    }
   }
 
   const summary = {
     status: failureState.error === undefined ? "complete" : "error",
-    dataset: writer.directory,
+    dataset: options.outputDirectory,
     counts: writer.snapshotCounts(),
   };
   console.log(JSON.stringify(summary));

@@ -1,0 +1,19 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /researchSessions/{sessionId} {
+      allow read: if true;
+      allow write: if false;
+
+      match /stats/{statId} {
+        allow read: if true;
+        allow write: if false;
+      }
+
+      match /graduations/{mint} {
+        allow read: if true;
+        allow write: if false;
+      }
+    }
+  }
+}

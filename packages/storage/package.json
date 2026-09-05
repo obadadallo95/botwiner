@@ -5,6 +5,7 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
-    "@botwiner/market-data": "workspace:*"
+    "@botwiner/market-data": "workspace:*",
+    "@google-cloud/storage": "^8.0.1"
   }
 }

@@ -15,6 +15,7 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
+    "noEmit": true,
     "types": ["node"]
   },
   "include": ["apps/**/*.ts", "packages/**/*.ts", "tests/**/*.ts"]

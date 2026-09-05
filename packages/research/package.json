@@ -7,6 +7,7 @@
   "dependencies": {
     "@botwiner/market-data": "workspace:*",
     "@botwiner/pumpfun": "workspace:*",
-    "@botwiner/storage": "workspace:*"
+    "@botwiner/storage": "workspace:*",
+    "@google-cloud/firestore": "^9.0.1"
   }
 }

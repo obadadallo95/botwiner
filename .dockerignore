@@ -1,11 +1,11 @@
 node_modules/
 .pnpm-store/
+data/
 dist/
 coverage/
-data/
-*.log
+.git/
 .env
 .env.*
-!.env.example
+!*.example
+*.log
 .DS_Store
-.firebase/
