@@ -2,12 +2,39 @@ import type { NormalizedMarketEvent, VenueEventEnvelope } from "@botwiner/market
 import type {
   ComputeBudgetEvidence,
   InstructionRecord,
+  JitoTipEvidence,
   RawRpcRecord,
   TokenBalanceRecord,
   TransactionEnrichment,
 } from "./types.js";
 
 export const COMPUTE_BUDGET_PROGRAM_ID = "ComputeBudget111111111111111111111111111111";
+export const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
+export const JITO_TIP_ACCOUNTS = [
+  "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+  "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+  "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+  "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+  "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+  "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+  "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+  "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+] as const;
+const JITO_TIP_ACCOUNT_SET = new Set<string>(JITO_TIP_ACCOUNTS);
+const MAX_COMPUTE_UNIT_LIMIT = 1_400_000n;
+const DEFAULT_NON_BUILTIN_COMPUTE_UNIT_LIMIT = 200_000n;
+const DEFAULT_BUILTIN_COMPUTE_UNIT_LIMIT = 3_000n;
+const NON_MIGRATING_BUILTIN_PROGRAM_IDS = new Set([
+  SYSTEM_PROGRAM_ID,
+  COMPUTE_BUDGET_PROGRAM_ID,
+  "BPFLoaderUpgradeab1e11111111111111111111111",
+  "BPFLoader1111111111111111111111111111111111",
+  "BPFLoader2111111111111111111111111111111111",
+  "LoaderV411111111111111111111111111111111111",
+  "KeccakSecp256k11111111111111111111111111111",
+  "Ed25519SigVerify111111111111111111111111111",
+]);
+const VOTE_PROGRAM_ID = "Vote111111111111111111111111111111111111111";
 const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE58_INDEX = new Map([...BASE58_ALPHABET].map((character, index) => [character, index]));
 
@@ -131,11 +158,38 @@ export function parseComputeBudget(
 
   let requestedPriorityFeeLamports: string | null = null;
   let priorityFeeFormula: string | null = null;
-  if (requestedComputeUnitLimit !== null && requestedComputeUnitPriceMicroLamports !== null) {
+  let effectiveComputeUnitLimit: string | null = null;
+  let computeUnitLimitSource: ComputeBudgetEvidence["computeUnitLimitSource"] = "unknown";
+  if (requestedComputeUnitLimit !== null) {
+    effectiveComputeUnitLimit = (
+      BigInt(requestedComputeUnitLimit) > MAX_COMPUTE_UNIT_LIMIT
+        ? MAX_COMPUTE_UNIT_LIMIT
+        : BigInt(requestedComputeUnitLimit)
+    ).toString();
+    computeUnitLimitSource = "explicit";
+  } else {
+    const outerProgramIds = instructions
+      .filter((instruction) => instruction.innerInstructionIndex === null)
+      .map((instruction) => instruction.programId);
+    // Vote is feature-gated in current Agave. Without the bank feature set its 3k/200k
+    // classification cannot be reconstructed authoritatively from transaction JSON alone.
+    if (!outerProgramIds.includes(null) && !outerProgramIds.includes(VOTE_PROGRAM_ID)) {
+      let total = 0n;
+      for (const programId of outerProgramIds) {
+        total += programId !== null && NON_MIGRATING_BUILTIN_PROGRAM_IDS.has(programId)
+          ? DEFAULT_BUILTIN_COMPUTE_UNIT_LIMIT
+          : DEFAULT_NON_BUILTIN_COMPUTE_UNIT_LIMIT;
+      }
+      effectiveComputeUnitLimit = (total > MAX_COMPUTE_UNIT_LIMIT ? MAX_COMPUTE_UNIT_LIMIT : total).toString();
+      computeUnitLimitSource = "runtime-default";
+    }
+  }
+  if (effectiveComputeUnitLimit !== null && requestedComputeUnitPriceMicroLamports !== null) {
     const numerator =
-      BigInt(requestedComputeUnitLimit) * BigInt(requestedComputeUnitPriceMicroLamports);
+      BigInt(effectiveComputeUnitLimit) * BigInt(requestedComputeUnitPriceMicroLamports);
     requestedPriorityFeeLamports = ((numerator + 999_999n) / 1_000_000n).toString();
-    priorityFeeFormula = "ceil(requested_compute_unit_limit * micro_lamports_per_cu / 1_000_000)";
+    priorityFeeFormula =
+      "ceil(effective_compute_unit_limit * micro_lamports_per_cu / 1_000_000)";
   } else if (deprecatedAdditionalFee !== null) {
     requestedPriorityFeeLamports = deprecatedAdditionalFee;
     priorityFeeFormula = "RequestUnitsDeprecated.additional_fee_lamports";
@@ -144,9 +198,71 @@ export function parseComputeBudget(
   return {
     instructions: decoded,
     requestedComputeUnitLimit,
+    effectiveComputeUnitLimit,
+    computeUnitLimitSource,
     requestedComputeUnitPriceMicroLamports,
     requestedPriorityFeeLamports,
     priorityFeeFormula,
+  };
+}
+
+function parsedTransfer(instruction: InstructionRecord): { source: string | null; destination: string; lamports: string } | null {
+  if (
+    !isRecord(instruction.parsed) ||
+    (instruction.parsed.type !== "transfer" && instruction.parsed.type !== "transferWithSeed") ||
+    !isRecord(instruction.parsed.info)
+  ) return null;
+  const destination = string(instruction.parsed.info.destination);
+  const lamportsValue = instruction.parsed.info.lamports;
+  const lamports = integer(lamportsValue) === null
+    ? typeof lamportsValue === "string" && /^\d+$/.test(lamportsValue) ? lamportsValue : null
+    : String(lamportsValue);
+  if (destination === null || lamports === null) return null;
+  return { source: string(instruction.parsed.info.source), destination, lamports };
+}
+
+/** Detect only directly observable System Program transfers in this transaction. */
+export function parseJitoTipEvidence(instructions: readonly InstructionRecord[]): JitoTipEvidence {
+  const transfers: JitoTipEvidence["transfers"][number][] = [];
+  let indeterminateSystemInstruction = false;
+  for (const instruction of instructions) {
+    if (instruction.programId !== SYSTEM_PROGRAM_ID) continue;
+    let transfer = parsedTransfer(instruction);
+    if (transfer === null && instruction.dataBase58 !== null) {
+      try {
+        const bytes = decodeBase58(instruction.dataBase58);
+        const tag = bytes.length >= 4 ? bytes.readUInt32LE(0) : null;
+        if (bytes.length >= 12 && (tag === 2 || tag === 11)) {
+          const destination = instruction.accountKeys[tag === 2 ? 1 : 2] ?? null;
+          if (destination !== null) {
+            transfer = {
+              source: instruction.accountKeys[0] ?? null,
+              destination,
+              lamports: bytes.readBigUInt64LE(4).toString(),
+            };
+          }
+        }
+      } catch {
+        indeterminateSystemInstruction = true;
+      }
+    }
+    if (transfer !== null && JITO_TIP_ACCOUNT_SET.has(transfer.destination)) {
+      transfers.push({
+        outerInstructionIndex: instruction.outerInstructionIndex,
+        innerInstructionIndex: instruction.innerInstructionIndex,
+        ...transfer,
+      });
+    }
+  }
+  const total = transfers.reduce((sum, transfer) => sum + BigInt(transfer.lamports), 0n);
+  return {
+    status: transfers.length > 0
+      ? "observed-transfer"
+      : indeterminateSystemInstruction ? "indeterminate" : "no-transfer-observed",
+    totalLamports: transfers.length > 0 ? total.toString() : indeterminateSystemInstruction ? null : "0",
+    transfers,
+    caveat:
+      "Covers direct System Program transfers to the eight documented Jito tip accounts in this transaction. A tip in another transaction of the same bundle and bundle-auction state are not observable here.",
   };
 }
 
@@ -252,9 +368,20 @@ function emptyComputeBudget(): ComputeBudgetEvidence {
   return {
     instructions: [],
     requestedComputeUnitLimit: null,
+    effectiveComputeUnitLimit: null,
+    computeUnitLimitSource: "unknown",
     requestedComputeUnitPriceMicroLamports: null,
     requestedPriorityFeeLamports: null,
     priorityFeeFormula: null,
+  };
+}
+
+function unavailableJitoTip(): JitoTipEvidence {
+  return {
+    status: "indeterminate",
+    totalLamports: null,
+    transfers: [],
+    caveat: "Transaction instructions were unavailable, so direct Jito tip transfers could not be inspected.",
   };
 }
 
@@ -284,6 +411,7 @@ function failedEnrichment(
     feeLamports: null,
     computeUnitsConsumed: null,
     computeBudget: emptyComputeBudget(),
+    jitoTip: unavailableJitoTip(),
     signatures: [],
     recentBlockhash: null,
     accountKeys: [],
@@ -458,6 +586,7 @@ export function parseTransactionEnrichment(
     feeLamports: fee === null ? null : String(fee),
     computeUnitsConsumed: computeUnitsConsumed === null ? null : String(computeUnitsConsumed),
     computeBudget: parseComputeBudget(instructions),
+    jitoTip: parseJitoTipEvidence(instructions),
     signatures: stringArray(transaction.signatures),
     recentBlockhash: string(message.recentBlockhash),
     accountKeys: [...staticKeys, ...loadedAddresses.writable, ...loadedAddresses.readonly],
@@ -477,6 +606,7 @@ export function venueEnvelopeFromLiveEvent(
   event: NormalizedMarketEvent,
   enrichment: TransactionEnrichment | null,
   outerInstructionIndex: number | null,
+  outerInstructionIndexSource: VenueEventEnvelope["canonical"]["outerInstructionIndexSource"],
   eventIndex: number,
 ): VenueEventEnvelope {
   const trade = event.eventType === "trade" ? event : null;
@@ -502,6 +632,7 @@ export function venueEnvelopeFromLiveEvent(
       slot: enrichment?.slot ?? event.ordering.slot,
       transactionIndex: enrichment?.canonicalTransactionIndex ?? null,
       outerInstructionIndex,
+      outerInstructionIndexSource,
       transactionLogIndex: event.ordering.transactionLogIndex,
       eventIndex,
       blockTimeUnixSeconds: enrichment?.blockTimeUnixSeconds ?? null,
@@ -515,19 +646,28 @@ export function venueEnvelopeFromLiveEvent(
       feeLamports: enrichment?.feeLamports ?? null,
       computeUnitsConsumed: enrichment?.computeUnitsConsumed ?? null,
       requestedComputeUnitLimit: enrichment?.computeBudget.requestedComputeUnitLimit ?? null,
+      effectiveComputeUnitLimit: enrichment?.computeBudget.effectiveComputeUnitLimit ?? null,
+      computeUnitLimitSource: enrichment?.computeBudget.computeUnitLimitSource ?? "unknown",
       requestedComputeUnitPriceMicroLamports:
         enrichment?.computeBudget.requestedComputeUnitPriceMicroLamports ?? null,
       requestedPriorityFeeLamports:
         enrichment?.computeBudget.requestedPriorityFeeLamports ?? null,
+      observableJitoTipLamports: enrichment?.jitoTip.totalLamports ?? null,
+      observableJitoTipStatus: enrichment?.jitoTip.status ?? "indeterminate",
     },
     venuePayload: event,
   };
 }
 
 export function compareCanonicalEvents(left: VenueEventEnvelope, right: VenueEventEnvelope): number {
+  const slot = compareNullable(left.canonical.slot, right.canonical.slot);
+  if (slot !== 0) return slot;
+  if (left.canonical.transactionIndex === null || right.canonical.transactionIndex === null) {
+    return compareObservedEvents(left, right);
+  }
+  const transaction = left.canonical.transactionIndex - right.canonical.transactionIndex;
+  if (transaction !== 0) return transaction;
   const fields: readonly [number | null, number | null][] = [
-    [left.canonical.slot, right.canonical.slot],
-    [left.canonical.transactionIndex, right.canonical.transactionIndex],
     [left.canonical.outerInstructionIndex, right.canonical.outerInstructionIndex],
     [left.canonical.transactionLogIndex, right.canonical.transactionLogIndex],
     [left.canonical.eventIndex, right.canonical.eventIndex],
@@ -538,5 +678,20 @@ export function compareCanonicalEvents(left: VenueEventEnvelope, right: VenueEve
     if (b === null) return -1;
     return a - b;
   }
-  return left.eventId.localeCompare(right.eventId);
+  return compareObservedEvents(left, right);
+}
+
+function compareNullable(left: number | null, right: number | null): number {
+  if (left === right) return 0;
+  if (left === null) return 1;
+  if (right === null) return -1;
+  return left - right;
+}
+
+/** Safe causal fallback: live collector order precedes deterministic non-live tie-breaking. */
+export function compareObservedEvents(left: VenueEventEnvelope, right: VenueEventEnvelope): number {
+  const sequence = compareNullable(left.observed.collectorSequence, right.observed.collectorSequence);
+  if (sequence !== 0) return sequence;
+  const log = left.canonical.transactionLogIndex - right.canonical.transactionLogIndex;
+  return log !== 0 ? log : left.eventId.localeCompare(right.eventId);
 }

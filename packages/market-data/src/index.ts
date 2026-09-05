@@ -126,11 +126,12 @@ export interface TradeMarketEvent extends CommonMarketEvent {
     readonly nativeSolLamports: string;
     readonly quoteBaseUnits: string;
   };
-  /** Exact observed amount ratio; this is not an executable-price assertion. */
+  /** Exact average fill ratio (quote amount / token amount); not spot or next executable price. */
   readonly observedPriceRatio: {
     readonly quoteBaseUnits: string;
     readonly tokenBaseUnits: string;
   };
+  /** Post-trade reserves emitted by Pump TradeEvent. */
   readonly reserves: {
     readonly virtualTokenBaseUnits: string;
     readonly virtualSolLamports: string;
@@ -195,6 +196,7 @@ export interface VenueEventEnvelope {
     readonly slot: number | null;
     readonly transactionIndex: number | null;
     readonly outerInstructionIndex: number | null;
+    readonly outerInstructionIndexSource: "message-correlated" | "log-inferred" | null;
     readonly transactionLogIndex: number;
     readonly eventIndex: number;
     readonly blockTimeUnixSeconds: number | null;
@@ -208,8 +210,16 @@ export interface VenueEventEnvelope {
     readonly feeLamports: string | null;
     readonly computeUnitsConsumed: string | null;
     readonly requestedComputeUnitLimit: string | null;
+    readonly effectiveComputeUnitLimit: string | null;
+    readonly computeUnitLimitSource: "explicit" | "runtime-default" | "unknown";
     readonly requestedComputeUnitPriceMicroLamports: string | null;
     readonly requestedPriorityFeeLamports: string | null;
+    /** Direct System Program transfers to documented Jito tip accounts in this transaction only. */
+    readonly observableJitoTipLamports: string | null;
+    readonly observableJitoTipStatus:
+      | "observed-transfer"
+      | "no-transfer-observed"
+      | "indeterminate";
   };
   readonly venuePayload: unknown;
 }

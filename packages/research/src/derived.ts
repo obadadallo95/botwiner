@@ -21,6 +21,7 @@ import {
 } from "@botwiner/storage";
 import {
   compareCanonicalEvents,
+  compareObservedEvents,
   parseTransactionEnrichment,
   transactionEnrichmentsFromFullBlocks,
   transactionIndexesFromBlockRecords,
@@ -38,6 +39,7 @@ import {
   type Distribution,
   type FeedQualityReport,
   type GapRecoveryRecord,
+  type ObservedTransactionRecord,
   type Phase2Manifest,
   type RawRpcRecord,
   type TransactionEnrichment,
@@ -46,6 +48,8 @@ import {
 export const PHASE2_DERIVED_DIRECTORY = "derived";
 export const TRANSACTIONS_FILE = "transactions.jsonl";
 export const VENUE_EVENTS_FILE = "venue-events.jsonl";
+export const CANONICAL_VENUE_EVENTS_FILE = "venue-events-canonical.jsonl";
+export const OBSERVED_TRANSACTIONS_FILE = "transactions-observed.jsonl";
 export const GAPS_FILE = "gaps.jsonl";
 export const FEED_QUALITY_FILE = "feed-quality.json";
 export const PHASE2_MANIFEST_FILE = "manifest.json";
@@ -112,6 +116,7 @@ interface LiveObservation {
   readonly receivedAtUnixMs: number;
   readonly receivedMonotonicNs: string;
   readonly sequence: number;
+  readonly error: unknown;
 }
 
 function backfilledEnvelope(
@@ -146,6 +151,7 @@ function backfilledEnvelope(
       slot: enrichment.slot,
       transactionIndex: enrichment.canonicalTransactionIndex,
       outerInstructionIndex: located.outerInstructionIndex,
+      outerInstructionIndexSource: located.outerInstructionIndexSource,
       transactionLogIndex: located.logIndex,
       eventIndex: located.eventIndex,
       blockTimeUnixSeconds: enrichment.blockTimeUnixSeconds,
@@ -159,9 +165,13 @@ function backfilledEnvelope(
       feeLamports: enrichment.feeLamports,
       computeUnitsConsumed: enrichment.computeUnitsConsumed,
       requestedComputeUnitLimit: enrichment.computeBudget.requestedComputeUnitLimit,
+      effectiveComputeUnitLimit: enrichment.computeBudget.effectiveComputeUnitLimit,
+      computeUnitLimitSource: enrichment.computeBudget.computeUnitLimitSource,
       requestedComputeUnitPriceMicroLamports:
         enrichment.computeBudget.requestedComputeUnitPriceMicroLamports,
       requestedPriorityFeeLamports: enrichment.computeBudget.requestedPriorityFeeLamports,
+      observableJitoTipLamports: enrichment.jitoTip.totalLamports,
+      observableJitoTipStatus: enrichment.jitoTip.status,
     },
     venuePayload: jsonSafe(event),
   };
@@ -169,21 +179,35 @@ function backfilledEnvelope(
 
 async function phase1Evidence(dataset: string): Promise<{
   readonly manifest: DatasetManifest;
-  readonly rawRecords: RawLogRecord[];
   readonly events: NormalizedMarketEvent[];
   readonly diagnostics: DiagnosticRecord[];
+  readonly rawParseDurationsMicroseconds: readonly number[];
   readonly observations: ReadonlyMap<string, LiveObservation>;
-  readonly eventLocations: ReadonlyMap<string, { outerInstructionIndex: number | null; eventIndex: number }>;
+  readonly eventLocations: ReadonlyMap<string, {
+    outerInstructionIndex: number | null;
+    outerInstructionIndexSource: VenueEventEnvelope["canonical"]["outerInstructionIndexSource"];
+    eventIndex: number;
+  }>;
 }> {
-  const [manifestText, rawRecords, events, diagnostics] = await Promise.all([
+  const [manifestText, events, diagnostics] = await Promise.all([
     readFile(join(dataset, MANIFEST_FILE_NAME), "utf8"),
-    collect<RawLogRecord>(join(dataset, RAW_FILE_NAME)),
     collect<NormalizedMarketEvent>(join(dataset, EVENTS_FILE_NAME)),
     collect<DiagnosticRecord>(join(dataset, DIAGNOSTICS_FILE_NAME)),
   ]);
   const observations = new Map<string, LiveObservation>();
-  const eventLocations = new Map<string, { outerInstructionIndex: number | null; eventIndex: number }>();
-  for (const raw of rawRecords) {
+  const eventLocations = new Map<string, {
+    outerInstructionIndex: number | null;
+    outerInstructionIndexSource: VenueEventEnvelope["canonical"]["outerInstructionIndexSource"];
+    eventIndex: number;
+  }>();
+  const rawParseDurationsMicroseconds: number[] = [];
+  for await (const line of readJsonLines<RawLogRecord>(join(dataset, RAW_FILE_NAME))) {
+    const raw = line.value;
+    try {
+      rawParseDurationsMicroseconds.push(Number(BigInt(raw.capture.parseDurationNs)) / 1_000);
+    } catch {
+      // Malformed duration evidence is excluded from this distribution, not invented.
+    }
     const notification = parseLogsNotification(raw.rpcPayload);
     if (!notification.ok) continue;
     const signature = notification.value.params.result.value.signature;
@@ -194,6 +218,7 @@ async function phase1Evidence(dataset: string): Promise<{
         receivedAtUnixMs: raw.capture.receivedAtUnixMs,
         receivedMonotonicNs: raw.capture.receivedMonotonicNs,
         sequence: raw.sequence,
+        error: notification.value.params.result.value.err,
       });
     }
     const parsed = parsePumpProgramLogs(notification.value.params.result.value.logs);
@@ -201,15 +226,16 @@ async function phase1Evidence(dataset: string): Promise<{
       const type = located.event.kind === "create" ? "launch" : "trade";
       eventLocations.set(`${signature}:${located.logIndex}:${type}`, {
         outerInstructionIndex: located.outerInstructionIndex,
+        outerInstructionIndexSource: located.outerInstructionIndexSource,
         eventIndex: located.eventIndex,
       });
     }
   }
   return {
     manifest: JSON.parse(manifestText) as DatasetManifest,
-    rawRecords,
     events,
     diagnostics,
+    rawParseDurationsMicroseconds,
     observations,
     eventLocations,
   };
@@ -236,13 +262,7 @@ function qualityReport(options: {
       confirmationObservation.push(enrichment.fetchedAtUnixMs - observed.receivedAtUnixMs);
     }
   }
-  const parseMicroseconds = phase1.rawRecords.flatMap((record) => {
-    try {
-      return [Number(BigInt(record.capture.parseDurationNs)) / 1_000];
-    } catch {
-      return [];
-    }
-  });
+  const parseMicroseconds = phase1.rawParseDurationsMicroseconds;
 
   const comparable = venueEvents.filter(
     (event) =>
@@ -310,6 +330,29 @@ function qualityReport(options: {
   const rawCount = phase1.manifest.counts.rawNotifications;
   const duplicateDenominator = phase1.manifest.counts.normalizedEvents + phase1.manifest.counts.duplicateEvents;
   const enrichmentCount = transactions.length;
+  let observedVsFinalizedSlotComparisons = 0;
+  let observedVsFinalizedSlotMismatches = 0;
+  const failedBySlot = new Map<number, { failed: number; observed: number }>();
+  for (const [signature, observation] of phase1.observations) {
+    const enrichment = enrichmentBySignature.get(signature);
+    if (enrichment?.slot !== null && enrichment?.slot !== undefined) {
+      observedVsFinalizedSlotComparisons += 1;
+      if (enrichment.slot !== observation.slot) observedVsFinalizedSlotMismatches += 1;
+    }
+    const slot = failedBySlot.get(observation.slot) ?? { failed: 0, observed: 0 };
+    slot.observed += 1;
+    if (observation.error !== null) slot.failed += 1;
+    failedBySlot.set(observation.slot, slot);
+  }
+  const sntpDiagnostics = phase1.diagnostics.filter((item) => item.code === "clock-offset-sampled");
+  const diagnosticNumbers = (field: string): number[] => sntpDiagnostics.flatMap((item) => {
+    const value = item.details[field];
+    return typeof value === "number" && Number.isFinite(value) ? [value] : [];
+  });
+  const observableJitoTipLamports = success.reduce(
+    (total, item) => total + BigInt(item.jitoTip.totalLamports ?? "0"),
+    0n,
+  );
 
   return {
     schemaVersion: 1,
@@ -352,11 +395,34 @@ function qualityReport(options: {
       eventsWithoutCanonicalOrder: venueEvents.length - venueEvents.filter(
         (event) => event.canonical.slot !== null && event.canonical.transactionIndex !== null,
       ).length,
+      observedVsFinalizedSlotComparisons,
+      observedVsFinalizedSlotMismatches,
+    },
+    congestion: {
+      observedTransactions: phase1.observations.size,
+      failedTransactions: phase1.manifest.counts.failedTransactions,
+      failedTransactionRate:
+        phase1.observations.size === 0
+          ? null
+          : phase1.manifest.counts.failedTransactions / phase1.observations.size,
+      failedTransactionsByObservedSlot: [...failedBySlot]
+        .sort(([left], [right]) => left - right)
+        .map(([slot, counts]) => ({ slot, ...counts })),
+      caveat:
+        "The observed transaction stream retains failed transactions as congestion evidence. It is not a complete mempool or leader ingress trace.",
+    },
+    clock: {
+      sntpSamples: sntpDiagnostics.length,
+      offsetMs: distribution(diagnosticNumbers("offsetMs")),
+      roundTripTimeMs: distribution(diagnosticNumbers("roundTripMs")),
+      caveat:
+        "SNTP samples are intermittent local clock evidence. They do not calibrate provider ingress time, eliminate asymmetric path error, or replace monotonic timing for within-process intervals.",
     },
     latency: {
       collectorReceiveMinusBlockTimeMs: distribution(receiveMinusBlock),
       collectorReceiveMinusBlockTimeCaveat:
         "Block time is validator-estimated and second-resolution. This value mixes block timestamp coarseness, provider delivery, network transit, and local wall-clock offset; it is not millisecond network latency.",
+      collectorReceiveMinusBlockTimeEligibleForExecutionModel: false,
       collectorParseDurationMicroseconds: distribution(parseMicroseconds),
       confirmationObservationDelayMs: distribution(confirmationObservation),
       confirmationObservationDelayCaveat:
@@ -375,6 +441,11 @@ function qualityReport(options: {
       withExplicitComputeUnitPrice: success.filter(
         (item) => item.computeBudget.requestedComputeUnitPriceMicroLamports !== null,
       ).length,
+      withRuntimeDefaultComputeUnitLimit: success.filter(
+        (item) => item.computeBudget.computeUnitLimitSource === "runtime-default",
+      ).length,
+      withObservableJitoTip: success.filter((item) => item.jitoTip.status === "observed-transfer").length,
+      observableJitoTipLamports: observableJitoTipLamports.toString(),
     },
     eventCountBySlot: [...countBySlot]
       .sort(([left], [right]) => left - right)
@@ -392,17 +463,10 @@ export async function rebuildDerivedResearchStore(
   const rawTransactionPath = join(rawDirectory, RPC_TRANSACTIONS_FILE);
   const rawBlockPath = join(rawDirectory, RPC_BLOCKS_FILE);
   const rawGapPath = join(rawDirectory, GAP_RECOVERY_FILE);
-  const [phase1, transactionRecords, blockRecords, gaps] = await Promise.all([
+  const [phase1, gaps] = await Promise.all([
     phase1Evidence(dataset),
-    collect<RawRpcRecord>(rawTransactionPath),
-    collect<RawRpcRecord>(rawBlockPath),
     collect<GapRecoveryRecord>(rawGapPath),
   ]);
-  const transactionIndexes = transactionIndexesFromBlockRecords(blockRecords);
-  const directTransactions = transactionRecords.map((record) =>
-    parseTransactionEnrichment(record, transactionIndexes),
-  );
-  const directSignatures = new Set(directTransactions.map((item) => item.signature));
   const backfilledSlotBySignature = new Map(
     gaps.flatMap((gap) => gap.candidateSignatures.map((item) => [item.signature, item.slot] as const)),
   );
@@ -416,21 +480,92 @@ export async function rebuildDerivedResearchStore(
       const slot = backfilledSlotBySignature.get(signature);
       return slot === undefined ? [] : [{ signature, slot, provenance: "backfilled" as const }];
     })),
-  ].filter((item) => item.slot >= 0 && !directSignatures.has(item.signature));
-  const transactions = [
-    ...directTransactions,
-    ...transactionEnrichmentsFromFullBlocks(blockRecords, expectedFromBlocks),
+  ].filter((item) => item.slot >= 0);
+  const expectedBySlot = new Map<number, typeof expectedFromBlocks>();
+  for (const expected of expectedFromBlocks) {
+    const group = expectedBySlot.get(expected.slot) ?? [];
+    group.push(expected);
+    expectedBySlot.set(expected.slot, group);
+  }
+
+  // Full blocks can be hundreds of megabytes. Consume one JSONL record at a time and
+  // retain only the requested transaction enrichments and compact signature indexes.
+  const transactionIndexes = new Map<string, number>();
+  const transactionBySignature = new Map<string, TransactionEnrichment>();
+  const slotsSeen = new Set<number>();
+  for await (const line of readJsonLines<RawRpcRecord>(rawBlockPath)) {
+    const record = line.value;
+    for (const [signature, index] of transactionIndexesFromBlockRecords([record])) {
+      transactionIndexes.set(signature, index);
+    }
+    const slot = Number(record.request.subject);
+    if (!Number.isSafeInteger(slot)) continue;
+    slotsSeen.add(slot);
+    for (const enrichment of transactionEnrichmentsFromFullBlocks(
+      [record],
+      expectedBySlot.get(slot) ?? [],
+    )) {
+      transactionBySignature.set(enrichment.signature, enrichment);
+    }
+  }
+  for (const expected of expectedFromBlocks) {
+    if (!slotsSeen.has(expected.slot)) {
+      const missing = transactionEnrichmentsFromFullBlocks([], [expected])[0];
+      if (missing !== undefined) transactionBySignature.set(expected.signature, missing);
+    }
+  }
+  // Targeted getTransaction is authoritative for the transaction payload and replaces
+  // any fallback extraction from a full block while reusing the finalized block index.
+  for await (const line of readJsonLines<RawRpcRecord>(rawTransactionPath)) {
+    const enrichment = parseTransactionEnrichment(line.value, transactionIndexes);
+    transactionBySignature.set(enrichment.signature, enrichment);
+  }
+  const transactionOrder = [
+    ...expectedFromBlocks.map((item) => item.signature),
+    ...transactionBySignature.keys(),
   ];
+  const transactions = [...new Set(transactionOrder)].flatMap((signature) => {
+    const enrichment = transactionBySignature.get(signature);
+    return enrichment === undefined ? [] : [enrichment];
+  });
   const enrichmentBySignature = new Map(transactions.map((item) => [item.signature, item]));
-  const venueEvents: VenueEventEnvelope[] = phase1.events.map((event) => {
-    const location = phase1.eventLocations.get(event.eventId);
+  const correlatedLocations = new Map(phase1.eventLocations);
+  for (const enrichment of transactions) {
+    if (enrichment.logMessages === null) continue;
+    const outerProgramIds = enrichment.instructions
+      .filter((instruction) => instruction.innerInstructionIndex === null)
+      .map((instruction) => instruction.programId);
+    for (const located of parsePumpProgramLogs(enrichment.logMessages, outerProgramIds).events) {
+      const type = located.event.kind === "create" ? "launch" : "trade";
+      correlatedLocations.set(`${enrichment.signature}:${located.logIndex}:${type}`, {
+        outerInstructionIndex: located.outerInstructionIndex,
+        outerInstructionIndexSource: located.outerInstructionIndexSource,
+        eventIndex: located.eventIndex,
+      });
+    }
+  }
+  const liveEnrichedEvents: VenueEventEnvelope[] = phase1.events.map((event) => {
+    const location = correlatedLocations.get(event.eventId);
     return venueEnvelopeFromLiveEvent(
       event,
       enrichmentBySignature.get(event.signature) ?? null,
       location?.outerInstructionIndex ?? null,
+      location?.outerInstructionIndexSource ?? null,
       location?.eventIndex ?? 0,
     );
   });
+  // Causal stream deliberately excludes every field learned only from finalized RPC.
+  const observedVenueEvents: VenueEventEnvelope[] = phase1.events.map((event) => {
+    const location = phase1.eventLocations.get(event.eventId);
+    return venueEnvelopeFromLiveEvent(
+      event,
+      null,
+      location?.outerInstructionIndex ?? null,
+      location?.outerInstructionIndexSource ?? null,
+      location?.eventIndex ?? 0,
+    );
+  }).sort(compareObservedEvents);
+  const allVenueEvents = [...liveEnrichedEvents];
   for (const enrichment of transactions) {
     if (
       enrichment.provenance !== "backfilled" ||
@@ -440,13 +575,30 @@ export async function rebuildDerivedResearchStore(
     ) {
       continue;
     }
-    const parsed = parsePumpProgramLogs(enrichment.logMessages);
+    const outerProgramIds = enrichment.instructions
+      .filter((instruction) => instruction.innerInstructionIndex === null)
+      .map((instruction) => instruction.programId);
+    const parsed = parsePumpProgramLogs(enrichment.logMessages, outerProgramIds);
     for (const located of parsed.events) {
-      venueEvents.push(backfilledEnvelope(enrichment.signature, located, enrichment));
+      allVenueEvents.push(backfilledEnvelope(enrichment.signature, located, enrichment));
     }
   }
-  const uniqueVenueEvents = [...new Map(venueEvents.map((event) => [event.eventId, event])).values()]
+  const canonicalVenueEvents = [...new Map(allVenueEvents.map((event) => [event.eventId, event])).values()]
     .sort(compareCanonicalEvents);
+  const observedTransactions: ObservedTransactionRecord[] = [...phase1.observations]
+    .map(([signature, observation]) => {
+      return {
+        schemaVersion: 1,
+        kind: "observed-transaction",
+        signature,
+        collectorSequence: observation.sequence,
+        observedSlot: observation.slot,
+        receivedAtUnixMs: observation.receivedAtUnixMs,
+        status: observation.error === null ? "success" : "failed",
+        error: observation.error,
+      } satisfies ObservedTransactionRecord;
+    })
+    .sort((left, right) => left.collectorSequence - right.collectorSequence);
 
   const inputDigests = {
     rawSha256: await digestFile(join(dataset, RAW_FILE_NAME)),
@@ -456,15 +608,19 @@ export async function rebuildDerivedResearchStore(
     rpcBlocksSha256: await digestFile(rawBlockPath),
     gapRecoverySha256: await digestFile(rawGapPath),
   };
-  const report = qualityReport({ phase1, transactions, venueEvents: uniqueVenueEvents, gaps, inputDigests });
+  const report = qualityReport({ phase1, transactions, venueEvents: canonicalVenueEvents, gaps, inputDigests });
   await mkdir(derivedDirectory, { recursive: true });
   const transactionsPath = join(derivedDirectory, TRANSACTIONS_FILE);
-  const venueEventsPath = join(derivedDirectory, VENUE_EVENTS_FILE);
+  const observedVenueEventsPath = join(derivedDirectory, VENUE_EVENTS_FILE);
+  const canonicalVenueEventsPath = join(derivedDirectory, CANONICAL_VENUE_EVENTS_FILE);
+  const observedTransactionsPath = join(derivedDirectory, OBSERVED_TRANSACTIONS_FILE);
   const gapsPath = join(derivedDirectory, GAPS_FILE);
   const reportPath = join(derivedDirectory, FEED_QUALITY_FILE);
-  const [transactionsSha256, venueEventsSha256, gapsSha256] = await Promise.all([
+  const [transactionsSha256, observedVenueEventsSha256, canonicalVenueEventsSha256, observedTransactionsSha256, gapsSha256] = await Promise.all([
     writeJsonLines(transactionsPath, transactions),
-    writeJsonLines(venueEventsPath, uniqueVenueEvents),
+    writeJsonLines(observedVenueEventsPath, observedVenueEvents),
+    writeJsonLines(canonicalVenueEventsPath, canonicalVenueEvents),
+    writeJsonLines(observedTransactionsPath, observedTransactions),
     writeJsonLines(gapsPath, gaps),
   ]);
   const reportText = `${JSON.stringify(report, null, 2)}\n`;
@@ -480,26 +636,40 @@ export async function rebuildDerivedResearchStore(
       rawBlocks: `${PHASE2_RAW_DIRECTORY}/${RPC_BLOCKS_FILE}`,
       rawGapQueries: `${PHASE2_RAW_DIRECTORY}/${GAP_RECOVERY_FILE}`,
       transactions: `${PHASE2_DERIVED_DIRECTORY}/${TRANSACTIONS_FILE}`,
-      venueEvents: `${PHASE2_DERIVED_DIRECTORY}/${VENUE_EVENTS_FILE}`,
+      observedVenueEvents: `${PHASE2_DERIVED_DIRECTORY}/${VENUE_EVENTS_FILE}`,
+      canonicalVenueEvents: `${PHASE2_DERIVED_DIRECTORY}/${CANONICAL_VENUE_EVENTS_FILE}`,
+      observedTransactions: `${PHASE2_DERIVED_DIRECTORY}/${OBSERVED_TRANSACTIONS_FILE}`,
       gaps: `${PHASE2_DERIVED_DIRECTORY}/${GAPS_FILE}`,
       feedQuality: `${PHASE2_DERIVED_DIRECTORY}/${FEED_QUALITY_FILE}`,
     },
     counts: {
       transactionEnrichments: transactions.length,
-      venueEvents: uniqueVenueEvents.length,
+      observedVenueEvents: observedVenueEvents.length,
+      canonicalVenueEvents: canonicalVenueEvents.length,
+      observedTransactions: observedTransactions.length,
       gaps: gaps.length,
     },
-    outputDigests: { transactionsSha256, venueEventsSha256, gapsSha256, feedQualitySha256 },
+    outputDigests: {
+      transactionsSha256,
+      observedVenueEventsSha256,
+      canonicalVenueEventsSha256,
+      observedTransactionsSha256,
+      gapsSha256,
+      feedQualitySha256,
+    },
     limitations: [
       "Raw Phase 1 JSONL and raw Phase 2 RPC evidence remain the immutable sources; this directory may be rebuilt.",
       "Finalized getTransaction availability proves finality for returned transactions, not completeness of PubSub delivery.",
       "Canonical transaction index comes from signature position in finalized getBlock output.",
-      "An inferred outer-instruction index depends on complete runtime invoke logs; the raw log index is retained.",
-      "No millisecond latency claim is made from second-resolution blockTime.",
+      "Observed event and transaction files preserve collector order, exclude backfill, and force finalized-only enrichment to null; canonical events are post-hoc evaluation data and must not be used as causal simulation input.",
+      "Outer-instruction indexes are correlated against the authoritative message instruction list when transaction payloads are available; the raw log index is retained.",
+      "Failed observed transactions are retained as congestion inputs, but this is not a mempool or leader-ingress trace.",
+      "No millisecond latency or execution-timing claim is made from second-resolution blockTime.",
+      "Observable Jito tips cover direct transfers in the same transaction only; separate bundle transactions and auction state remain unknown.",
     ],
   };
   await writeFile(join(phase2Root, PHASE2_MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  return { transactions, venueEvents: uniqueVenueEvents, gaps, report, manifest };
+  return { transactions, observedTransactions, observedVenueEvents, canonicalVenueEvents, gaps, report, manifest };
 }
 
 export async function readFeedQualityReport(datasetDirectory: string): Promise<FeedQualityReport> {

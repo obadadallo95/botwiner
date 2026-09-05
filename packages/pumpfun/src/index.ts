@@ -85,10 +85,88 @@ export interface PumpTradeEvent {
 
 export type PumpEvent = PumpCreateEvent | PumpTradeEvent;
 
+export interface PumpTradeReserveSemantics {
+  readonly status: "exact-standard-bonding-curve" | "unsupported-mayhem-mode";
+  readonly preTrade: {
+    readonly virtualTokenReserves: bigint;
+    readonly virtualQuoteReserves: bigint;
+    readonly realTokenReserves: bigint;
+    readonly realQuoteReserves: bigint;
+  } | null;
+  readonly postTrade: {
+    readonly virtualTokenReserves: bigint;
+    readonly virtualQuoteReserves: bigint;
+    readonly realTokenReserves: bigint;
+    readonly realQuoteReserves: bigint;
+  };
+  readonly averageFillRatio: { readonly quoteBaseUnits: bigint; readonly tokenBaseUnits: bigint };
+  readonly marginalRatios: {
+    readonly preQuoteReservesPerTokenReserves: { readonly numerator: bigint; readonly denominator: bigint } | null;
+    readonly postQuoteReservesPerTokenReserves: { readonly numerator: bigint; readonly denominator: bigint };
+  };
+  readonly caveat: string;
+}
+
+/**
+ * Documents TradeEvent reserve semantics without pretending a reserve ratio is an executable quote.
+ * Standard Pump events are post-trade. Mayhem-mode quote reserves can change independently, so their
+ * pre-state cannot be reconstructed from one event and is intentionally left null.
+ */
+export function pumpTradeReserveSemantics(event: PumpTradeEvent): PumpTradeReserveSemantics {
+  const postTrade = {
+    virtualTokenReserves: event.virtualTokenReserves,
+    virtualQuoteReserves: event.virtualQuoteReserves,
+    realTokenReserves: event.realTokenReserves,
+    realQuoteReserves: event.realQuoteReserves,
+  };
+  if (event.mayhemMode) {
+    return {
+      status: "unsupported-mayhem-mode",
+      preTrade: null,
+      postTrade,
+      averageFillRatio: { quoteBaseUnits: event.quoteAmount, tokenBaseUnits: event.tokenAmount },
+      marginalRatios: {
+        preQuoteReservesPerTokenReserves: null,
+        postQuoteReservesPerTokenReserves: {
+          numerator: event.virtualQuoteReserves,
+          denominator: event.virtualTokenReserves,
+        },
+      },
+      caveat: "Mayhem-mode quote-reserve jumps are not reconstructible from a single TradeEvent.",
+    };
+  }
+  const direction = event.isBuy ? 1n : -1n;
+  const preTrade = {
+    virtualTokenReserves: event.virtualTokenReserves + direction * event.tokenAmount,
+    virtualQuoteReserves: event.virtualQuoteReserves - direction * event.quoteAmount,
+    realTokenReserves: event.realTokenReserves + direction * event.tokenAmount,
+    realQuoteReserves: event.realQuoteReserves - direction * event.quoteAmount,
+  };
+  return {
+    status: "exact-standard-bonding-curve",
+    preTrade,
+    postTrade,
+    averageFillRatio: { quoteBaseUnits: event.quoteAmount, tokenBaseUnits: event.tokenAmount },
+    marginalRatios: {
+      preQuoteReservesPerTokenReserves: {
+        numerator: preTrade.virtualQuoteReserves,
+        denominator: preTrade.virtualTokenReserves,
+      },
+      postQuoteReservesPerTokenReserves: {
+        numerator: event.virtualQuoteReserves,
+        denominator: event.virtualTokenReserves,
+      },
+    },
+    caveat:
+      "Ratios describe reserve state and average fill only. An executable quote must apply Pump's exact integer formula, direction, dynamic fees, slippage limit, and transaction ordering.",
+  };
+}
+
 export interface LocatedPumpEvent {
   readonly logIndex: number;
   /** Best-effort outer transaction instruction inferred from depth-1 runtime invokes. */
   readonly outerInstructionIndex: number | null;
+  readonly outerInstructionIndexSource: "message-correlated" | "log-inferred" | null;
   /** Index among successfully decoded Pump events in this transaction. */
   readonly eventIndex: number;
   readonly discriminatorHex: string;
@@ -300,11 +378,16 @@ function removeProgramFromStack(stack: string[], programId: string): void {
   if (index >= 0) stack.splice(index);
 }
 
-export function parsePumpProgramLogs(logs: readonly string[]): PumpLogParseResult {
+export function parsePumpProgramLogs(
+  logs: readonly string[],
+  outerProgramIds?: readonly (string | null)[],
+): PumpLogParseResult {
   const events: LocatedPumpEvent[] = [];
   const failures: PumpParseFailure[] = [];
   const programStack: string[] = [];
   let outerInstructionIndex = -1;
+  let correlatedOuterInstructionIndex = -1;
+  let currentCorrelatedOuterInstructionIndex: number | null = null;
 
   for (let logIndex = 0; logIndex < logs.length; logIndex += 1) {
     const line = logs[logIndex] ?? "";
@@ -313,7 +396,16 @@ export function parsePumpProgramLogs(logs: readonly string[]): PumpLogParseResul
       const programId = invocation[1] ?? "";
       const depth = Number(invocation[2]);
       if (Number.isSafeInteger(depth) && depth > 0) {
-        if (depth === 1) outerInstructionIndex += 1;
+        if (depth === 1) {
+          outerInstructionIndex += 1;
+          if (outerProgramIds !== undefined) {
+            const matchingIndex = outerProgramIds.findIndex(
+              (candidate, index) => index > correlatedOuterInstructionIndex && candidate === programId,
+            );
+            if (matchingIndex >= 0) correlatedOuterInstructionIndex = matchingIndex;
+            currentCorrelatedOuterInstructionIndex = matchingIndex >= 0 ? matchingIndex : null;
+          }
+        }
         programStack.length = Math.min(programStack.length, depth - 1);
         programStack[depth - 1] = programId;
       }
@@ -343,7 +435,14 @@ export function parsePumpProgramLogs(logs: readonly string[]): PumpLogParseResul
     try {
       events.push({
         logIndex,
-        outerInstructionIndex: outerInstructionIndex >= 0 ? outerInstructionIndex : null,
+        outerInstructionIndex:
+          outerProgramIds === undefined
+            ? outerInstructionIndex >= 0 ? outerInstructionIndex : null
+            : currentCorrelatedOuterInstructionIndex,
+        outerInstructionIndexSource:
+          outerProgramIds === undefined
+            ? outerInstructionIndex >= 0 ? "log-inferred" : null
+            : currentCorrelatedOuterInstructionIndex !== null ? "message-correlated" : null,
         eventIndex: events.length,
         discriminatorHex,
         event: decoder(bytes.subarray(8)),

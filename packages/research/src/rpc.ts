@@ -1,8 +1,8 @@
-import { mkdir, stat } from "node:fs/promises";
+import { mkdir, open, stat, type FileHandle } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { parseLogsNotification, type DiagnosticRecord, type RawLogRecord } from "@botwiner/market-data";
 import { PUMP_PROGRAM_ID } from "@botwiner/pumpfun";
-import { DIAGNOSTICS_FILE_NAME, RAW_FILE_NAME, readJsonLines, writeJsonLines } from "@botwiner/storage";
+import { DIAGNOSTICS_FILE_NAME, RAW_FILE_NAME, readJsonLines } from "@botwiner/storage";
 import {
   PHASE2_DIRECTORY,
   type GapBoundary,
@@ -27,6 +27,7 @@ export interface CaptureRpcEvidenceOptions extends RpcClientOptions {
   readonly datasetDirectory: string;
   readonly concurrency?: number;
   readonly maximumGapSignatures?: number;
+  readonly source?: "targeted-transactions" | "full-blocks";
   readonly onProgress?: (progress: {
     readonly stage: "transactions" | "blocks";
     readonly completed: number;
@@ -75,7 +76,9 @@ function retryAfterMs(response: Response, fallback: number): number {
   const value = response.headers.get("retry-after");
   if (value === null) return fallback;
   const seconds = Number(value);
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1_000 : fallback;
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const atUnixMs = Date.parse(value);
+  return Number.isFinite(atUnixMs) ? Math.max(0, atUnixMs - Date.now()) : fallback;
 }
 
 export async function callSolanaRpc(
@@ -153,6 +156,36 @@ async function mapConcurrent<T, U>(
   return output;
 }
 
+async function appendJsonLines(handle: FileHandle, records: readonly unknown[]): Promise<void> {
+  if (records.length === 0) return;
+  await handle.writeFile(`${records.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+}
+
+async function captureInBatches<T>(options: {
+  readonly values: readonly T[];
+  readonly concurrency: number;
+  readonly handle: FileHandle;
+  readonly batchSize?: number;
+  readonly work: (value: T) => Promise<RawRpcRecord>;
+  readonly onBatch?: (records: readonly RawRpcRecord[], completed: number) => void;
+}): Promise<number> {
+  const batchSize = options.batchSize ?? Math.max(options.concurrency, options.concurrency * 8);
+  let completed = 0;
+  for (let offset = 0; offset < options.values.length; offset += batchSize) {
+    const batch = options.values.slice(offset, offset + batchSize);
+    const records = await mapConcurrent(batch, options.concurrency, options.work);
+    await appendJsonLines(options.handle, records);
+    completed += records.length;
+    options.onBatch?.(records, completed);
+  }
+  return completed;
+}
+
+function transactionSlot(response: unknown): number | null {
+  if (!isRecord(response) || !isRecord(response.result)) return null;
+  return Number.isSafeInteger(response.result.slot) ? response.result.slot as number : null;
+}
+
 interface ObservedSignature {
   readonly signature: string;
   readonly slot: number;
@@ -201,8 +234,8 @@ function boundary(value: ObservedSignature | undefined): GapBoundary | null {
 export function detectGaps(
   diagnostics: readonly DiagnosticRecord[],
   observed: readonly ObservedSignature[],
-): Omit<GapRecoveryRecord, "queryCompleted" | "queryTruncatedByBound" | "candidateSignatures" | "newlyDiscoveredSignatures" | "limitation" | "error">[] {
-  const gaps: Omit<GapRecoveryRecord, "queryCompleted" | "queryTruncatedByBound" | "candidateSignatures" | "newlyDiscoveredSignatures" | "limitation" | "error">[] = [];
+): Omit<GapRecoveryRecord, "rpcEvidence" | "boundaryValidation" | "queryCompleted" | "queryTruncatedByBound" | "candidateSignatures" | "newlyDiscoveredSignatures" | "limitation" | "error">[] {
+  const gaps: Omit<GapRecoveryRecord, "rpcEvidence" | "boundaryValidation" | "queryCompleted" | "queryTruncatedByBound" | "candidateSignatures" | "newlyDiscoveredSignatures" | "limitation" | "error">[] = [];
   for (let index = 0; index < diagnostics.length; index += 1) {
     const diagnostic = diagnostics[index];
     if (diagnostic?.code !== "connection-closed" || diagnostic.details.willReconnect !== true) continue;
@@ -248,7 +281,24 @@ function rpcResponseError(response: unknown): string | null {
   return response.error === undefined ? null : JSON.stringify(response.error);
 }
 
-async function recoverGap(
+function finalizedBoundaryStatuses(
+  response: unknown,
+  detected: ReturnType<typeof detectGaps>[number],
+): GapRecoveryRecord["boundaryValidation"] {
+  if (!isRecord(response) || !isRecord(response.result) || !Array.isArray(response.result.value)) return null;
+  const values = response.result.value as unknown[];
+  const before = values[0];
+  const after = values[1];
+  const matches = (value: unknown, expected: GapBoundary | null): boolean =>
+    expected !== null && isRecord(value) && value.confirmationStatus === "finalized" && value.slot === expected.slot;
+  return {
+    checkedAtCommitment: "finalized",
+    beforeGapFinalizedAtExpectedSlot: matches(before, detected.beforeGap),
+    afterGapFinalizedAtExpectedSlot: matches(after, detected.afterGap),
+  };
+}
+
+export async function recoverGap(
   options: RpcClientOptions,
   detected: ReturnType<typeof detectGaps>[number],
   liveSignatures: ReadonlySet<string>,
@@ -257,6 +307,8 @@ async function recoverGap(
   if (detected.beforeGap === null || detected.afterGap === null) {
     return {
       ...detected,
+      rpcEvidence: [],
+      boundaryValidation: null,
       queryCompleted: false,
       queryTruncatedByBound: false,
       candidateSignatures: [],
@@ -265,24 +317,65 @@ async function recoverGap(
       error: "missing boundary signature",
     };
   }
+  const beforeGap = detected.beforeGap;
+  const afterGap = detected.afterGap;
+
+  const statusRecord = await callSolanaRpc(
+    options,
+    "getSignatureStatuses",
+    detected.gapId,
+    [[beforeGap.signature, afterGap.signature], { searchTransactionHistory: true }],
+    "gap-recovery",
+  );
+  const statusError = rpcResponseError(statusRecord.response);
+  const boundaryValidation = finalizedBoundaryStatuses(statusRecord.response, detected);
+  if (
+    statusError !== null ||
+    boundaryValidation === null ||
+    !boundaryValidation.beforeGapFinalizedAtExpectedSlot ||
+    !boundaryValidation.afterGapFinalizedAtExpectedSlot
+  ) {
+    return {
+      ...detected,
+      rpcEvidence: [statusRecord],
+      boundaryValidation,
+      queryCompleted: false,
+      queryTruncatedByBound: false,
+      candidateSignatures: [],
+      newlyDiscoveredSignatures: [],
+      limitation: "Gap history was not queried because both processed-feed boundaries could not be validated as finalized at their observed slots.",
+      error: statusError ?? "gap boundary is not finalized at the observed slot",
+    };
+  }
 
   const candidates: GapRecoveryRecord["candidateSignatures"][number][] = [];
-  let before = detected.afterGap.signature;
+  const rpcEvidence: RawRpcRecord[] = [statusRecord];
+  let scannedSignatures = 0;
+  let before = afterGap.signature;
   let queryCompleted = false;
   let error: string | null = null;
-  while (candidates.length < maximumGapSignatures) {
-    const limit = Math.min(1_000, maximumGapSignatures - candidates.length);
+  while (scannedSignatures < maximumGapSignatures) {
+    const limit = Math.min(1_000, maximumGapSignatures - scannedSignatures);
     const record = await callSolanaRpc(
       options,
       "getSignaturesForAddress",
       detected.gapId,
-      [PUMP_PROGRAM_ID, { before, until: detected.beforeGap.signature, limit, commitment: "finalized" }],
+      [PUMP_PROGRAM_ID, { before, until: beforeGap.signature, limit, commitment: "finalized" }],
       "gap-recovery",
     );
     error = rpcResponseError(record.response);
+    rpcEvidence.push(record);
     if (error !== null) break;
     const page = signatureItems(record.response);
-    candidates.push(...page);
+    scannedSignatures += page.length;
+    const inSlotBounds = page.filter(
+      (item) => item.slot >= beforeGap.slot && item.slot <= afterGap.slot,
+    );
+    candidates.push(...inSlotBounds);
+    if (page.some((item) => item.slot < beforeGap.slot)) {
+      error = "pagination crossed below the validated before-gap slot without reaching the boundary";
+      break;
+    }
     if (page.length < limit) {
       queryCompleted = true;
       break;
@@ -294,12 +387,14 @@ async function recoverGap(
     }
     before = last.signature;
   }
-  const queryTruncatedByBound = !queryCompleted && error === null && candidates.length >= maximumGapSignatures;
+  const queryTruncatedByBound = !queryCompleted && error === null && scannedSignatures >= maximumGapSignatures;
   const newlyDiscoveredSignatures = candidates
     .map((item) => item.signature)
     .filter((signature, index, values) => !liveSignatures.has(signature) && values.indexOf(signature) === index);
   return {
     ...detected,
+    rpcEvidence,
+    boundaryValidation,
     queryCompleted,
     queryTruncatedByBound,
     candidateSignatures: candidates,
@@ -343,42 +438,79 @@ export async function captureRpcEvidence(
     throw new Error("concurrency must be an integer from 1 to 32");
   }
 
-  const transactionRecords: RawRpcRecord[] = [];
-  const slots = [...new Set([
+  const signatures = [
+    ...observed.map((item) => ({ signature: item.signature, provenance: "live" as const })),
+    ...uniqueBackfilled.map((signature) => ({ signature, provenance: "backfilled" as const })),
+  ];
+  const slots = new Set([
     ...observed.map((item) => item.slot),
     ...uniqueBackfilled.flatMap((signature) => {
       const slot = backfilledSlotBySignature.get(signature);
       return slot === undefined ? [] : [slot];
     }),
-  ])].sort((left, right) => left - right);
-  let completedBlocks = 0;
-  const blockRecords = await mapConcurrent(slots, concurrency, async (slot) => {
-    const record = await callSolanaRpc(
-      options,
-      "getBlock",
-      String(slot),
-      [slot, { commitment: "finalized", encoding: "json", transactionDetails: "full", rewards: false, maxSupportedTransactionVersion: 0 }],
-      "canonical-order",
-    );
-    completedBlocks += 1;
-    if (completedBlocks === slots.length || completedBlocks % 25 === 0) {
-      options.onProgress?.({ stage: "blocks", completed: completedBlocks, total: slots.length });
-    }
-    return record;
-  });
-
-  await Promise.all([
-    writeJsonLines(targetFiles[0] ?? "", transactionRecords),
-    writeJsonLines(targetFiles[1] ?? "", blockRecords),
-    writeJsonLines(targetFiles[2] ?? "", gapRecords),
   ]);
+  const source = options.source ?? "targeted-transactions";
+  const transactionHandle = await open(targetFiles[0] ?? "", "wx");
+  const blockHandle = await open(targetFiles[1] ?? "", "wx");
+  const gapHandle = await open(targetFiles[2] ?? "", "wx");
+  let transactionRequests = 0;
+  let blockRequests = 0;
+  try {
+    await appendJsonLines(gapHandle, gapRecords);
+    if (source === "targeted-transactions") {
+      transactionRequests = await captureInBatches({
+        values: signatures,
+        concurrency,
+        handle: transactionHandle,
+        work: ({ signature, provenance }) => callSolanaRpc(
+          options,
+          "getTransaction",
+          signature,
+          [signature, { commitment: "finalized", encoding: "json", maxSupportedTransactionVersion: 0 }],
+          provenance,
+        ),
+        onBatch: (records, completed) => {
+          for (const record of records) {
+            const slot = transactionSlot(record.response);
+            if (slot !== null) slots.add(slot);
+          }
+          options.onProgress?.({ stage: "transactions", completed, total: signatures.length });
+        },
+      });
+    }
+    const orderedSlots = [...slots].sort((left, right) => left - right);
+    blockRequests = await captureInBatches({
+      values: orderedSlots,
+      concurrency,
+      handle: blockHandle,
+      batchSize: source === "full-blocks" ? concurrency : concurrency * 8,
+      work: (slot) => callSolanaRpc(
+        options,
+        "getBlock",
+        String(slot),
+        [slot, {
+          commitment: "finalized",
+          encoding: "json",
+          transactionDetails: source === "full-blocks" ? "full" : "signatures",
+          rewards: false,
+          maxSupportedTransactionVersion: 0,
+        }],
+        "canonical-order",
+      ),
+      onBatch: (_records, completed) => {
+        options.onProgress?.({ stage: "blocks", completed, total: orderedSlots.length });
+      },
+    });
+  } finally {
+    await Promise.all([transactionHandle.close(), blockHandle.close(), gapHandle.close()]);
+  }
   return {
     dataset,
     rawDirectory,
     liveSignatures: observed.length,
     backfilledSignatures: uniqueBackfilled.length,
-    transactionRequests: 0,
-    blockRequests: blockRecords.length,
+    transactionRequests,
+    blockRequests,
     gaps: gapRecords.length,
   };
 }

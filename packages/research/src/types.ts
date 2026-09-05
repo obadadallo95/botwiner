@@ -3,7 +3,11 @@ import type { VenueEventEnvelope } from "@botwiner/market-data";
 export const PHASE2_SCHEMA_VERSION = 1 as const;
 export const PHASE2_DIRECTORY = "phase2-v1";
 
-export type RpcMethod = "getTransaction" | "getBlock" | "getSignaturesForAddress";
+export type RpcMethod =
+  | "getTransaction"
+  | "getBlock"
+  | "getSignaturesForAddress"
+  | "getSignatureStatuses";
 
 export interface RawRpcRecord {
   readonly schemaVersion: typeof PHASE2_SCHEMA_VERSION;
@@ -41,6 +45,12 @@ export interface GapRecoveryRecord {
   readonly estimatedDurationMs: number;
   readonly beforeGap: GapBoundary | null;
   readonly afterGap: GapBoundary | null;
+  readonly rpcEvidence: readonly RawRpcRecord[];
+  readonly boundaryValidation: {
+    readonly checkedAtCommitment: "finalized";
+    readonly beforeGapFinalizedAtExpectedSlot: boolean;
+    readonly afterGapFinalizedAtExpectedSlot: boolean;
+  } | null;
   readonly queryCompleted: boolean;
   readonly queryTruncatedByBound: boolean;
   readonly candidateSignatures: readonly {
@@ -72,9 +82,24 @@ export interface ComputeBudgetEvidence {
     readonly rawDataBase58: string;
   }[];
   readonly requestedComputeUnitLimit: string | null;
+  readonly effectiveComputeUnitLimit: string | null;
+  readonly computeUnitLimitSource: "explicit" | "runtime-default" | "unknown";
   readonly requestedComputeUnitPriceMicroLamports: string | null;
   readonly requestedPriorityFeeLamports: string | null;
   readonly priorityFeeFormula: string | null;
+}
+
+export interface JitoTipEvidence {
+  readonly status: "observed-transfer" | "no-transfer-observed" | "indeterminate";
+  readonly totalLamports: string | null;
+  readonly transfers: readonly {
+    readonly outerInstructionIndex: number;
+    readonly innerInstructionIndex: number | null;
+    readonly source: string | null;
+    readonly destination: string;
+    readonly lamports: string;
+  }[];
+  readonly caveat: string;
 }
 
 export interface TokenBalanceRecord {
@@ -119,6 +144,7 @@ export interface TransactionEnrichment {
   readonly feeLamports: string | null;
   readonly computeUnitsConsumed: string | null;
   readonly computeBudget: ComputeBudgetEvidence;
+  readonly jitoTip: JitoTipEvidence;
   readonly signatures: readonly string[];
   readonly recentBlockhash: string | null;
   readonly accountKeys: readonly string[];
@@ -134,6 +160,18 @@ export interface TransactionEnrichment {
   readonly logMessages: readonly string[] | null;
   readonly returnData: unknown;
   readonly rewards: unknown;
+}
+
+/** Causal transaction stream retained even when a transaction failed and emitted no market event. */
+export interface ObservedTransactionRecord {
+  readonly schemaVersion: typeof PHASE2_SCHEMA_VERSION;
+  readonly kind: "observed-transaction";
+  readonly signature: string;
+  readonly collectorSequence: number;
+  readonly observedSlot: number;
+  readonly receivedAtUnixMs: number;
+  readonly status: "success" | "failed" | null;
+  readonly error: unknown;
 }
 
 export interface Distribution {
@@ -189,10 +227,30 @@ export interface FeedQualityReport {
     readonly comparableLiveEvents: number;
     readonly pairwiseObservedVsCanonicalInversions: number;
     readonly eventsWithoutCanonicalOrder: number;
+    readonly observedVsFinalizedSlotComparisons: number;
+    readonly observedVsFinalizedSlotMismatches: number;
+  };
+  readonly congestion: {
+    readonly observedTransactions: number;
+    readonly failedTransactions: number;
+    readonly failedTransactionRate: number | null;
+    readonly failedTransactionsByObservedSlot: readonly {
+      readonly slot: number;
+      readonly failed: number;
+      readonly observed: number;
+    }[];
+    readonly caveat: string;
+  };
+  readonly clock: {
+    readonly sntpSamples: number;
+    readonly offsetMs: Distribution;
+    readonly roundTripTimeMs: Distribution;
+    readonly caveat: string;
   };
   readonly latency: {
     readonly collectorReceiveMinusBlockTimeMs: Distribution;
     readonly collectorReceiveMinusBlockTimeCaveat: string;
+    readonly collectorReceiveMinusBlockTimeEligibleForExecutionModel: false;
     readonly collectorParseDurationMicroseconds: Distribution;
     readonly confirmationObservationDelayMs: Distribution;
     readonly confirmationObservationDelayCaveat: string;
@@ -211,6 +269,9 @@ export interface FeedQualityReport {
     readonly withCanonicalTransactionIndex: number;
     readonly withComputeUnitsConsumed: number;
     readonly withExplicitComputeUnitPrice: number;
+    readonly withRuntimeDefaultComputeUnitLimit: number;
+    readonly withObservableJitoTip: number;
+    readonly observableJitoTipLamports: string;
   };
   readonly eventCountBySlot: readonly { readonly slot: number; readonly count: number }[];
 }
@@ -225,18 +286,26 @@ export interface Phase2Manifest {
     readonly rawBlocks: string;
     readonly rawGapQueries: string;
     readonly transactions: string;
-    readonly venueEvents: string;
+    /** Live feed order only. This is the only event stream eligible for causal simulation input. */
+    readonly observedVenueEvents: string;
+    /** Finalized, backfill-inclusive order for post-hoc truth and evaluation only. */
+    readonly canonicalVenueEvents: string;
+    readonly observedTransactions: string;
     readonly gaps: string;
     readonly feedQuality: string;
   };
   readonly counts: {
     readonly transactionEnrichments: number;
-    readonly venueEvents: number;
+    readonly observedVenueEvents: number;
+    readonly canonicalVenueEvents: number;
+    readonly observedTransactions: number;
     readonly gaps: number;
   };
   readonly outputDigests: {
     readonly transactionsSha256: string;
-    readonly venueEventsSha256: string;
+    readonly observedVenueEventsSha256: string;
+    readonly canonicalVenueEventsSha256: string;
+    readonly observedTransactionsSha256: string;
     readonly gapsSha256: string;
     readonly feedQualitySha256: string;
   };
@@ -245,7 +314,9 @@ export interface Phase2Manifest {
 
 export interface DerivedResearchData {
   readonly transactions: readonly TransactionEnrichment[];
-  readonly venueEvents: readonly VenueEventEnvelope[];
+  readonly observedTransactions: readonly ObservedTransactionRecord[];
+  readonly observedVenueEvents: readonly VenueEventEnvelope[];
+  readonly canonicalVenueEvents: readonly VenueEventEnvelope[];
   readonly gaps: readonly GapRecoveryRecord[];
   readonly report: FeedQualityReport;
   readonly manifest: Phase2Manifest;

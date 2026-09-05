@@ -24,6 +24,7 @@ interface CollectorCliOptions {
   readonly outputDirectory: string;
   readonly durationSeconds: number | null;
   readonly ntpHost: string | null;
+  readonly ntpIntervalSeconds: number;
 }
 
 function usage(): string {
@@ -35,7 +36,8 @@ function usage(): string {
     "  --duration-seconds <seconds>  Stop cleanly after a bounded interval",
     "  --commitment <level>          processed (default), confirmed, or finalized",
     "  --ws-url <url>                Solana WebSocket URL (prefer SOLANA_WS_URL)",
-    "  --ntp-host <host>             One startup SNTP sample (default: time.cloudflare.com)",
+    "  --ntp-host <host>             SNTP host (default: time.cloudflare.com)",
+    "  --ntp-interval-seconds <n>    Repeat clock-offset sampling (default: 300)",
     "  --disable-ntp                 Record that clock-offset sampling was skipped",
     "  --help                        Show this help",
   ].join("\n");
@@ -63,13 +65,14 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
   let outputDirectory = defaultSessionDirectory();
   let durationSeconds: number | null = null;
   let ntpHost: string | null = process.env.NTP_HOST ?? "time.cloudflare.com";
+  let ntpIntervalSeconds = Number(process.env.NTP_INTERVAL_SECONDS ?? "300");
 
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === "--help") {
       console.log(usage());
       process.exitCode = 0;
-      return { wsUrl, commitment, outputDirectory, durationSeconds: 0, ntpHost };
+      return { wsUrl, commitment, outputDirectory, durationSeconds: 0, ntpHost, ntpIntervalSeconds };
     }
     if (argument === "--output") {
       outputDirectory = resolve(requireNext(arguments_, index, argument));
@@ -100,6 +103,15 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
       index += 1;
       continue;
     }
+    if (argument === "--ntp-interval-seconds") {
+      const raw = requireNext(arguments_, index, argument);
+      ntpIntervalSeconds = Number(raw);
+      if (!Number.isFinite(ntpIntervalSeconds) || ntpIntervalSeconds < 30) {
+        throw new Error(`invalid NTP interval: ${raw}; minimum is 30 seconds`);
+      }
+      index += 1;
+      continue;
+    }
     if (argument === "--disable-ntp") {
       ntpHost = null;
       continue;
@@ -111,7 +123,10 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
   if (protocol !== "ws:" && protocol !== "wss:") {
     throw new Error("Solana WebSocket URL must use ws: or wss:");
   }
-  return { wsUrl, commitment, outputDirectory, durationSeconds, ntpHost };
+  if (!Number.isFinite(ntpIntervalSeconds) || ntpIntervalSeconds < 30) {
+    throw new Error("NTP_INTERVAL_SECONDS must be at least 30 seconds");
+  }
+  return { wsUrl, commitment, outputDirectory, durationSeconds, ntpHost, ntpIntervalSeconds };
 }
 
 function applyFinalCapture(
@@ -147,6 +162,8 @@ async function run(): Promise<void> {
     officialIdlRevision: PUMP_IDL_REVISION,
   });
 
+  let clockSampleQueue = Promise.resolve();
+  let clockSampleTimer: NodeJS.Timeout | undefined;
   if (options.ntpHost === null) {
     await writer.recordDiagnostic({
       schemaVersion: 1,
@@ -158,16 +175,17 @@ async function run(): Promise<void> {
       details: { reason: "disabled" },
     });
   } else {
+    const recordClockSample = async (): Promise<void> => {
     try {
-      const sample = await sampleSntpClock(options.ntpHost);
+      const sample = await sampleSntpClock(options.ntpHost ?? "");
       await writer.recordDiagnostic({
         schemaVersion: 1,
         kind: "diagnostic",
         code: "clock-offset-sampled",
         atUnixMs: sample.completedAtUnixMs,
-        message: "Recorded one SNTP clock-offset sample",
+        message: "Recorded SNTP clock-offset sample",
         sequence: null,
-        details: { ...sample, interpretation: "single-sample evidence; not a synchronization SLA" },
+        details: { ...sample, interpretation: "sample evidence; not a synchronization SLA" },
       });
     } catch (error) {
       await writer.recordDiagnostic({
@@ -180,6 +198,11 @@ async function run(): Promise<void> {
         details: { host: options.ntpHost, error: error instanceof Error ? error.message : String(error) },
       });
     }
+    };
+    await recordClockSample();
+    clockSampleTimer = setInterval(() => {
+      clockSampleQueue = clockSampleQueue.then(recordClockSample);
+    }, options.ntpIntervalSeconds * 1_000);
   }
 
   const stopForSignal = (): void => {
@@ -268,6 +291,8 @@ async function run(): Promise<void> {
     fail(error);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    if (clockSampleTimer !== undefined) clearInterval(clockSampleTimer);
+    await clockSampleQueue;
     process.removeListener("SIGINT", stopForSignal);
     process.removeListener("SIGTERM", stopForSignal);
     await writer.close(failureState.error === undefined && !stoppedBySignal ? "complete" : "aborted");

@@ -5,6 +5,7 @@ interface Options {
   readonly rpcUrl: string;
   readonly concurrency: number;
   readonly maximumGapSignatures: number;
+  readonly source: "targeted-transactions" | "full-blocks";
 }
 
 function usage(): string {
@@ -15,6 +16,7 @@ function usage(): string {
     "  --rpc-url <https-url>           HTTP RPC endpoint (prefer SOLANA_RPC_URL)",
     "  --concurrency <1-32>             Concurrent requests (default: 4)",
     "  --max-gap-signatures <count>     Hard bound per detected gap (default: 5000)",
+    "  --source <mode>                  targeted-transactions (default) or full-blocks",
   ].join("\n");
 }
 
@@ -37,6 +39,7 @@ function parseArguments(arguments_: readonly string[]): Options | null {
   let rpcUrl = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
   let concurrency = 4;
   let maximumGapSignatures = 5_000;
+  let source: Options["source"] = "targeted-transactions";
   for (let index = 1; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === "--rpc-url") {
@@ -48,12 +51,19 @@ function parseArguments(arguments_: readonly string[]): Options | null {
     } else if (argument === "--max-gap-signatures") {
       maximumGapSignatures = positiveInteger(valueAfter(arguments_, index), argument);
       index += 1;
+    } else if (argument === "--source") {
+      const value = valueAfter(arguments_, index);
+      if (value !== "targeted-transactions" && value !== "full-blocks") {
+        throw new Error("--source must be targeted-transactions or full-blocks");
+      }
+      source = value;
+      index += 1;
     } else {
       throw new Error(`unknown argument: ${argument}`);
     }
   }
   if (new URL(rpcUrl).protocol !== "https:") throw new Error("RPC URL must use HTTPS");
-  return { dataset, rpcUrl, concurrency, maximumGapSignatures };
+  return { dataset, rpcUrl, concurrency, maximumGapSignatures, source };
 }
 
 async function run(): Promise<void> {
@@ -67,6 +77,7 @@ async function run(): Promise<void> {
     rpcUrl: options.rpcUrl,
     concurrency: options.concurrency,
     maximumGapSignatures: options.maximumGapSignatures,
+    source: options.source,
     onProgress: (progress) => console.log(JSON.stringify({ status: "enriching", ...progress })),
   });
   const rebuilt = await rebuildDerivedResearchStore(options.dataset);
