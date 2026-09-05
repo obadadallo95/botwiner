@@ -50,6 +50,7 @@ const JOB_NAME = process.env.CLOUD_RUN_JOB_NAME ?? "pump-collector-runner";
 // Configuration for owner authorization - fail closed if not configured in production
 const OWNER_EMAIL = process.env.OWNER_EMAIL?.trim() || undefined;
 const OWNER_UID = process.env.OWNER_UID?.trim() || undefined;
+const GOOGLE_OAUTH_CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID?.trim() || undefined;
 
 function parseBoolean(val: string | undefined): boolean {
   return typeof val === "string" && val.trim().toLowerCase() === "true";
@@ -100,9 +101,87 @@ async function seedAuthorizedOwner(): Promise<void> {
     console.warn("[API] Failed to seed authorizedUsers collection:", error);
   }
 }
-void seedAuthorizedOwner();
+const isRunningTests =
+  process.env.NODE_ENV === "test" ||
+  Boolean(process.env.NODE_TEST_CONTEXT) ||
+  process.argv.some((arg) => arg.includes("--test") || arg.includes("test"));
 
-// Auth Middleware: requires valid Firebase ID token and verifies owner identity
+if (!isRunningTests) {
+  void seedAuthorizedOwner();
+}
+
+export interface DecodedAuthUser {
+  email?: string | undefined;
+  uid?: string | undefined;
+  isOwnerClaim?: boolean | undefined;
+}
+
+export interface DecodedAuthToken {
+  uid: string;
+  email?: string;
+  owner?: boolean;
+  [key: string]: unknown;
+}
+
+export async function verifyToken(
+  token: string,
+  options?: {
+    verifyFirebaseIdToken?: ((t: string) => Promise<DecodedAuthToken>) | undefined;
+    googleOAuthClientId?: string | undefined;
+    fetchImpl?: typeof fetch | undefined;
+  }
+): Promise<DecodedAuthUser> {
+  const verifyFb = options?.verifyFirebaseIdToken ?? ((t: string) => admin.auth().verifyIdToken(t));
+  const googleClientId = options?.googleOAuthClientId ?? GOOGLE_OAUTH_CLIENT_ID;
+  const fetchFn = options?.fetchImpl ?? fetch;
+
+  try {
+    const decoded = await verifyFb(token);
+    return {
+      email: decoded.email,
+      uid: decoded.uid,
+      isOwnerClaim: decoded.owner === true,
+    };
+  } catch (fbErr) {
+    // If Google ID token fallback is configured, strictly verify issuer, audience, expiration, and email_verified
+    if (googleClientId) {
+      try {
+        const verifyResp = await fetchFn(
+          `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(token)}`
+        );
+        if (verifyResp.ok) {
+          const info = (await verifyResp.json()) as {
+            email?: string;
+            sub?: string;
+            email_verified?: string | boolean;
+            aud?: string;
+            iss?: string;
+            exp?: string | number;
+          };
+          const isGoogleIssuer =
+            info.iss === "accounts.google.com" || info.iss === "https://accounts.google.com";
+          const isAudienceMatch = info.aud === googleClientId;
+          const isEmailVerified = info.email_verified === "true" || info.email_verified === true;
+          const expSeconds = typeof info.exp === "string" ? Number.parseInt(info.exp, 10) : Number(info.exp);
+          const isNotExpired = !Number.isNaN(expSeconds) && expSeconds * 1000 > Date.now();
+
+          if (isGoogleIssuer && isAudienceMatch && isEmailVerified && isNotExpired) {
+            return {
+              email: info.email,
+              uid: info.sub,
+              isOwnerClaim: false,
+            };
+          }
+        }
+      } catch {
+        // Fallback network error: ignore and rethrow fbErr
+      }
+    }
+    throw fbErr;
+  }
+}
+
+// Auth Middleware: requires valid Firebase ID token (or strict Google OAuth token if configured) and verifies owner identity
 async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   if (DISABLE_AUTH) {
     console.warn("[API] WARNING: Auth is disabled via DISABLE_AUTH=true");
@@ -130,54 +209,20 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
   }
 
   try {
-    let decodedEmail: string | undefined;
-    let decodedUid: string | undefined;
-    let isOwnerClaim = false;
-
-    try {
-      const decoded = await admin.auth().verifyIdToken(token);
-      decodedEmail = decoded.email;
-      decodedUid = decoded.uid;
-      isOwnerClaim = decoded.owner === true;
-      (req as Request & { user?: admin.auth.DecodedIdToken }).user = decoded;
-    } catch (fbErr) {
-      // Fallback: verify standard Google ID token (from Google Sign-in or gcloud auth print-identity-token)
-      try {
-        const verifyResp = await fetch(
-          `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(token)}`
-        );
-        if (verifyResp.ok) {
-          const info = (await verifyResp.json()) as {
-            email?: string;
-            sub?: string;
-            email_verified?: string | boolean;
-          };
-          if (info.email_verified === "true" || info.email_verified === true) {
-            decodedEmail = info.email;
-            decodedUid = info.sub;
-          }
-        }
-      } catch {
-        // Ignore fallback error and report fbErr if neither worked
-      }
-
-      if (!decodedEmail && !decodedUid) {
-        throw fbErr;
-      }
-    }
-
+    const verified = await verifyToken(token);
     const isOwner =
-      (OWNER_EMAIL !== undefined && decodedEmail === OWNER_EMAIL) ||
-      (OWNER_UID !== undefined && decodedUid === OWNER_UID) ||
-      isOwnerClaim;
+      (OWNER_EMAIL !== undefined && verified.email === OWNER_EMAIL) ||
+      (OWNER_UID !== undefined && verified.uid === OWNER_UID) ||
+      verified.isOwnerClaim === true;
 
     if (!isOwner) {
       res.status(403).json({
-        error: `Forbidden: caller (${decodedEmail ?? decodedUid}) is not an authorized owner.`,
+        error: `Forbidden: caller (${verified.email ?? verified.uid}) is not an authorized owner.`,
       });
       return;
     }
 
+    (req as Request & { user?: DecodedAuthUser }).user = verified;
     next();
   } catch (error) {
     res.status(401).json({
@@ -309,6 +354,100 @@ app.get("/api/sessions/:sessionId/graduations", requireAuth, async (req, res) =>
   } catch (error) {
     res.status(500).json({
       error: "Failed to fetch graduations",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+// Protected Paper Trading Stats
+app.get("/api/sessions/:sessionId/stats/paper-trading", requireAuth, async (req, res) => {
+  try {
+    const sessionId = typeof req.params.sessionId === "string" ? req.params.sessionId : undefined;
+    if (!sessionId) {
+      res.status(400).json({ error: "sessionId parameter is required" });
+      return;
+    }
+    const doc = await firestore
+      .collection("researchSessions")
+      .doc(sessionId)
+      .collection("stats")
+      .doc("paperTrading")
+      .get();
+    res.json({ paperTrading: doc.exists ? doc.data() : null });
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to fetch paper trading stats",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+// Protected Market PnL Stats
+app.get("/api/sessions/:sessionId/stats/market-pnl", requireAuth, async (req, res) => {
+  try {
+    const sessionId = typeof req.params.sessionId === "string" ? req.params.sessionId : undefined;
+    if (!sessionId) {
+      res.status(400).json({ error: "sessionId parameter is required" });
+      return;
+    }
+    const doc = await firestore
+      .collection("researchSessions")
+      .doc(sessionId)
+      .collection("stats")
+      .doc("marketPnl")
+      .get();
+    res.json({ marketPnl: doc.exists ? doc.data() : null });
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to fetch market pnl stats",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+// Protected Creator Analytics Stats
+app.get("/api/sessions/:sessionId/stats/creator-analytics", requireAuth, async (req, res) => {
+  try {
+    const sessionId = typeof req.params.sessionId === "string" ? req.params.sessionId : undefined;
+    if (!sessionId) {
+      res.status(400).json({ error: "sessionId parameter is required" });
+      return;
+    }
+    const doc = await firestore
+      .collection("researchSessions")
+      .doc(sessionId)
+      .collection("stats")
+      .doc("creatorAnalytics")
+      .get();
+    res.json({ creatorAnalytics: doc.exists ? doc.data() : null });
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to fetch creator analytics",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+// Protected Paper Trades List
+app.get("/api/sessions/:sessionId/paper-trades", requireAuth, async (req, res) => {
+  try {
+    const sessionId = typeof req.params.sessionId === "string" ? req.params.sessionId : undefined;
+    if (!sessionId) {
+      res.status(400).json({ error: "sessionId parameter is required" });
+      return;
+    }
+    const snapshot = await firestore
+      .collection("researchSessions")
+      .doc(sessionId)
+      .collection("paperTrades")
+      .orderBy("openedAtUnixMs", "desc")
+      .limit(50)
+      .get();
+    const paperTrades = snapshot.docs.map((d) => ({ tradeId: d.id, ...d.data() }));
+    res.json({ paperTrades });
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to fetch paper trades",
       details: error instanceof Error ? error.message : String(error),
     });
   }
@@ -602,6 +741,8 @@ app.post("/api/sessions/stop", requireAuth, async (req, res) => {
 });
 
 const PORT = Number(process.env.PORT ?? 8080);
-app.listen(PORT, () => {
-  console.log(`[botwiner-api] listening on port ${PORT}`);
-});
+if (!isRunningTests) {
+  app.listen(PORT, () => {
+    console.log(`[botwiner-api] listening on port ${PORT}`);
+  });
+}

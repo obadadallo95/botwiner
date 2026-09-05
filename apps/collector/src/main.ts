@@ -26,7 +26,12 @@ import {
   type ReceivedLogsMessage,
 } from "@botwiner/solana";
 import { DatasetWriter, CloudResearchSink, type ResearchSink } from "@botwiner/storage";
-import { GraduationTracker, FirestoreTelemetryReporter } from "@botwiner/research";
+import {
+  GraduationTracker,
+  FirestoreTelemetryReporter,
+  PaperTradingEngine,
+  TraderPnlTracker,
+} from "@botwiner/research";
 
 interface CollectorCliOptions {
   readonly transport: FeedTransportType;
@@ -410,6 +415,17 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     },
   });
 
+  const paperTradingEngine = new PaperTradingEngine({
+    onPositionOpened: (pos) => {
+      telemetryReporter?.queuePaperTrade(pos);
+    },
+    onPositionClosed: (pos) => {
+      telemetryReporter?.queuePaperTrade(pos);
+    },
+  });
+
+  const traderPnlTracker = new TraderPnlTracker();
+
   if (options.sink === "cloud") {
     const bucket = process.env.GCS_BUCKET ?? "your-gcs-bucket";
     const projectId = process.env.GCP_PROJECT_ID ?? "your-gcp-project-id";
@@ -581,8 +597,12 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     for (const event of finalEvents) {
       if (event.eventType === "launch") {
         graduationTracker.onLaunch(event);
+        paperTradingEngine.onLaunch(event);
+        traderPnlTracker.onLaunch(event);
       } else if (event.eventType === "trade") {
         graduationTracker.onTrade(event);
+        paperTradingEngine.onTrade(event);
+        traderPnlTracker.onTrade(event);
       }
     }
     if (telemetryReporter !== null) {
@@ -591,6 +611,8 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         graduationTracker.getSummaryCounters(),
         raw.capture.receivedAtIso,
       );
+      telemetryReporter.updatePaperStats(paperTradingEngine.getStats());
+      telemetryReporter.updateMarketParticipantStats(traderPnlTracker.getStats());
     }
     return writer
       .recordRaw({
@@ -653,8 +675,12 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     for (const event of finalEvents) {
       if (event.eventType === "launch") {
         graduationTracker.onLaunch(event);
+        paperTradingEngine.onLaunch(event);
+        traderPnlTracker.onLaunch(event);
       } else if (event.eventType === "trade") {
         graduationTracker.onTrade(event);
+        paperTradingEngine.onTrade(event);
+        traderPnlTracker.onTrade(event);
       }
     }
     if (telemetryReporter !== null) {
@@ -663,6 +689,8 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         graduationTracker.getSummaryCounters(),
         raw.capture.receivedAtIso,
       );
+      telemetryReporter.updatePaperStats(paperTradingEngine.getStats());
+      telemetryReporter.updateMarketParticipantStats(traderPnlTracker.getStats());
     }
     return writer
       .recordRaw({
@@ -750,8 +778,21 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     await clockSampleQueue;
     process.removeListener("SIGINT", stopForSignal);
     process.removeListener("SIGTERM", stopForSignal);
+    paperTradingEngine.onSessionEnd(Date.now());
+    if (telemetryReporter !== null) {
+      telemetryReporter.updatePaperStats(paperTradingEngine.getStats());
+      telemetryReporter.updateMarketParticipantStats(traderPnlTracker.getStats());
+    }
     const finalStatus = failureState.error === undefined && !stoppedBySignal ? "complete" : "aborted";
     await writer.close(finalStatus);
+    if (cloudSink !== null) {
+      try {
+        await cloudSink.uploadDerivedSummary("paper-trading-summary", paperTradingEngine.getStats());
+        await cloudSink.uploadDerivedSummary("participant-analytics-summary", traderPnlTracker.getStats());
+      } catch (err) {
+        console.warn("[Collector] Failed to upload derived summaries to GCS:", err);
+      }
+    }
     if (telemetryReporter !== null) {
       const finalStatusToReport = stoppedBySignal ? "cancelled" : (finalStatus === "complete" ? "completed" : "failed");
       await telemetryReporter.close(finalStatusToReport);

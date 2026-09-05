@@ -40,6 +40,10 @@ export interface FirestoreBackend {
   setSessionDoc(sessionId: string, data: Partial<ResearchSessionDocument>): Promise<void>;
   updateStatsDoc(sessionId: string, stats: GraduationSummaryCounters): Promise<void>;
   setGraduationCandidate(sessionId: string, mint: string, candidate: Record<string, unknown>): Promise<void>;
+  updatePaperStatsDoc?(sessionId: string, stats: Record<string, unknown>): Promise<void>;
+  updateMarketPnlDoc?(sessionId: string, stats: Record<string, unknown>): Promise<void>;
+  updateCreatorAnalyticsDoc?(sessionId: string, stats: Record<string, unknown>): Promise<void>;
+  savePaperTradeDoc?(sessionId: string, tradeId: string, trade: Record<string, unknown>): Promise<void>;
   updateActiveLock?(sessionId: string, data: { heartbeatAt: string; status?: string }): Promise<void>;
   releaseActiveLock?(sessionId: string): Promise<void>;
 }
@@ -65,6 +69,26 @@ export class GoogleFirestoreBackend implements FirestoreBackend {
     await docRef.set(stats, { merge: true });
   }
 
+  public async updatePaperStatsDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
+    const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("paperTrading");
+    await docRef.set(stats, { merge: true });
+  }
+
+  public async updateMarketPnlDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
+    const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("marketPnl");
+    await docRef.set(stats, { merge: true });
+  }
+
+  public async updateCreatorAnalyticsDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
+    const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("creatorAnalytics");
+    await docRef.set(stats, { merge: true });
+  }
+
+  public async savePaperTradeDoc(sessionId: string, tradeId: string, trade: Record<string, unknown>): Promise<void> {
+    const docRef = this.db.collection("researchSessions").doc(sessionId).collection("paperTrades").doc(tradeId);
+    await docRef.set(trade, { merge: true });
+  }
+
   public async setGraduationCandidate(sessionId: string, mint: string, candidate: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("graduations").doc(mint);
     await docRef.set(candidate, { merge: true });
@@ -83,6 +107,9 @@ export class GoogleFirestoreBackend implements FirestoreBackend {
     }
   }
 }
+
+import type { PaperTradingStats, PaperPosition } from "./paper-trading-engine.js";
+import type { MarketParticipantStats } from "./trader-pnl-tracker.js";
 
 export interface FirestoreTelemetryReporterOptions {
   readonly sessionId: string;
@@ -121,7 +148,10 @@ export class FirestoreTelemetryReporter {
 
   private latestCounts?: DatasetCounts | undefined;
   private latestGraduationCounters?: GraduationSummaryCounters | undefined;
+  private latestPaperStats?: PaperTradingStats | undefined;
+  private latestMarketParticipantStats?: MarketParticipantStats | undefined;
   private pendingCandidates = new Map<string, TokenGraduationState>();
+  private pendingPaperTrades = new Map<string, PaperPosition>();
 
   public constructor(options: FirestoreTelemetryReporterOptions) {
     this.sessionId = options.sessionId;
@@ -211,6 +241,18 @@ export class FirestoreTelemetryReporter {
 
   public queueCandidateUpdate(candidate: TokenGraduationState): void {
     this.pendingCandidates.set(candidate.mint, candidate);
+  }
+
+  public updatePaperStats(stats: PaperTradingStats): void {
+    this.latestPaperStats = stats;
+  }
+
+  public updateMarketParticipantStats(stats: MarketParticipantStats): void {
+    this.latestMarketParticipantStats = stats;
+  }
+
+  public queuePaperTrade(trade: PaperPosition): void {
+    this.pendingPaperTrades.set(`${trade.mint}-${trade.openedAtUnixMs}`, trade);
   }
 
   public recordError(error: Error | string): void {
@@ -355,6 +397,81 @@ export class FirestoreTelemetryReporter {
           await this.backend.setGraduationCandidate(this.sessionId, candidate.mint, serializable);
         } catch (err) {
           console.warn(`[FirestoreTelemetryReporter] failed to update candidate ${candidate.mint}:`, err);
+        }
+      }
+    }
+
+    if (this.latestPaperStats && this.backend.updatePaperStatsDoc) {
+      try {
+        await this.backend.updatePaperStatsDoc(
+          this.sessionId,
+          this.latestPaperStats as unknown as Record<string, unknown>,
+        );
+      } catch (err) {
+        console.warn("[FirestoreTelemetryReporter] failed to update paper stats:", err);
+      }
+    }
+
+    if (this.latestMarketParticipantStats) {
+      if (this.backend.updateMarketPnlDoc) {
+        try {
+          const marketPnlSummary: Record<string, unknown> = { ...this.latestMarketParticipantStats };
+          delete marketPnlSummary["creatorAnalytics"];
+          await this.backend.updateMarketPnlDoc(
+            this.sessionId,
+            marketPnlSummary,
+          );
+        } catch (err) {
+          console.warn("[FirestoreTelemetryReporter] failed to update market pnl:", err);
+        }
+      }
+      if (this.backend.updateCreatorAnalyticsDoc) {
+        try {
+          await this.backend.updateCreatorAnalyticsDoc(
+            this.sessionId,
+            this.latestMarketParticipantStats.creatorAnalytics as unknown as Record<string, unknown>,
+          );
+        } catch (err) {
+          console.warn("[FirestoreTelemetryReporter] failed to update creator analytics:", err);
+        }
+      }
+    }
+
+    if (this.pendingPaperTrades.size > 0 && this.backend.savePaperTradeDoc) {
+      const tradesToFlush = Array.from(this.pendingPaperTrades.values());
+      this.pendingPaperTrades.clear();
+
+      for (const trade of tradesToFlush) {
+        try {
+          const tradeId = `${trade.mint}-${trade.openedAtUnixMs}`;
+          const serializable = {
+            strategyId: trade.strategyId,
+            mint: trade.mint,
+            openedAtUnixMs: trade.openedAtUnixMs,
+            openedAtIso: new Date(trade.openedAtUnixMs).toISOString(),
+            closedAtUnixMs: trade.closedAtUnixMs ?? null,
+            closedAtIso: trade.closedAtUnixMs ? new Date(trade.closedAtUnixMs).toISOString() : null,
+            status: trade.status,
+            exitReason: trade.exitReason ?? null,
+            holdDurationSec: trade.holdDurationSec ?? null,
+            curveSolInputLamports: trade.curveSolInputLamports.toString(),
+            totalWalletOutflowLamports: trade.totalWalletOutflowLamports.toString(),
+            tokenQuantity: trade.tokenQuantity.toString(),
+            grossPnlLamports: trade.grossPnlLamports?.toString() ?? null,
+            netPnlLamports: trade.netPnlLamports?.toString() ?? null,
+            netReturnPct: trade.netReturnPct ?? null,
+            maxFavorableExcursionPct: trade.maxFavorableExcursionPct,
+            maxAdverseExcursionPct: trade.maxAdverseExcursionPct,
+            entryPumpFeeLamports: trade.entryPumpFeeLamports.toString(),
+            entryTxCostLamports: trade.entryTxCostLamports.toString(),
+            totalPumpFeesLamports: trade.totalPumpFeesLamports?.toString() ?? null,
+            totalTxCostsLamports: trade.totalTxCostsLamports?.toString() ?? null,
+            triggerState: trade.triggerState,
+            updatedAt: new Date().toISOString(),
+          };
+          await this.backend.savePaperTradeDoc(this.sessionId, tradeId, serializable);
+        } catch (err) {
+          console.warn("[FirestoreTelemetryReporter] failed to save paper trade:", err);
         }
       }
     }

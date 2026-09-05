@@ -407,6 +407,12 @@ export class CloudResearchSink implements ResearchSink {
     await this.uploader.uploadBuffer(destinationPath, summaryBuffer, "application/json");
   }
 
+  public async uploadDerivedSummary(name: string, data: unknown): Promise<void> {
+    const destinationPath = `sessions/${this.options.sessionId}/summary/${name}.json`;
+    const buffer = Buffer.from(JSON.stringify(data, null, 2), "utf8");
+    await this.uploader.uploadBuffer(destinationPath, buffer, "application/json");
+  }
+
   private enqueue(work: () => Promise<void>): Promise<void> {
     if (this.closed) return Promise.reject(new Error("cloud research sink is closed"));
     this.queue = this.queue.then(work);

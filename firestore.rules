@@ -24,6 +24,11 @@ service cloud.firestore {
         allow read: if isOwner();
         allow write: if false;
       }
+
+      match /paperTrades/{tradeId} {
+        allow read: if isOwner();
+        allow write: if false;
+      }
     }
 
     // Authorized users list: protected reads for owner only, no client writes

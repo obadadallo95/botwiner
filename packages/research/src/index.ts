@@ -14,3 +14,5 @@ export * from "./rebound-research-types.js";
 export * from "./rebound-research.js";
 export * from "./graduation-tracker.js";
 export * from "./cloud-telemetry.js";
+export * from "./paper-trading-engine.js";
+export * from "./trader-pnl-tracker.js";
