@@ -18,6 +18,8 @@
     "comparison:analyze": "node --import tsx apps/comparator/src/analyze-comparison.ts",
     "simulate": "node --import tsx apps/simulator/src/main.ts",
     "filter:research": "node --import tsx apps/simulator/src/run-filters.ts",
+    "pivot:audit": "node --import tsx apps/simulator/src/run-pivots.ts",
+    "rebound:research": "node --import tsx apps/simulator/src/run-rebound.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "lint": "eslint .",

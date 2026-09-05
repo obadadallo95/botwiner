@@ -8,3 +8,7 @@ export * from "./simulation-types.js";
 export * from "./simulation.js";
 export * from "./filter-research-types.js";
 export * from "./filter-research.js";
+export * from "./pivot-research-types.js";
+export * from "./pivot-research.js";
+export * from "./rebound-research-types.js";
+export * from "./rebound-research.js";
