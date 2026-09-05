@@ -17,6 +17,8 @@ import {
   type User,
 } from "./firebase.js";
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 interface ResearchSession {
   sessionId: string;
   mode: string;
@@ -211,12 +213,6 @@ interface CreatorAnalyticsData {
   }>;
 }
 
-const shortenAddress = (addr?: string) => {
-  if (!addr || addr === "unknown") return "—";
-  if (addr.length <= 10) return addr;
-  return `${addr.slice(0, 4)}...${addr.slice(-4)}`;
-};
-
 interface PaperTradeRow {
   tradeId?: string;
   mint?: string;
@@ -233,9 +229,100 @@ interface PaperTradeRow {
   [key: string]: unknown;
 }
 
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+type TabId = "overview" | "portfolios" | "strategy" | "market" | "data";
+
+const shortenAddress = (addr?: string) => {
+  if (!addr || addr === "unknown") return "—";
+  if (addr.length <= 10) return addr;
+  return `${addr.slice(0, 4)}…${addr.slice(-4)}`;
+};
+
+const formatDuration = (sec: number) => {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  return `${m}m ${s}s`;
+};
+
+const formatBytes = (bytes: number) => {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+};
+
+const pnlCls = (v?: number | null) =>
+  v == null ? "" : v >= 0 ? "pnl-pos" : "pnl-neg";
+
+const pnlSign = (v?: number | null) => (v != null && v > 0 ? "+" : "");
+
+function EmptyRow({ cols, text }: { cols: number; text: string }) {
+  return (
+    <tr>
+      <td colSpan={cols} className="table-empty">
+        {text}
+      </td>
+    </tr>
+  );
+}
+
+// ─── Shared Components ────────────────────────────────────────────────────────
+
+function KpiCard({
+  label,
+  value,
+  sub,
+  color,
+}: {
+  label: string;
+  value: React.ReactNode;
+  sub?: React.ReactNode;
+  color?: string;
+}) {
+  return (
+    <div className="kpi-card">
+      <div className="kpi-label">{label}</div>
+      <div className="kpi-value" style={color ? { color } : undefined}>
+        {value}
+      </div>
+      {sub && <div className="kpi-sub">{sub}</div>}
+    </div>
+  );
+}
+
+function StatusPill({ status }: { status: string }) {
+  return <span className={`status-pill ${status}`}>{status}</span>;
+}
+
+function Chip({
+  children,
+  color,
+  small,
+}: {
+  children: React.ReactNode;
+  color?: string;
+  small?: boolean;
+}) {
+  return (
+    <span
+      className="chip"
+      style={{
+        ...(color ? { color, borderColor: `${color}44` } : {}),
+        ...(small ? { fontSize: "0.7rem", padding: "0.1rem 0.35rem" } : {}),
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [activeTab, setActiveTab] = useState<"overview" | "graduation" | "paper" | "market">("overview");
+  const [activeTab, setActiveTab] = useState<TabId>("overview");
   const [activeSession, setActiveSession] = useState<ResearchSession | null>(null);
   const [sessionsHistory, setSessionsHistory] = useState<ResearchSession[]>([]);
   const [gradStats, setGradStats] = useState<GraduationStats | null>(null);
@@ -247,16 +334,16 @@ export default function App() {
   const [paperTradesList, setPaperTradesList] = useState<PaperTradeRow[]>([]);
   const [selectedSession, setSelectedSession] = useState<ResearchSession | null>(null);
 
-  // Start Session Modal State
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [selectedDuration, setSelectedDuration] = useState(3600); // 1 hour default
+  const [selectedDuration, setSelectedDuration] = useState(3600);
   const [isStarting, setIsStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [isStopping, setIsStopping] = useState(false);
   const [stopError, setStopError] = useState<string | null>(null);
 
-  // Custom token auth state
-  const [authToken, setAuthToken] = useState<string>(() => localStorage.getItem("botwiner_token") || "");
+  const [authToken, setAuthToken] = useState<string>(
+    () => localStorage.getItem("botwiner_token") || ""
+  );
   const [isTokenModalOpen, setIsTokenModalOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState("");
 
@@ -279,7 +366,7 @@ export default function App() {
     });
   }, []);
 
-  // Polling fallback to authenticated API endpoints
+  // Polling fallback
   useEffect(() => {
     let isMounted = true;
 
@@ -309,54 +396,64 @@ export default function App() {
         }
 
         if (activeSession) {
-          const statsRes = await fetch(`/api/sessions/${activeSession.sessionId}/stats`, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
+          const statsRes = await fetch(
+            `/api/sessions/${activeSession.sessionId}/stats`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
           if (statsRes.ok) {
             const stData = (await statsRes.json()) as { stats?: GraduationStats | null };
             if (isMounted && stData.stats) setGradStats(stData.stats);
           }
 
-          const gradsRes = await fetch(`/api/sessions/${activeSession.sessionId}/graduations`, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
+          const gradsRes = await fetch(
+            `/api/sessions/${activeSession.sessionId}/graduations`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
           if (gradsRes.ok) {
             const gData = (await gradsRes.json()) as { graduations?: GraduationCandidate[] };
             if (isMounted && Array.isArray(gData.graduations)) setCandidates(gData.graduations);
           }
 
-          const portfoliosRes = await fetch(`/api/sessions/${activeSession.sessionId}/stats/portfolios`, { headers: { Authorization: `Bearer ${token}` } });
+          const portfoliosRes = await fetch(
+            `/api/sessions/${activeSession.sessionId}/stats/portfolios`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
           if (portfoliosRes.ok) {
-            const data = await portfoliosRes.json() as { portfolios: PortfolioSummary | null };
+            const data = (await portfoliosRes.json()) as { portfolios: PortfolioSummary | null };
             if (isMounted) setPortfolioStats(data.portfolios);
           }
-          const paperRes = await fetch(`/api/sessions/${activeSession.sessionId}/stats/paper-trading`, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
+
+          const paperRes = await fetch(
+            `/api/sessions/${activeSession.sessionId}/stats/paper-trading`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
           if (paperRes.ok) {
             const pData = (await paperRes.json()) as { paperTrading?: PaperTradingData | null };
             if (isMounted && pData.paperTrading) setPaperStats(pData.paperTrading);
           }
 
-          const marketRes = await fetch(`/api/sessions/${activeSession.sessionId}/stats/market-pnl`, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
+          const marketRes = await fetch(
+            `/api/sessions/${activeSession.sessionId}/stats/market-pnl`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
           if (marketRes.ok) {
             const mData = (await marketRes.json()) as { marketPnl?: MarketParticipantData | null };
             if (isMounted && mData.marketPnl) setMarketStats(mData.marketPnl);
           }
 
-          const creatorRes = await fetch(`/api/sessions/${activeSession.sessionId}/stats/creator-analytics`, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
+          const creatorRes = await fetch(
+            `/api/sessions/${activeSession.sessionId}/stats/creator-analytics`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
           if (creatorRes.ok) {
             const cData = (await creatorRes.json()) as { creatorAnalytics?: CreatorAnalyticsData | null };
             if (isMounted && cData.creatorAnalytics) setCreatorStats(cData.creatorAnalytics);
           }
 
-          const tradesRes = await fetch(`/api/sessions/${activeSession.sessionId}/paper-trades`, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
+          const tradesRes = await fetch(
+            `/api/sessions/${activeSession.sessionId}/paper-trades`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
           if (tradesRes.ok) {
             const tData = (await tradesRes.json()) as { paperTrades?: PaperTradeRow[] };
             if (isMounted && Array.isArray(tData.paperTrades)) setPaperTradesList(tData.paperTrades);
@@ -378,7 +475,7 @@ export default function App() {
     };
   }, [authToken, user, activeSession?.sessionId]);
 
-  // Listen to active sessions and session history via Firestore SDK
+  // Firestore live listeners
   useEffect(() => {
     const sessionsRef = collection(db, "researchSessions");
     const q = query(sessionsRef, orderBy("startedAt", "desc"), limit(20));
@@ -391,19 +488,20 @@ export default function App() {
           list.push({ sessionId: d.id, ...d.data() } as ResearchSession);
         });
         setSessionsHistory(list);
-
-        const active = list.find((s) => s.status === "running" || s.status === "starting" || s.status === "reconnecting");
+        const active = list.find(
+          (s) =>
+            s.status === "running" ||
+            s.status === "starting" ||
+            s.status === "reconnecting"
+        );
         setActiveSession(active || null);
       },
-      (error) => {
-        console.warn("Firestore subscription status:", error.message);
-      }
+      (error) => console.warn("Firestore subscription status:", error.message)
     );
 
     return () => unsubscribe();
   }, []);
 
-  // Listen to live stats of active session
   useEffect(() => {
     if (!activeSession) {
       setGradStats(null);
@@ -424,9 +522,12 @@ export default function App() {
       (err) => console.warn("Grad stats error:", err.message)
     );
 
-    const unsubPortfolios = onSnapshot(doc(db, "researchSessions", activeSession.sessionId, "stats", "portfolios"),
-      snap => setPortfolioStats(snap.exists() ? snap.data() as PortfolioSummary : null),
-      err => console.warn("Portfolio stats error:", err.message));
+    const unsubPortfolios = onSnapshot(
+      doc(db, "researchSessions", activeSession.sessionId, "stats", "portfolios"),
+      (snap) => setPortfolioStats(snap.exists() ? (snap.data() as PortfolioSummary) : null),
+      (err) => console.warn("Portfolio stats error:", err.message)
+    );
+
     const unsubPaper = onSnapshot(
       doc(db, "researchSessions", activeSession.sessionId, "stats", "paperTrading"),
       (snap) => {
@@ -452,7 +553,11 @@ export default function App() {
     );
 
     const unsubCandidates = onSnapshot(
-      query(collection(db, "researchSessions", activeSession.sessionId, "graduations"), orderBy("realSolLamports", "desc"), limit(30)),
+      query(
+        collection(db, "researchSessions", activeSession.sessionId, "graduations"),
+        orderBy("realSolLamports", "desc"),
+        limit(30)
+      ),
       (snap) => {
         const list: GraduationCandidate[] = [];
         snap.forEach((d) => list.push({ mint: d.id, ...d.data() } as GraduationCandidate));
@@ -462,7 +567,11 @@ export default function App() {
     );
 
     const unsubTrades = onSnapshot(
-      query(collection(db, "researchSessions", activeSession.sessionId, "paperTrades"), orderBy("openedAtUnixMs", "desc"), limit(50)),
+      query(
+        collection(db, "researchSessions", activeSession.sessionId, "paperTrades"),
+        orderBy("openedAtUnixMs", "desc"),
+        limit(50)
+      ),
       (snap) => {
         const list: PaperTradeRow[] = [];
         snap.forEach((d) => list.push({ tradeId: d.id, ...(d.data() as PaperTradeRow) }));
@@ -503,16 +612,11 @@ export default function App() {
     setStartError(null);
     try {
       const token = await getEffectiveToken();
-      if (!token) {
-        throw new Error("Authorization required. Please sign in or provide a token.");
-      }
+      if (!token) throw new Error("Authorization required. Please sign in or provide a token.");
 
       const response = await fetch("/api/sessions/start", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           durationSeconds: selectedDuration,
           mode: "graduation-research",
@@ -525,10 +629,7 @@ export default function App() {
         error?: string;
       }
       const data = (await response.json()) as StartApiResponse;
-      if (!response.ok) {
-        throw new Error(data.error || "Failed to start session");
-      }
-
+      if (!response.ok) throw new Error(data.error || "Failed to start session");
       setIsModalOpen(false);
     } catch (err) {
       setStartError(err instanceof Error ? err.message : String(err));
@@ -538,34 +639,20 @@ export default function App() {
   };
 
   const handleStopSession = async (sessionId: string) => {
-    if (!confirm(`Are you sure you want to stop active session ${sessionId}?`)) return;
-
+    if (!confirm(`Stop active session ${sessionId}?`)) return;
     setIsStopping(true);
     setStopError(null);
     try {
       const token = await getEffectiveToken();
-      if (!token) {
-        throw new Error("Authorization required. Please sign in or provide a token.");
-      }
-
+      if (!token) throw new Error("Authorization required.");
       const response = await fetch("/api/sessions/stop", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ sessionId }),
       });
-
-      interface StopApiResponse {
-        sessionId?: string;
-        status?: string;
-        error?: string;
-      }
+      interface StopApiResponse { sessionId?: string; status?: string; error?: string; }
       const data = (await response.json()) as StopApiResponse;
-      if (!response.ok) {
-        setStopError(data.error ?? "Failed to stop session");
-      }
+      if (!response.ok) setStopError(data.error ?? "Failed to stop session");
     } catch (err) {
       setStopError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -573,31 +660,44 @@ export default function App() {
     }
   };
 
-  const formatDuration = (sec: number) => {
-    const h = Math.floor(sec / 3600);
-    const m = Math.floor((sec % 3600) / 60);
-    const s = sec % 60;
-    if (h > 0) return `${h}h ${m}m ${s}s`;
-    return `${m}m ${s}s`;
-  };
+  const isLive =
+    activeSession?.status === "running" || activeSession?.status === "reconnecting";
 
-  const formatBytes = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-  };
+  // ── Health indicator ─────────────────────────────────────────────────────────
+  const healthOk =
+    isLive &&
+    !activeSession?.latestError &&
+    (activeSession?.disconnectCount ?? 0) === 0;
+  const healthWarn =
+    isLive && !activeSession?.latestError && (activeSession?.disconnectCount ?? 0) > 0;
+  const healthErr = isLive && !!activeSession?.latestError;
+  const healthColor = healthErr
+    ? "var(--accent-rose)"
+    : healthWarn
+    ? "var(--accent-amber)"
+    : healthOk
+    ? "var(--accent-emerald)"
+    : "var(--text-muted)";
+  const healthLabel = healthErr ? "ERROR" : healthWarn ? "DEGRADED" : healthOk ? "HEALTHY" : "IDLE";
 
-  const isLive = activeSession?.status === "running" || activeSession?.status === "reconnecting";
+  // ── Tabs ─────────────────────────────────────────────────────────────────────
+  const TABS: { id: TabId; label: string }[] = [
+    { id: "overview", label: "Overview" },
+    { id: "portfolios", label: "Portfolios" },
+    { id: "strategy", label: "Strategy Research" },
+    { id: "market", label: "Market Intelligence" },
+    { id: "data", label: "Data / Session" },
+  ];
 
   return (
     <div className="dashboard-container">
-      {/* Top Header */}
+      {/* ── Top Header ────────────────────────────────────────────────────────── */}
       <header className="header">
         <div className="brand-section">
           <div className="brand-icon">B</div>
           <div>
             <h1 className="brand-title">BOTWINER RESEARCH</h1>
-            <div className="brand-subtitle">Pump.fun Live Paper Trading & Market Analytics</div>
+            <div className="brand-subtitle">Pump.fun Live Paper Trading &amp; Market Analytics</div>
           </div>
         </div>
 
@@ -607,12 +707,15 @@ export default function App() {
             onClick={() => setIsModalOpen(true)}
             id="btn-start-session"
           >
-            Start Research Session
+            Start Session
           </button>
 
           {authToken ? (
-            <div className="user-badge" style={{ borderColor: "rgba(16, 185, 129, 0.4)", background: "rgba(16, 185, 129, 0.1)" }}>
-              <span style={{ color: "#34d399", fontWeight: 600 }}>Owner Token Active</span>
+            <div
+              className="user-badge"
+              style={{ borderColor: "rgba(16, 185, 129, 0.4)", background: "rgba(16, 185, 129, 0.1)" }}
+            >
+              <span style={{ color: "#34d399", fontWeight: 600 }}>Token Active</span>
               <button
                 className="btn btn-secondary"
                 style={{ padding: "0.2rem 0.5rem", fontSize: "0.75rem" }}
@@ -639,217 +742,1011 @@ export default function App() {
 
           {user ? (
             <div className="user-badge">
-              {user.photoURL && <img src={user.photoURL} alt="User avatar" className="user-avatar" />}
+              {user.photoURL && (
+                <img src={user.photoURL} alt="User avatar" className="user-avatar" />
+              )}
               <span>{user.displayName || user.email}</span>
-              <button className="btn btn-secondary" onClick={handleSignOut} style={{ padding: "0.3rem 0.6rem" }}>
+              <button
+                className="btn btn-secondary"
+                onClick={handleSignOut}
+                style={{ padding: "0.3rem 0.6rem" }}
+              >
                 Logout
               </button>
             </div>
           ) : (
             <button className="btn btn-secondary" onClick={handleSignIn} id="btn-login">
-              Sign In (Google)
+              Sign In
             </button>
           )}
         </div>
       </header>
 
-      {/* Active Session Status Card */}
+      {/* ── Active session status bar ─────────────────────────────────────────── */}
       {stopError && (
-        <div className="warning-box" style={{ marginBottom: "1rem", borderColor: "rgba(239, 68, 68, 0.4)", color: "#fca5a5" }}>
+        <div
+          className="warning-box"
+          style={{ marginBottom: "1rem", borderColor: "rgba(239,68,68,0.4)", color: "#fca5a5" }}
+        >
           {stopError}
         </div>
       )}
 
       {activeSession && (
         <section className="status-card">
+          {/* Row 1: identity + controls */}
           <div className="status-header">
             <div className="session-badge-group">
-              <span className={`status-pill ${activeSession.status}`}>
-                {isLive && <span className="heartbeat-dot"></span>}
-                {activeSession.status}
-              </span>
-              <span className="field-value field-mono" style={{ fontSize: "1rem" }}>
+              <StatusPill status={activeSession.status} />
+              {isLive && <span className="heartbeat-dot" />}
+              <span className="field-mono" style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
                 {activeSession.sessionId}
               </span>
             </div>
-
-            <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
-              <span className="limitation-pill" style={{ background: "rgba(99, 102, 241, 0.15)", color: "#a5b4fc", borderColor: "rgba(99,102,241,0.3)" }}>
-                {activeSession.provider.toUpperCase()} RPC
-              </span>
-              <span className="limitation-pill" style={{ background: "rgba(6, 182, 212, 0.15)", color: "#67e8f9", borderColor: "rgba(6,182,212,0.3)" }}>
-                {activeSession.region}
+            <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", flexWrap: "wrap" }}>
+              <Chip color="var(--accent-indigo)">{activeSession.provider.toUpperCase()} RPC</Chip>
+              <Chip color="var(--accent-cyan)">{activeSession.region}</Chip>
+              <span
+                className="chip"
+                style={{
+                  color: healthColor,
+                  borderColor: `${healthColor}44`,
+                  fontWeight: 600,
+                  fontSize: "0.7rem",
+                }}
+              >
+                {healthLabel}
               </span>
               {isLive && (
                 <button
                   id="btn-stop-session"
                   className="btn btn-secondary"
                   style={{
-                    background: "rgba(239, 68, 68, 0.15)",
-                    borderColor: "rgba(239, 68, 68, 0.4)",
+                    background: "rgba(239,68,68,0.12)",
+                    borderColor: "rgba(239,68,68,0.35)",
                     color: "#fca5a5",
-                    padding: "0.3rem 0.75rem",
-                    fontSize: "0.85rem",
-                    fontWeight: 600,
-                    cursor: isStopping ? "not-allowed" : "pointer",
+                    padding: "0.25rem 0.65rem",
+                    fontSize: "0.8rem",
                   }}
                   disabled={isStopping}
                   onClick={() => handleStopSession(activeSession.sessionId)}
                 >
-                  {isStopping ? "Stopping..." : "Stop Session"}
+                  {isStopping ? "Stopping…" : "Stop"}
                 </button>
               )}
             </div>
           </div>
 
+          {/* Row 2: compact metrics */}
           <div className="status-grid">
             <div className="status-field">
               <span className="field-label">Elapsed / Target</span>
               <span className="field-value">
                 {formatDuration(activeSession.elapsedSec)} /{" "}
-                {activeSession.requestedDurationSec ? formatDuration(activeSession.requestedDurationSec) : "Open"}
+                {activeSession.requestedDurationSec
+                  ? formatDuration(activeSession.requestedDurationSec)
+                  : "Open"}
               </span>
             </div>
-
             <div className="status-field">
-              <span className="field-label">Last Heartbeat</span>
+              <span className="field-label">Events</span>
               <span className="field-value">
-                {activeSession.lastHeartbeatAt ? new Date(activeSession.lastHeartbeatAt).toLocaleTimeString() : "—"}
+                {(activeSession.totalEvents || 0).toLocaleString()}
               </span>
             </div>
-
             <div className="status-field">
-              <span className="field-label">Current Chunk</span>
-              <span className="field-value field-mono">Chunk #{activeSession.currentChunk}</span>
+              <span className="field-label">Launches</span>
+              <span className="field-value">{activeSession.launchesDetected || 0}</span>
             </div>
-
             <div className="status-field">
-              <span className="field-label">GCS Storage Written</span>
+              <span className="field-label">Storage</span>
               <span className="field-value">{formatBytes(activeSession.bytesPersisted)}</span>
             </div>
+            <div className="status-field">
+              <span className="field-label">Chunk</span>
+              <span className="field-value field-mono">#{activeSession.currentChunk}</span>
+            </div>
+            <div className="status-field">
+              <span className="field-label">Heartbeat</span>
+              <span className="field-value">
+                {activeSession.lastHeartbeatAt
+                  ? new Date(activeSession.lastHeartbeatAt).toLocaleTimeString()
+                  : "—"}
+              </span>
+            </div>
+            <div className="status-field">
+              <span className="field-label">Reconnects</span>
+              <span
+                className="field-value"
+                style={{
+                  color: (activeSession.disconnectCount || 0) > 0
+                    ? "var(--accent-amber)"
+                    : undefined,
+                }}
+              >
+                {activeSession.reconnectCount || 0} / {activeSession.disconnectCount || 0}
+              </span>
+            </div>
+            {activeSession.latestError && (
+              <div className="status-field" style={{ gridColumn: "1 / -1" }}>
+                <span className="field-label" style={{ color: "var(--accent-rose)" }}>
+                  Error
+                </span>
+                <span className="field-value" style={{ color: "#fca5a5", fontFamily: "var(--font-mono)" }}>
+                  {activeSession.latestError}
+                </span>
+              </div>
+            )}
           </div>
         </section>
       )}
 
-      {/* Tabs Navigation */}
+      {/* ── Tab navigation ────────────────────────────────────────────────────── */}
       <nav className="tabs-nav" id="main-tabs">
-        <button
-          className={`tab-btn ${activeTab === "overview" ? "active" : ""}`}
-          onClick={() => setActiveTab("overview")}
-          id="tab-overview"
-        >
-          1. Overview & Collector
-        </button>
-        <button
-          className={`tab-btn ${activeTab === "graduation" ? "active" : ""}`}
-          onClick={() => setActiveTab("graduation")}
-          id="tab-graduation"
-        >
-          2. Graduation Research
-        </button>
-        <button
-          className={`tab-btn ${activeTab === "paper" ? "active" : ""}`}
-          onClick={() => setActiveTab("paper")}
-          id="tab-paper"
-        >
-          3. Live Paper Trading
-        </button>
-        <button
-          className={`tab-btn ${activeTab === "market" ? "active" : ""}`}
-          onClick={() => setActiveTab("market")}
-          id="tab-market"
-        >
-          4. Market Intelligence
-        </button>
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            className={`tab-btn ${activeTab === t.id ? "active" : ""}`}
+            onClick={() => setActiveTab(t.id)}
+            id={`tab-${t.id}`}
+          >
+            {t.label}
+          </button>
+        ))}
       </nav>
 
-      {/* TAB 1: OVERVIEW & COLLECTOR */}
+      {/* ════════════════════════════════════════════════════════════════════════
+          TAB 1 — OVERVIEW
+         ════════════════════════════════════════════════════════════════════════ */}
       {activeTab === "overview" && (
         <>
+          {/* Session health headline */}
           <section className="kpi-grid">
-            <div className="kpi-card">
-              <div className="kpi-label">Total Events</div>
-              <div className="kpi-value">{(activeSession?.totalEvents || 0).toLocaleString()}</div>
-              <div className="kpi-sub">Normalized stream</div>
-            </div>
+            <KpiCard
+              label="Total Events"
+              value={(activeSession?.totalEvents || 0).toLocaleString()}
+              sub="Normalized stream"
+            />
+            <KpiCard
+              label="Launches"
+              value={(activeSession?.launchesDetected || 0).toLocaleString()}
+              sub="Pump.fun tokens"
+              color="var(--accent-cyan)"
+            />
+            <KpiCard
+              label="Trades"
+              value={(activeSession?.tradesDetected || 0).toLocaleString()}
+              sub="Curve executions"
+              color="var(--accent-indigo)"
+            />
+            <KpiCard
+              label="Tokens Tracked"
+              value={gradStats?.tokensTracked || 0}
+              sub="Active in window"
+            />
+            <KpiCard
+              label="Graduations"
+              value={gradStats?.graduationsDetected || 0}
+              sub={`Organic: ${gradStats?.organicGraduationsDetected || 0} · Bundles: ${gradStats?.instantBundleGraduationsDetected || 0}`}
+              color="var(--accent-emerald)"
+            />
+            <KpiCard
+              label="Storage Written"
+              value={formatBytes(activeSession?.bytesPersisted ?? 0)}
+              sub={`Chunk #${activeSession?.currentChunk ?? 0}`}
+            />
+          </section>
 
-            <div className="kpi-card">
-              <div className="kpi-label">Launches Detected</div>
-              <div className="kpi-value" style={{ color: "var(--accent-cyan)" }}>
-                {(activeSession?.launchesDetected || 0).toLocaleString()}
+          {/* Portfolio headline */}
+          {portfolioStats && (
+            <section className="section-card" style={{ marginBottom: "1.25rem" }}>
+              <div className="section-header">
+                <h2 className="section-title">Portfolio Headline (5 SOL / balanced / baseline-50sol-v1)</h2>
+                <Chip color="var(--accent-amber)" small>Hypothetical</Chip>
               </div>
-              <div className="kpi-sub">Pump.fun tokens</div>
-            </div>
+              {(() => {
+                const p = portfolioStats.portfolios.find(
+                  (pp) =>
+                    pp.startingSol === 5 &&
+                    pp.riskMode === "balanced" &&
+                    pp.strategyId === "baseline-50sol-v1"
+                );
+                if (!p) return <p className="note-text">Select the Portfolios tab for full analysis.</p>;
+                return (
+                  <div className="kpi-grid" style={{ marginTop: "0.75rem" }}>
+                    <KpiCard label="Current Equity" value={`${p.equitySol.toFixed(4)} SOL`} />
+                    <KpiCard
+                      label="Net PnL"
+                      value={`${pnlSign(p.netPnlSol)}${p.netPnlSol.toFixed(4)} SOL`}
+                      color={p.netPnlSol >= 0 ? "var(--accent-emerald)" : "var(--accent-rose)"}
+                    />
+                    <KpiCard
+                      label="Return %"
+                      value={`${pnlSign(p.returnPct)}${p.returnPct.toFixed(2)}%`}
+                      color={p.returnPct >= 0 ? "var(--accent-emerald)" : "var(--accent-rose)"}
+                    />
+                    <KpiCard
+                      label="Win Rate"
+                      value={`${p.winRatePct.toFixed(1)}%`}
+                      sub={`${p.trades} closed trades`}
+                      color={p.winRatePct >= 50 ? "var(--accent-emerald)" : "var(--accent-rose)"}
+                    />
+                  </div>
+                );
+              })()}
+            </section>
+          )}
 
-            <div className="kpi-card">
-              <div className="kpi-label">Trades Processed</div>
-              <div className="kpi-value" style={{ color: "var(--accent-indigo)" }}>
-                {(activeSession?.tradesDetected || 0).toLocaleString()}
+          {/* Strategy baseline headline */}
+          {paperStats && (
+            <section className="section-card" style={{ marginBottom: "1.25rem" }}>
+              <div className="section-header">
+                <h2 className="section-title">Strategy Research Headline</h2>
+                <Chip color="var(--accent-cyan)" small>
+                  {paperStats.strategyId}
+                </Chip>
               </div>
-              <div className="kpi-sub">Curve executions</div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Tokens Tracked</div>
-              <div className="kpi-value">{gradStats?.tokensTracked || 0}</div>
-              <div className="kpi-sub">Active in window</div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Reconnects / Disconnects</div>
-              <div className="kpi-value" style={{ color: (activeSession?.disconnectCount || 0) > 0 ? "var(--accent-amber)" : "white" }}>
-                {activeSession?.reconnectCount || 0} / {activeSession?.disconnectCount || 0}
+              <div className="kpi-grid" style={{ marginTop: "0.75rem" }}>
+                <KpiCard
+                  label="Net PnL (SOL)"
+                  value={`${pnlSign(paperStats.netPnlSol)}${paperStats.netPnlSol} SOL`}
+                  color={pnlCls(paperStats.netPnlSol) === "pnl-pos" ? "var(--accent-emerald)" : "var(--accent-rose)"}
+                />
+                <KpiCard
+                  label="Win Rate"
+                  value={`${paperStats.winRatePct}%`}
+                  sub={`${paperStats.winningClosedTrades}W / ${paperStats.losingClosedTrades}L`}
+                  color={paperStats.winRatePct >= 50 ? "var(--accent-emerald)" : "var(--accent-rose)"}
+                />
+                <KpiCard
+                  label="Closed / Open"
+                  value={`${paperStats.closedPositions} / ${paperStats.openPositions}`}
+                />
+                <KpiCard label="Profit Factor" value={paperStats.profitFactor} />
               </div>
-              <div className="kpi-sub">Feed stability</div>
-            </div>
+            </section>
+          )}
 
-            <div className="kpi-card">
-              <div className="kpi-label">Failed / Truncated Txs</div>
-              <div className="kpi-value">
-                {activeSession?.failedTxObserved || 0} / {activeSession?.parserErrors || 0}
-              </div>
-              <div className="kpi-sub">RPC notifications</div>
+          {/* Graduation summary */}
+          <section className="section-card" style={{ marginBottom: "1.25rem" }}>
+            <div className="section-header">
+              <h2 className="section-title">Graduation Funnel</h2>
+              <Chip color="var(--text-muted)" small>Migration decoding limited by IDL</Chip>
+            </div>
+            <div className="graduation-grid" style={{ marginTop: "0.75rem" }}>
+              {[
+                { label: "≥ 50 SOL", value: gradStats?.curve50PlusCount || 0 },
+                { label: "≥ 60 SOL", value: gradStats?.curve60PlusCount || 0 },
+                { label: "≥ 70 SOL", value: gradStats?.curve70PlusCount || 0 },
+                { label: "≥ 80 SOL", value: gradStats?.nearGraduationCount || 0, highlight: true },
+                { label: "Organic Grads", value: gradStats?.organicGraduationsDetected || 0, color: "var(--accent-emerald)" },
+                { label: "Instant Bundles", value: gradStats?.instantBundleGraduationsDetected || 0, color: "var(--accent-rose)" },
+              ].map((item) => (
+                <div key={item.label} className={`grad-box${item.highlight ? " highlight" : ""}`}>
+                  <div className="grad-box-label">{item.label}</div>
+                  <div className="grad-box-value" style={item.color ? { color: item.color } : undefined}>
+                    {item.value}
+                  </div>
+                </div>
+              ))}
             </div>
           </section>
 
-          {/* Sessions History Table */}
+          {/* Feed quality */}
           <section className="section-card">
             <div className="section-header">
-              <h2 className="section-title">Research Sessions History</h2>
-              <span className="field-value field-mono" style={{ fontSize: "0.85rem" }}>
-                {sessionsHistory.length} Recorded
-              </span>
+              <h2 className="section-title">Feed Quality</h2>
+            </div>
+            <div className="kpi-grid" style={{ marginTop: "0.75rem" }}>
+              <KpiCard
+                label="Failed Txs Observed"
+                value={(activeSession?.failedTxObserved || 0).toLocaleString()}
+                sub="RPC notifications"
+              />
+              <KpiCard
+                label="Parser Errors"
+                value={activeSession?.parserErrors || 0}
+                color={
+                  (activeSession?.parserErrors || 0) > 0 ? "var(--accent-rose)" : undefined
+                }
+              />
+              <KpiCard
+                label="Disconnects / Reconnects"
+                value={`${activeSession?.disconnectCount || 0} / ${activeSession?.reconnectCount || 0}`}
+                color={
+                  (activeSession?.disconnectCount || 0) > 0 ? "var(--accent-amber)" : undefined
+                }
+              />
+            </div>
+          </section>
+        </>
+      )}
+
+      {/* ════════════════════════════════════════════════════════════════════════
+          TAB 2 — PORTFOLIOS
+         ════════════════════════════════════════════════════════════════════════ */}
+      {activeTab === "portfolios" && <Portfolios data={portfolioStats} />}
+
+      {/* ════════════════════════════════════════════════════════════════════════
+          TAB 3 — STRATEGY RESEARCH
+         ════════════════════════════════════════════════════════════════════════ */}
+      {activeTab === "strategy" && (
+        <>
+          {/* Frozen strategy banner */}
+          <div className="research-banner">
+            <div>
+              <div className="banner-title">PAPER TRADING — NO REAL FUNDS</div>
+              <div className="banner-subtitle">
+                Strategy: {paperStats?.strategyId || "organic-50sol-continuation-v1"} ·
+                Cost Scenario: {paperStats?.costScenarioId || "paper-medium-v1"}
+              </div>
+            </div>
+            <Chip color="var(--accent-emerald)">Causal 0.10 SOL Quotes</Chip>
+          </div>
+
+          {/* Strategy spec */}
+          <section className="section-card" style={{ marginBottom: "1.25rem" }}>
+            <div className="section-header">
+              <h2 className="section-title" style={{ color: "var(--accent-cyan)" }}>
+                organic-50sol-continuation-v1
+              </h2>
+              <Chip color="var(--accent-emerald)">Frozen Rule</Chip>
+            </div>
+            <div className="spec-grid">
+              <div>
+                <span className="field-label">Thesis</span>
+                <span className="field-value">
+                  Graduation / Curve-Progress Momentum — enters on first organic crossing from &lt;50 SOL
+                  to ≥50 SOL real reserves for tokens launched in session.
+                </span>
+              </div>
+              <div className="spec-pills">
+                <Chip>Min Age: ≥ 5s</Chip>
+                <Chip>Min Trades: ≥ 5</Chip>
+                <Chip>Size: 0.10 SOL fixed</Chip>
+                <Chip>Instant Bundle: Disallowed</Chip>
+                <Chip color="var(--accent-emerald)">Rebound Filter: NONE</Chip>
+                <Chip color="var(--accent-emerald)">Sell-Vol Filter: NONE</Chip>
+                <Chip color="var(--accent-emerald)">Higher-Low Filter: NONE</Chip>
+                <Chip>TP: +30% net</Chip>
+                <Chip>SL: −20% net</Chip>
+                <Chip>Timeout: 5 min</Chip>
+              </div>
+            </div>
+          </section>
+
+          {/* KPI grid */}
+          <section className="kpi-grid">
+            <KpiCard
+              label="Open Positions"
+              value={paperStats?.openPositions ?? 0}
+              sub={`Triggered: ${paperStats?.entriesTriggered ?? 0}`}
+              color="var(--accent-cyan)"
+            />
+            <KpiCard
+              label="Closed Trades"
+              value={paperStats?.closedPositions ?? 0}
+              sub={`Censored: ${paperStats?.censoredPositions ?? 0} · Migration: ${paperStats?.unresolvedMigrationPositions ?? 0}`}
+            />
+            <KpiCard
+              label="Win Rate %"
+              value={`${paperStats?.winRatePct ?? 0}%`}
+              sub={`${paperStats?.winningClosedTrades ?? 0}W / ${paperStats?.losingClosedTrades ?? 0}L`}
+              color={
+                (paperStats?.winRatePct ?? 0) >= 50
+                  ? "var(--accent-emerald)"
+                  : "var(--accent-rose)"
+              }
+            />
+            <KpiCard
+              label="Net PnL (SOL)"
+              value={`${pnlSign(paperStats?.netPnlSol)}${paperStats?.netPnlSol ?? 0} SOL`}
+              sub={`Gross: ${paperStats?.grossPnlSol ?? 0} SOL`}
+              color={
+                pnlCls(paperStats?.netPnlSol) === "pnl-pos"
+                  ? "var(--accent-emerald)"
+                  : "var(--accent-rose)"
+              }
+            />
+            <KpiCard
+              label="Protocol + Tx Fees"
+              value={`${(
+                (paperStats?.totalPumpFeesSol ?? 0) + (paperStats?.totalTxCostsSol ?? 0)
+              ).toFixed(6)} SOL`}
+              sub={`Pump: ${paperStats?.totalPumpFeesSol ?? 0} · Tx: ${paperStats?.totalTxCostsSol ?? 0}`}
+              color="var(--accent-amber)"
+            />
+            <KpiCard
+              label="Profit Factor"
+              value={paperStats?.profitFactor ?? 0}
+              sub={`Avg Hold: ${paperStats?.averageHoldSec ?? 0}s`}
+            />
+          </section>
+
+          {/* Breakdown row */}
+          <div className="breakdown-row">
+            <div className="section-card" style={{ marginBottom: 0 }}>
+              <h3 className="section-subtitle">By Exit Reason</h3>
+              <div className="breakdown-list">
+                <div className="breakdown-item">
+                  <span>Take Profit (+30%)</span>
+                  <span className="pnl-pos">
+                    {paperStats?.pnlByExitReason?.takeProfit.count ?? 0} trades (
+                    {paperStats?.pnlByExitReason?.takeProfit.netPnlSol ?? 0} SOL)
+                  </span>
+                </div>
+                <div className="breakdown-item">
+                  <span>Stop Loss (−20%)</span>
+                  <span className="pnl-neg">
+                    {paperStats?.pnlByExitReason?.stopLoss.count ?? 0} trades (
+                    {paperStats?.pnlByExitReason?.stopLoss.netPnlSol ?? 0} SOL)
+                  </span>
+                </div>
+                <div className="breakdown-item">
+                  <span>Timeout (5m)</span>
+                  <span>
+                    {paperStats?.pnlByExitReason?.timeout.count ?? 0} trades (
+                    {paperStats?.pnlByExitReason?.timeout.netPnlSol ?? 0} SOL)
+                  </span>
+                </div>
+              </div>
             </div>
 
+            <div className="section-card" style={{ marginBottom: 0 }}>
+              <h3 className="section-subtitle">By Token Age at Trigger</h3>
+              <div className="breakdown-list">
+                <div className="breakdown-item">
+                  <span>5s – 15s</span>
+                  <span>
+                    {paperStats?.pnlByTokenAgeBucket?.age5to15s.count ?? 0} trades (
+                    {paperStats?.pnlByTokenAgeBucket?.age5to15s.netPnlSol ?? 0} SOL)
+                  </span>
+                </div>
+                <div className="breakdown-item">
+                  <span>15s – 60s</span>
+                  <span>
+                    {paperStats?.pnlByTokenAgeBucket?.age15to60s.count ?? 0} trades (
+                    {paperStats?.pnlByTokenAgeBucket?.age15to60s.netPnlSol ?? 0} SOL)
+                  </span>
+                </div>
+                <div className="breakdown-item">
+                  <span>60s+</span>
+                  <span>
+                    {paperStats?.pnlByTokenAgeBucket?.age60sPlus.count ?? 0} trades (
+                    {paperStats?.pnlByTokenAgeBucket?.age60sPlus.netPnlSol ?? 0} SOL)
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="section-card" style={{ marginBottom: 0 }}>
+              <h3 className="section-subtitle">By Speed to 50 SOL</h3>
+              <div className="breakdown-list">
+                <div className="breakdown-item">
+                  <span>Fast (&lt;10s)</span>
+                  <span>
+                    {paperStats?.pnlByOrganicSpeedBucket?.fastUnder10s.count ?? 0} trades (
+                    {paperStats?.pnlByOrganicSpeedBucket?.fastUnder10s.netPnlSol ?? 0} SOL)
+                  </span>
+                </div>
+                <div className="breakdown-item">
+                  <span>Medium (10–30s)</span>
+                  <span>
+                    {paperStats?.pnlByOrganicSpeedBucket?.medium10to30s.count ?? 0} trades (
+                    {paperStats?.pnlByOrganicSpeedBucket?.medium10to30s.netPnlSol ?? 0} SOL)
+                  </span>
+                </div>
+                <div className="breakdown-item">
+                  <span>Steady (30s+)</span>
+                  <span>
+                    {paperStats?.pnlByOrganicSpeedBucket?.steady30sPlus.count ?? 0} trades (
+                    {paperStats?.pnlByOrganicSpeedBucket?.steady30sPlus.netPnlSol ?? 0} SOL)
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Open positions */}
+          <section className="section-card" style={{ marginTop: "1.5rem" }}>
+            <div className="section-header">
+              <h2 className="section-title">Open Positions</h2>
+              <Chip small>{paperStats?.activePositionsSummary?.length ?? 0} active</Chip>
+            </div>
             <div className="table-container">
               <table className="data-table">
                 <thead>
                   <tr>
-                    <th>Session ID</th>
-                    <th>Status</th>
-                    <th>Started</th>
-                    <th>Duration</th>
-                    <th>Events</th>
-                    <th>Launches</th>
-                    <th>Storage</th>
-                    <th>Actions</th>
+                    {["Mint", "Opened", "Age", "Entry Real SOL", "Unrealised %", "MFE %", "MAE %", "Status"].map(
+                      (h) => <th key={h}>{h}</th>
+                    )}
+                  </tr>
+                </thead>
+                <tbody>
+                  {!paperStats?.activePositionsSummary ||
+                  paperStats.activePositionsSummary.length === 0 ? (
+                    <EmptyRow cols={8} text="No paper positions currently open." />
+                  ) : (
+                    paperStats.activePositionsSummary.map((p) => (
+                      <tr key={p.mint}>
+                        <td className="field-mono">{shortenAddress(p.mint)}</td>
+                        <td>{new Date(p.openedAtIso).toLocaleTimeString()}</td>
+                        <td>{p.tokenAgeSec}s</td>
+                        <td className="field-mono">{p.currentRealSol.toFixed(2)} SOL</td>
+                        <td className={`field-mono ${pnlCls(p.unrealizedNetReturnPct)}`}>
+                          {pnlSign(p.unrealizedNetReturnPct)}
+                          {p.unrealizedNetReturnPct.toFixed(2)}%
+                        </td>
+                        <td className="field-mono pnl-pos">+{p.mfePct.toFixed(2)}%</td>
+                        <td className="field-mono pnl-neg">{p.maePct.toFixed(2)}%</td>
+                        <td>
+                          <Chip small color="var(--accent-cyan)">{p.status}</Chip>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          {/* Closed trades */}
+          <section className="section-card">
+            <div className="section-header">
+              <h2 className="section-title">Recent Closed Trades</h2>
+              <Chip small>
+                {paperTradesList.length > 0
+                  ? paperTradesList.length
+                  : paperStats?.recentClosedTrades?.length ?? 0}{" "}
+                closed
+              </Chip>
+            </div>
+            <div className="table-container">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    {["Mint", "Hold", "Exit", "Gross PnL", "Fees", "Net PnL (SOL)", "Return %"].map(
+                      (h) => <th key={h}>{h}</th>
+                    )}
+                  </tr>
+                </thead>
+                <tbody>
+                  {!paperStats?.recentClosedTrades ||
+                  paperStats.recentClosedTrades.length === 0 ? (
+                    <EmptyRow cols={7} text="No paper trades closed yet." />
+                  ) : (
+                    paperStats.recentClosedTrades.map((t, idx) => (
+                      <tr key={idx}>
+                        <td className="field-mono">{shortenAddress(t.mint)}</td>
+                        <td>{t.holdDurationSec}s</td>
+                        <td>
+                          <Chip
+                            small
+                            color={
+                              t.exitReason === "take-profit"
+                                ? "var(--accent-emerald)"
+                                : t.exitReason === "stop-loss"
+                                ? "var(--accent-rose)"
+                                : "var(--text-muted)"
+                            }
+                          >
+                            {t.exitReason}
+                          </Chip>
+                        </td>
+                        <td className="field-mono">{t.grossPnlSol.toFixed(6)}</td>
+                        <td className="field-mono">{t.feesSol.toFixed(6)}</td>
+                        <td className={`field-mono ${pnlCls(t.netPnlSol)}`}>
+                          {pnlSign(t.netPnlSol)}
+                          {t.netPnlSol.toFixed(6)}
+                        </td>
+                        <td className={`field-mono ${pnlCls(t.netReturnPct)}`}>
+                          {pnlSign(t.netReturnPct)}
+                          {t.netReturnPct.toFixed(2)}%
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          {/* Graduation candidates */}
+          <section className="section-card">
+            <div className="section-header">
+              <h2 className="section-title">Graduation Candidates (≥ 50 SOL or Graduated)</h2>
+              <Chip small>{candidates.length} detected</Chip>
+            </div>
+            <div className="table-container">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    {["Mint", "Creator", "Current SOL", "Peak SOL", "Progress", "Trades", "Class", "Status", "Updated"].map(
+                      (h) => <th key={h}>{h}</th>
+                    )}
+                  </tr>
+                </thead>
+                <tbody>
+                  {candidates.length === 0 ? (
+                    <EmptyRow cols={9} text="No tokens have crossed ≥ 50 SOL yet." />
+                  ) : (
+                    candidates.map((c) => {
+                      const curSol = Number(BigInt(c.currentRealSolLamports || "0")) / 1e9;
+                      const peakSol = Number(BigInt(c.maxRealSolLamports || "0")) / 1e9;
+                      return (
+                        <tr key={c.mint}>
+                          <td className="field-mono">{shortenAddress(c.mint)}</td>
+                          <td className="field-mono">{shortenAddress(c.creatorWallet)}</td>
+                          <td className="field-mono">{curSol.toFixed(2)}</td>
+                          <td className="field-mono">{peakSol.toFixed(2)}</td>
+                          <td>
+                            <div className="progress-bar-bg">
+                              <div
+                                className="progress-bar-fill"
+                                style={{ width: `${Math.min(100, c.curveProgressPct)}%` }}
+                              />
+                            </div>
+                            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                              {c.curveProgressPct.toFixed(1)}%
+                            </span>
+                          </td>
+                          <td>{c.tradeCount}</td>
+                          <td>
+                            <Chip
+                              small
+                              color={
+                                c.classification === "organic"
+                                  ? "var(--accent-emerald)"
+                                  : c.classification === "instant-bundle"
+                                  ? "var(--accent-rose)"
+                                  : "var(--text-muted)"
+                              }
+                            >
+                              {c.classification}
+                            </Chip>
+                          </td>
+                          <td>
+                            {c.graduated ? (
+                              <Chip small color="var(--accent-emerald)">GRADUATED</Chip>
+                            ) : (
+                              <Chip small color="var(--accent-indigo)">BONDING</Chip>
+                            )}
+                          </td>
+                          <td>{new Date(c.updatedAt).toLocaleTimeString()}</td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </>
+      )}
+
+      {/* ════════════════════════════════════════════════════════════════════════
+          TAB 4 — MARKET INTELLIGENCE
+         ════════════════════════════════════════════════════════════════════════ */}
+      {activeTab === "market" && (
+        <>
+          <div className="disclaimer-banner">
+            <div>
+              <strong>Methodology:</strong>{" "}
+              {marketStats?.disclaimer ||
+                "Session-scoped estimate. External transaction costs may be incomplete. Mid-session inventory is excluded from clean profitability metrics."}
+            </div>
+            <div style={{ marginTop: "0.35rem", fontSize: "0.775rem", color: "#fca5a5" }}>
+              <strong>Fee Coverage:</strong>{" "}
+              {marketStats?.feeCoverageDisclaimer ||
+                "Estimated curve trading PnL before Pump protocol fees and unobserved external transaction costs."}
+            </div>
+          </div>
+
+          {/* Participant KPIs */}
+          <section className="kpi-grid">
+            <KpiCard
+              label="Observed Wallets"
+              value={marketStats?.totalObservedWallets ?? 0}
+              sub={`Clean: ${marketStats?.cleanEligibleWallets ?? 0} · Partial: ${marketStats?.partialWallets ?? 0}`}
+            />
+            <KpiCard
+              label="Clean Closed Win Rate"
+              value={`${marketStats?.cleanClosedTraderWinRatePct ?? 0}%`}
+              sub={`N = ${marketStats?.cleanClosedWalletCount ?? 0} (${marketStats?.cleanClosedWinningWalletCount ?? 0} winners)`}
+              color={
+                (marketStats?.cleanClosedTraderWinRatePct ?? 0) >= 50
+                  ? "var(--accent-emerald)"
+                  : "var(--accent-rose)"
+              }
+            />
+            <KpiCard
+              label="Marked Positive PnL"
+              value={`${marketStats?.cleanMarkedPositivePnlRatePct ?? 0}%`}
+              sub={`${marketStats?.cleanMarkedPositivePnlCount ?? 0} / ${marketStats?.cleanMarkedWalletCount ?? 0} marked`}
+              color="var(--accent-cyan)"
+            />
+            <KpiCard
+              label="Realized"
+              value={
+                <>
+                  <span className="pnl-pos">{marketStats?.realizedProfitableCount ?? 0}W</span>
+                  {" / "}
+                  <span className="pnl-neg">{marketStats?.realizedLossCount ?? 0}L</span>
+                </>
+              }
+              sub="Fully closed positions"
+            />
+            <KpiCard
+              label="Open Inventory"
+              value={
+                <>
+                  <span className="pnl-pos">{marketStats?.openProfitableCount ?? 0}</span>
+                  {" / "}
+                  <span className="pnl-neg">{marketStats?.openUnderwaterCount ?? 0}</span>
+                </>
+              }
+              sub="Profit / underwater"
+            />
+            <KpiCard
+              label="Clean Marked PnL"
+              value={`${pnlSign(marketStats?.totalCleanMarkedPnlSol)}${marketStats?.totalCleanMarkedPnlSol ?? 0} SOL`}
+              sub={`Realized: ${marketStats?.totalCleanRealizedPnlSol ?? 0} SOL`}
+              color={
+                pnlCls(marketStats?.totalCleanMarkedPnlSol) === "pnl-pos"
+                  ? "var(--accent-emerald)"
+                  : "var(--accent-rose)"
+              }
+            />
+          </section>
+
+          {/* Whale + Creator */}
+          <div className="breakdown-row">
+            <div className="section-card" style={{ marginBottom: 0 }}>
+              <h3 className="section-subtitle">Wallet Concentration</h3>
+              <div className="breakdown-list">
+                <div className="breakdown-item">
+                  <span>Top 1% Wallets — Volume Share</span>
+                  <strong className="field-mono">
+                    {marketStats?.top1PctWalletsSolVolumeSharePct ?? 0}%
+                  </strong>
+                </div>
+                <div className="breakdown-item">
+                  <span>Top 5 Wallets — Buy Volume</span>
+                  <strong className="field-mono">
+                    {marketStats?.top5WalletsBuyVolumeSol ?? 0} SOL (
+                    {marketStats?.top5WalletsBuyVolumeSharePct ?? 0}%)
+                  </strong>
+                </div>
+              </div>
+            </div>
+
+            <div className="section-card" style={{ marginBottom: 0 }}>
+              <h3 className="section-subtitle">Creator SOL Extraction</h3>
+              <div className="breakdown-list">
+                <div className="breakdown-item">
+                  <span>Creators Clean / Partial</span>
+                  <strong>
+                    {creatorStats?.cleanCreatorsCount ?? creatorStats?.creatorsObserved ?? 0} /{" "}
+                    {creatorStats?.partialCreatorsCount ?? 0} (Total:{" "}
+                    {creatorStats?.creatorsObserved ?? 0})
+                  </strong>
+                </div>
+                <div className="breakdown-item">
+                  <span>Selling / Fully Exited</span>
+                  <strong>
+                    {creatorStats?.creatorsSelling ?? 0} /{" "}
+                    {creatorStats?.cleanCreatorsFullyExited ?? creatorStats?.creatorsFullyExited ?? 0}
+                  </strong>
+                </div>
+                <div className="breakdown-item">
+                  <span>Median First-Sell Delay</span>
+                  <strong className="field-mono">
+                    {creatorStats?.medianCleanFirstSellDelaySec ?? creatorStats?.medianFirstSellDelaySec ?? 0}s
+                  </strong>
+                </div>
+                <div className="breakdown-item">
+                  <span>Total Net Extracted</span>
+                  <strong className="field-mono" style={{ color: "#f87171" }}>
+                    {creatorStats?.totalObservedCreatorExtractionSol ?? 0} SOL
+                  </strong>
+                </div>
+                <div className="breakdown-item">
+                  <span>p50 / p90 / Max</span>
+                  <span className="field-mono" style={{ fontSize: "0.8rem" }}>
+                    {creatorStats?.p50Sol ?? 0} / {creatorStats?.p90Sol ?? 0} /{" "}
+                    {creatorStats?.largestObservedExtractionSol ?? 0} SOL
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Top winners / losers */}
+          <div className="breakdown-row" style={{ marginTop: "1.5rem" }}>
+            <div className="section-card" style={{ marginBottom: 0 }}>
+              <h3 className="section-subtitle" style={{ color: "var(--accent-emerald)" }}>
+                Top Clean Winning Wallets
+              </h3>
+              <div className="table-container">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      {["Wallet", "Marked PnL", "Realized PnL", "Trades", "Mints"].map((h) => (
+                        <th key={h}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {!marketStats?.topCleanWinners || marketStats.topCleanWinners.length === 0 ? (
+                      <EmptyRow cols={5} text="No clean winners observed." />
+                    ) : (
+                      marketStats.topCleanWinners.map((w, idx) => (
+                        <tr key={idx}>
+                          <td className="field-mono">{shortenAddress(w.wallet)}</td>
+                          <td className="field-mono pnl-pos">+{w.markedPnlSol.toFixed(4)}</td>
+                          <td className="field-mono">+{w.realizedPnlSol.toFixed(4)}</td>
+                          <td>{w.tradeCount}</td>
+                          <td>{w.mintsTraded}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="section-card" style={{ marginBottom: 0 }}>
+              <h3 className="section-subtitle" style={{ color: "var(--accent-rose)" }}>
+                Top Clean Losing Wallets
+              </h3>
+              <div className="table-container">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      {["Wallet", "Marked PnL", "Realized PnL", "Trades", "Mints"].map((h) => (
+                        <th key={h}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {!marketStats?.topCleanLosers || marketStats.topCleanLosers.length === 0 ? (
+                      <EmptyRow cols={5} text="No clean losers observed." />
+                    ) : (
+                      marketStats.topCleanLosers.map((w, idx) => (
+                        <tr key={idx}>
+                          <td className="field-mono">{shortenAddress(w.wallet)}</td>
+                          <td className="field-mono pnl-neg">{w.markedPnlSol.toFixed(4)}</td>
+                          <td className="field-mono">{w.realizedPnlSol.toFixed(4)}</td>
+                          <td>{w.tradeCount}</td>
+                          <td>{w.mintsTraded}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          {/* Creator extractions */}
+          <section className="section-card" style={{ marginTop: "1.5rem" }}>
+            <div className="section-header">
+              <h2 className="section-title">Largest Creator Extraction Events</h2>
+              <Chip small>{creatorStats?.topCreatorExtractions?.length ?? 0} recorded</Chip>
+            </div>
+            <div className="table-container">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    {["Creator", "Mint", "Quality", "Net SOL", "First Sell", "% Sold"].map((h) => (
+                      <th key={h}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {!creatorStats?.topCreatorExtractions ||
+                  creatorStats.topCreatorExtractions.length === 0 ? (
+                    <EmptyRow cols={6} text="No creator extraction events observed." />
+                  ) : (
+                    creatorStats.topCreatorExtractions.map((e, idx) => (
+                      <tr key={idx}>
+                        <td className="field-mono">{shortenAddress(e.creatorWallet)}</td>
+                        <td className="field-mono">{shortenAddress(e.mint)}</td>
+                        <td>
+                          <Chip
+                            small
+                            color={
+                              e.inventoryQuality === "CLEAN"
+                                ? "var(--accent-emerald)"
+                                : "var(--text-muted)"
+                            }
+                          >
+                            {e.inventoryQuality || "CLEAN"}
+                          </Chip>
+                        </td>
+                        <td className="field-mono pnl-neg">
+                          +{e.netExtractionSol.toFixed(4)}
+                        </td>
+                        <td className="field-mono">{e.firstSellDelaySec}s</td>
+                        <td>
+                          {e.pctSold !== undefined ? `${e.pctSold.toFixed(1)}%` : "—"}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </>
+      )}
+
+      {/* ════════════════════════════════════════════════════════════════════════
+          TAB 5 — DATA / SESSION DETAILS
+         ════════════════════════════════════════════════════════════════════════ */}
+      {activeTab === "data" && (
+        <>
+          {/* Active session operational details */}
+          {activeSession && (
+            <section className="section-card" style={{ marginBottom: "1.25rem" }}>
+              <div className="section-header">
+                <h2 className="section-title">Active Session</h2>
+                <StatusPill status={activeSession.status} />
+              </div>
+              <div className="data-grid">
+                {[
+                  ["Session ID", activeSession.sessionId, true],
+                  ["Provider", activeSession.provider],
+                  ["Region", activeSession.region],
+                  ["Mode", activeSession.mode],
+                  ["Started At", new Date(activeSession.startedAt).toLocaleString()],
+                  ["Elapsed / Target", `${formatDuration(activeSession.elapsedSec)} / ${activeSession.requestedDurationSec ? formatDuration(activeSession.requestedDurationSec) : "Open"}`],
+                  ["Last Heartbeat", activeSession.lastHeartbeatAt ? new Date(activeSession.lastHeartbeatAt).toLocaleString() : "—"],
+                  ["Total Events", activeSession.totalEvents.toLocaleString()],
+                  ["Launches", activeSession.launchesDetected.toLocaleString()],
+                  ["Trades", activeSession.tradesDetected.toLocaleString()],
+                  ["Failed Txs", activeSession.failedTxObserved.toLocaleString()],
+                  ["Parser Errors", activeSession.parserErrors],
+                  ["Disconnects / Reconnects", `${activeSession.disconnectCount} / ${activeSession.reconnectCount}`],
+                  ["Current Chunk", `#${activeSession.currentChunk}`],
+                  ["GCS Bytes Persisted", formatBytes(activeSession.bytesPersisted)],
+                  ["Latest Error", activeSession.latestError ?? "—"],
+                ].map(([label, value, mono]) => (
+                  <div key={label as string} className="data-row">
+                    <span className="field-label">{label}</span>
+                    <span className={`field-value${mono ? " field-mono" : ""}`}>{value}</span>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* Sessions history table */}
+          <section className="section-card">
+            <div className="section-header">
+              <h2 className="section-title">Sessions History</h2>
+              <Chip small>{sessionsHistory.length} recorded</Chip>
+            </div>
+            <div className="table-container">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    {["Session ID", "Status", "Started", "Duration", "Events", "Launches", "Storage", ""].map(
+                      (h) => <th key={h}>{h}</th>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
                   {sessionsHistory.length === 0 ? (
-                    <tr>
-                      <td colSpan={8} style={{ textAlign: "center", color: "var(--text-muted)", padding: "2rem" }}>
-                        No research sessions found. Click &quot;Start Research Session&quot; to begin.
-                      </td>
-                    </tr>
+                    <EmptyRow cols={8} text="No sessions yet." />
                   ) : (
                     sessionsHistory.map((s) => (
                       <tr key={s.sessionId}>
-                        <td className="field-mono">{s.sessionId}</td>
+                        <td className="field-mono" style={{ fontSize: "0.78rem" }}>
+                          {s.sessionId}
+                        </td>
                         <td>
-                          <span className={`status-pill ${s.status}`} style={{ fontSize: "0.75rem", padding: "0.15rem 0.5rem" }}>
-                            {s.status}
-                          </span>
+                          <StatusPill status={s.status} />
                         </td>
                         <td>{new Date(s.startedAt).toLocaleString()}</td>
                         <td>{formatDuration(s.elapsedSec)}</td>
@@ -875,740 +1772,9 @@ export default function App() {
         </>
       )}
 
-      {/* TAB 2: GRADUATION RESEARCH */}
-      {activeTab === "graduation" && (
-        <>
-          <section className="section-card">
-            <div className="section-header">
-              <h2 className="section-title">
-                <span>Phase 4C — Bonding Curve Graduation Observability</span>
-              </h2>
-              <span className="limitation-pill">
-                Migration decoding: Limitation noted (IDL revision does not emit migration events; no faked counts)
-              </span>
-            </div>
+      {/* ── Modals ────────────────────────────────────────────────────────────── */}
 
-            <div className="graduation-grid">
-              <div className="grad-box">
-                <div className="grad-box-label">&ge; 50 SOL</div>
-                <div className="grad-box-value">{gradStats?.curve50PlusCount || 0}</div>
-              </div>
-
-              <div className="grad-box">
-                <div className="grad-box-label">&ge; 60 SOL</div>
-                <div className="grad-box-value">{gradStats?.curve60PlusCount || 0}</div>
-              </div>
-
-              <div className="grad-box">
-                <div className="grad-box-label">&ge; 70 SOL</div>
-                <div className="grad-box-value">{gradStats?.curve70PlusCount || 0}</div>
-              </div>
-
-              <div className="grad-box highlight">
-                <div className="grad-box-label">&ge; 80 SOL (Near Grad)</div>
-                <div className="grad-box-value" style={{ color: "#a5b4fc" }}>
-                  {gradStats?.nearGraduationCount || 0}
-                </div>
-              </div>
-
-              <div className="grad-box organic">
-                <div className="grad-box-label">Organic Graduations</div>
-                <div className="grad-box-value" style={{ color: "#34d399" }}>
-                  {gradStats?.organicGraduationsDetected || 0}
-                </div>
-              </div>
-
-              <div className="grad-box bundle">
-                <div className="grad-box-label">Instant Bundles</div>
-                <div className="grad-box-value" style={{ color: "#f87171" }}>
-                  {gradStats?.instantBundleGraduationsDetected || 0}
-                </div>
-              </div>
-
-              <div className="grad-box">
-                <div className="grad-box-label">Migrations</div>
-                <div className="grad-box-value" style={{ color: "var(--text-muted)" }}>
-                  {gradStats?.migrationsDetected || 0}
-                </div>
-              </div>
-            </div>
-          </section>
-
-          {/* Live Candidates Table */}
-          <section className="section-card">
-            <div className="section-header">
-              <h2 className="section-title">
-                <span>Graduation Candidates (&ge; 50 SOL or Graduated)</span>
-              </h2>
-              <span className="field-value field-mono" style={{ fontSize: "0.85rem" }}>
-                {candidates.length} Detected
-              </span>
-            </div>
-
-            <div className="table-container">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Mint</th>
-                    <th>Creator</th>
-                    <th>Current Real SOL</th>
-                    <th>Peak Real SOL</th>
-                    <th>Curve Progress</th>
-                    <th>Trades</th>
-                    <th>Classification</th>
-                    <th>Status</th>
-                    <th>Last Updated</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {candidates.length === 0 ? (
-                    <tr>
-                      <td colSpan={9} style={{ textAlign: "center", color: "var(--text-muted)", padding: "2rem" }}>
-                        No tokens have crossed &ge; 50 SOL yet in this active session.
-                      </td>
-                    </tr>
-                  ) : (
-                    candidates.map((c) => {
-                      const curSol = Number(BigInt(c.currentRealSolLamports || "0")) / 1e9;
-                      const peakSol = Number(BigInt(c.maxRealSolLamports || "0")) / 1e9;
-                      return (
-                        <tr key={c.mint}>
-                          <td className="field-mono">{shortenAddress(c.mint)}</td>
-                          <td className="field-mono">{shortenAddress(c.creatorWallet)}</td>
-                          <td className="field-mono">{curSol.toFixed(2)} SOL</td>
-                          <td className="field-mono">{peakSol.toFixed(2)} SOL</td>
-                          <td>
-                            <div className="progress-bar-bg">
-                              <div
-                                className="progress-bar-fill"
-                                style={{ width: `${Math.min(100, c.curveProgressPct)}%` }}
-                              ></div>
-                            </div>
-                            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-                              {c.curveProgressPct.toFixed(1)}%
-                            </span>
-                          </td>
-                          <td>{c.tradeCount}</td>
-                          <td>
-                            <span
-                              className={`status-pill ${
-                                c.classification === "organic"
-                                  ? "running"
-                                  : c.classification === "instant-bundle"
-                                    ? "failed"
-                                    : "queued"
-                              }`}
-                              style={{ fontSize: "0.75rem", padding: "0.15rem 0.5rem" }}
-                            >
-                              {c.classification}
-                            </span>
-                          </td>
-                          <td>
-                            {c.graduated ? (
-                              <span style={{ color: "#34d399", fontWeight: 600 }}>GRADUATED</span>
-                            ) : (
-                              <span style={{ color: "#a5b4fc" }}>BONDING</span>
-                            )}
-                          </td>
-                          <td>{new Date(c.updatedAt).toLocaleTimeString()}</td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </section>
-        </>
-      )}
-
-      {/* TAB 3: LIVE PAPER TRADING */}
-      {activeTab === "paper" && <Portfolios data={portfolioStats} />}
-      {activeTab === "paper" && (
-        <>
-          <div className="research-banner">
-            <div>
-              <div className="banner-title">PAPER TRADING — NO REAL FUNDS</div>
-              <div className="banner-subtitle">
-                Strategy: {paperStats?.strategyId || "organic-50sol-continuation-v1"} | Cost Scenario: {paperStats?.costScenarioId || "paper-medium-v1"}
-              </div>
-            </div>
-            <div className="limitation-pill" style={{ background: "rgba(16, 185, 129, 0.15)", color: "#34d399", borderColor: "rgba(16, 185, 129, 0.4)" }}>
-              Causal 0.10 SOL Quotes
-            </div>
-          </div>
-
-          {/* Canonical Strategy Specification */}
-          <div className="section-card" style={{ marginBottom: "1.25rem", background: "rgba(255, 255, 255, 0.02)", border: "1px solid rgba(255, 255, 255, 0.08)" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem" }}>
-              <div style={{ fontWeight: 600, fontSize: "0.95rem", color: "var(--accent-cyan)" }}>
-                Strategy Specification: organic-50sol-continuation-v1
-              </div>
-              <span className="status-pill running" style={{ fontSize: "0.75rem", padding: "0.15rem 0.5rem" }}>
-                Frozen Rule
-              </span>
-            </div>
-            <div style={{ fontSize: "0.825rem", color: "var(--text-secondary)", lineHeight: 1.5 }}>
-              <div><strong>Thesis:</strong> Graduation / Curve-Progress Momentum (enters on first organic crossing from &lt;50 SOL to &ge;50 SOL real reserves for tokens launched in session).</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "1rem", marginTop: "0.35rem" }}>
-                <span>&bull; Min Age: <strong>&ge; 5s</strong></span>
-                <span>&bull; Min Trades: <strong>&ge; 5</strong></span>
-                <span>&bull; Instant Bundle: <strong>Disallowed (&lt;1.5s / same slot)</strong></span>
-                <span>&bull; Position Sizing: <strong>0.10 SOL fixed input</strong></span>
-              </div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "1rem", marginTop: "0.35rem", color: "var(--text-muted)" }}>
-                <span>&bull; Rebound Filter: <strong style={{ color: "#34d399" }}>NONE (0)</strong></span>
-                <span>&bull; Sell-Volume Filter: <strong style={{ color: "#34d399" }}>NONE (0)</strong></span>
-                <span>&bull; Higher-Low Filter: <strong style={{ color: "#34d399" }}>NONE (0)</strong></span>
-                <span>&bull; Exits: <strong>+30% Net TP | -20% Net SL | 5m Timeout</strong></span>
-              </div>
-            </div>
-          </div>
-
-          {/* Paper Trading KPIs */}
-          <section className="kpi-grid">
-            <div className="kpi-card">
-              <div className="kpi-label">Open Positions</div>
-              <div className="kpi-value" style={{ color: "var(--accent-cyan)" }}>
-                {paperStats?.openPositions ?? 0}
-              </div>
-              <div className="kpi-sub">Triggered: {paperStats?.entriesTriggered ?? 0}</div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Closed Trades</div>
-              <div className="kpi-value">{paperStats?.closedPositions ?? 0}</div>
-              <div className="kpi-sub">
-                Censored: {paperStats?.censoredPositions ?? 0} | Migration: {paperStats?.unresolvedMigrationPositions ?? 0}
-              </div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Win Rate %</div>
-              <div className="kpi-value" style={{ color: (paperStats?.winRatePct ?? 0) >= 50 ? "#34d399" : "#f87171" }}>
-                {paperStats?.winRatePct ?? 0}%
-              </div>
-              <div className="kpi-sub">
-                {paperStats?.winningClosedTrades ?? 0}W / {paperStats?.losingClosedTrades ?? 0}L (Closed only)
-              </div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Net PnL (SOL)</div>
-              <div className={`kpi-value ${(paperStats?.netPnlSol ?? 0) >= 0 ? "pnl-pos" : "pnl-neg"}`}>
-                {(paperStats?.netPnlSol ?? 0) > 0 ? "+" : ""}
-                {paperStats?.netPnlSol ?? 0} SOL
-              </div>
-              <div className="kpi-sub">Gross: {paperStats?.grossPnlSol ?? 0} SOL</div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Total Protocol & Tx Fees</div>
-              <div className="kpi-value" style={{ color: "var(--accent-amber)" }}>
-                {(((paperStats?.totalPumpFeesSol ?? 0) + (paperStats?.totalTxCostsSol ?? 0))).toFixed(6)} SOL
-              </div>
-              <div className="kpi-sub">
-                Pump: {paperStats?.totalPumpFeesSol ?? 0} | Tx: {paperStats?.totalTxCostsSol ?? 0}
-              </div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Profit Factor / Hold</div>
-              <div className="kpi-value">{paperStats?.profitFactor ?? 0}</div>
-              <div className="kpi-sub">Avg Hold: {paperStats?.averageHoldSec ?? 0}s</div>
-            </div>
-          </section>
-
-          {/* Performance Breakdowns */}
-          <div className="breakdown-row">
-            <div className="section-card" style={{ marginBottom: 0 }}>
-              <h3 className="section-title" style={{ fontSize: "0.95rem", marginBottom: "0.75rem" }}>
-                PnL by Exit Reason
-              </h3>
-              <div style={{ fontSize: "0.85rem", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Take Profit (+30%):</span>
-                  <span className="pnl-pos">
-                    {paperStats?.pnlByExitReason?.takeProfit.count ?? 0} trades (
-                    {paperStats?.pnlByExitReason?.takeProfit.netPnlSol ?? 0} SOL)
-                  </span>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Stop Loss (-20%):</span>
-                  <span className="pnl-neg">
-                    {paperStats?.pnlByExitReason?.stopLoss.count ?? 0} trades (
-                    {paperStats?.pnlByExitReason?.stopLoss.netPnlSol ?? 0} SOL)
-                  </span>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Timeout (5m):</span>
-                  <span>
-                    {paperStats?.pnlByExitReason?.timeout.count ?? 0} trades (
-                    {paperStats?.pnlByExitReason?.timeout.netPnlSol ?? 0} SOL)
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="section-card" style={{ marginBottom: 0 }}>
-              <h3 className="section-title" style={{ fontSize: "0.95rem", marginBottom: "0.75rem" }}>
-                PnL by Token Age at Trigger
-              </h3>
-              <div style={{ fontSize: "0.85rem", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>5s – 15s:</span>
-                  <span>
-                    {paperStats?.pnlByTokenAgeBucket?.age5to15s.count ?? 0} trades (
-                    {paperStats?.pnlByTokenAgeBucket?.age5to15s.netPnlSol ?? 0} SOL)
-                  </span>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>15s – 60s:</span>
-                  <span>
-                    {paperStats?.pnlByTokenAgeBucket?.age15to60s.count ?? 0} trades (
-                    {paperStats?.pnlByTokenAgeBucket?.age15to60s.netPnlSol ?? 0} SOL)
-                  </span>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>60s+:</span>
-                  <span>
-                    {paperStats?.pnlByTokenAgeBucket?.age60sPlus.count ?? 0} trades (
-                    {paperStats?.pnlByTokenAgeBucket?.age60sPlus.netPnlSol ?? 0} SOL)
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="section-card" style={{ marginBottom: 0 }}>
-              <h3 className="section-title" style={{ fontSize: "0.95rem", marginBottom: "0.75rem" }}>
-                PnL by Speed to 50 SOL
-              </h3>
-              <div style={{ fontSize: "0.85rem", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Fast (&lt;10s):</span>
-                  <span>
-                    {paperStats?.pnlByOrganicSpeedBucket?.fastUnder10s.count ?? 0} trades (
-                    {paperStats?.pnlByOrganicSpeedBucket?.fastUnder10s.netPnlSol ?? 0} SOL)
-                  </span>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Medium (10s – 30s):</span>
-                  <span>
-                    {paperStats?.pnlByOrganicSpeedBucket?.medium10to30s.count ?? 0} trades (
-                    {paperStats?.pnlByOrganicSpeedBucket?.medium10to30s.netPnlSol ?? 0} SOL)
-                  </span>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Steady (30s+):</span>
-                  <span>
-                    {paperStats?.pnlByOrganicSpeedBucket?.steady30sPlus.count ?? 0} trades (
-                    {paperStats?.pnlByOrganicSpeedBucket?.steady30sPlus.netPnlSol ?? 0} SOL)
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Active Open Positions Table */}
-          <section className="section-card" style={{ marginTop: "1.5rem" }}>
-            <div className="section-header">
-              <h2 className="section-title">Live Active Open Positions</h2>
-              <span className="field-value field-mono" style={{ fontSize: "0.85rem" }}>
-                {paperStats?.activePositionsSummary?.length ?? 0} Active
-              </span>
-            </div>
-
-            <div className="table-container">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Mint</th>
-                    <th>Opened</th>
-                    <th>Token Age</th>
-                    <th>Entry Real SOL</th>
-                    <th>Unrealized Return %</th>
-                    <th>MFE %</th>
-                    <th>MAE %</th>
-                    <th>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {!paperStats?.activePositionsSummary || paperStats.activePositionsSummary.length === 0 ? (
-                    <tr>
-                      <td colSpan={8} style={{ textAlign: "center", color: "var(--text-muted)", padding: "2rem" }}>
-                        No paper positions currently open.
-                      </td>
-                    </tr>
-                  ) : (
-                    paperStats.activePositionsSummary.map((p) => (
-                      <tr key={p.mint}>
-                        <td className="field-mono">{shortenAddress(p.mint)}</td>
-                        <td>{new Date(p.openedAtIso).toLocaleTimeString()}</td>
-                        <td>{p.tokenAgeSec}s</td>
-                        <td className="field-mono">{p.currentRealSol.toFixed(2)} SOL</td>
-                        <td className={`field-mono ${p.unrealizedNetReturnPct >= 0 ? "pnl-pos" : "pnl-neg"}`}>
-                          {p.unrealizedNetReturnPct > 0 ? "+" : ""}
-                          {p.unrealizedNetReturnPct.toFixed(2)}%
-                        </td>
-                        <td className="field-mono pnl-pos">+{p.mfePct.toFixed(2)}%</td>
-                        <td className="field-mono pnl-neg">{p.maePct.toFixed(2)}%</td>
-                        <td>
-                          <span className="status-pill running" style={{ fontSize: "0.75rem", padding: "0.15rem 0.5rem" }}>
-                            {p.status}
-                          </span>
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </section>
-
-          {/* Recent Closed Trades Table */}
-          <section className="section-card">
-            <div className="section-header">
-              <h2 className="section-title">Recent Closed Paper Trades</h2>
-              <span className="field-value field-mono" style={{ fontSize: "0.85rem" }}>
-                {paperTradesList.length > 0 ? paperTradesList.length : paperStats?.recentClosedTrades?.length ?? 0} Closed
-              </span>
-            </div>
-
-            <div className="table-container">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Mint</th>
-                    <th>Hold</th>
-                    <th>Exit Reason</th>
-                    <th>Gross PnL</th>
-                    <th>Fees (Pump+Tx)</th>
-                    <th>Net PnL (SOL)</th>
-                    <th>Net Return %</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {!paperStats?.recentClosedTrades || paperStats.recentClosedTrades.length === 0 ? (
-                    <tr>
-                      <td colSpan={7} style={{ textAlign: "center", color: "var(--text-muted)", padding: "2rem" }}>
-                        No paper trades closed yet.
-                      </td>
-                    </tr>
-                  ) : (
-                    paperStats.recentClosedTrades.map((t, idx) => (
-                      <tr key={idx}>
-                        <td className="field-mono">{shortenAddress(t.mint)}</td>
-                        <td>{t.holdDurationSec}s</td>
-                        <td>
-                          <span
-                            className={`status-pill ${
-                              t.exitReason === "take-profit"
-                                ? "running"
-                                : t.exitReason === "stop-loss"
-                                  ? "failed"
-                                  : "queued"
-                            }`}
-                            style={{ fontSize: "0.75rem", padding: "0.15rem 0.5rem" }}
-                          >
-                            {t.exitReason}
-                          </span>
-                        </td>
-                        <td className="field-mono">{t.grossPnlSol.toFixed(6)} SOL</td>
-                        <td className="field-mono">{t.feesSol.toFixed(6)} SOL</td>
-                        <td className={`field-mono ${t.netPnlSol >= 0 ? "pnl-pos" : "pnl-neg"}`}>
-                          {t.netPnlSol > 0 ? "+" : ""}
-                          {t.netPnlSol.toFixed(6)} SOL
-                        </td>
-                        <td className={`field-mono ${t.netReturnPct >= 0 ? "pnl-pos" : "pnl-neg"}`}>
-                          {t.netReturnPct > 0 ? "+" : ""}
-                          {t.netReturnPct.toFixed(2)}%
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </section>
-        </>
-      )}
-
-      {/* TAB 4: MARKET PARTICIPANT INTELLIGENCE */}
-      {activeTab === "market" && (
-        <>
-          <div className="disclaimer-banner">
-            <div>
-              <strong>Methodology Notice:</strong> {marketStats?.disclaimer || "Session-scoped estimate. External transaction costs may be incomplete. Mid-session inventory is excluded from clean profitability metrics. Estimated curve trading PnL before Pump protocol fees and unobserved external transaction costs."}
-            </div>
-            <div style={{ marginTop: "0.35rem", fontSize: "0.775rem", color: "#f87171" }}>
-              <strong>Fee Coverage Disclaimer:</strong> {marketStats?.feeCoverageDisclaimer || "Estimated curve trading PnL before Pump protocol fees and unobserved external transaction costs."}
-            </div>
-          </div>
-
-          {/* Participant Cohort KPIs */}
-          <section className="kpi-grid">
-            <div className="kpi-card">
-              <div className="kpi-label">Observed Wallets</div>
-              <div className="kpi-value">{marketStats?.totalObservedWallets ?? 0}</div>
-              <div className="kpi-sub">
-                Clean: {marketStats?.cleanEligibleWallets ?? 0} | Partial: {marketStats?.partialWallets ?? 0}
-              </div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Clean Closed Trader Win Rate</div>
-              <div
-                className="kpi-value"
-                style={{
-                  color: (marketStats?.cleanClosedTraderWinRatePct ?? 0) >= 50 ? "#34d399" : "#f87171",
-                }}
-              >
-                {marketStats?.cleanClosedTraderWinRatePct ?? 0}%
-              </div>
-              <div className="kpi-sub">
-                N = {marketStats?.cleanClosedWalletCount ?? 0} eligible wallets ({marketStats?.cleanClosedWinningWalletCount ?? 0} winners)
-              </div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Clean Marked Positive PnL</div>
-              <div className="kpi-value" style={{ color: "var(--accent-cyan)" }}>
-                {marketStats?.cleanMarkedPositivePnlRatePct ?? 0}%
-              </div>
-              <div className="kpi-sub">
-                {marketStats?.cleanMarkedPositivePnlCount ?? 0} of {marketStats?.cleanMarkedWalletCount ?? 0} marked wallets
-              </div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Realized Distribution</div>
-              <div className="kpi-value" style={{ fontSize: "1.2rem" }}>
-                <span className="pnl-pos">{marketStats?.realizedProfitableCount ?? 0} Win</span> /{" "}
-                <span className="pnl-neg">{marketStats?.realizedLossCount ?? 0} Loss</span>
-              </div>
-              <div className="kpi-sub">Fully closed positions</div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Open Inventory State</div>
-              <div className="kpi-value" style={{ fontSize: "1.2rem" }}>
-                <span className="pnl-pos">{marketStats?.openProfitableCount ?? 0} Profit</span> /{" "}
-                <span className="pnl-neg">{marketStats?.openUnderwaterCount ?? 0} Under</span>
-              </div>
-              <div className="kpi-sub">Active token holders</div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="kpi-label">Clean Marked PnL (SOL)</div>
-              <div className={`kpi-value ${(marketStats?.totalCleanMarkedPnlSol ?? 0) >= 0 ? "pnl-pos" : "pnl-neg"}`}>
-                {(marketStats?.totalCleanMarkedPnlSol ?? 0) > 0 ? "+" : ""}
-                {marketStats?.totalCleanMarkedPnlSol ?? 0} SOL
-              </div>
-              <div className="kpi-sub">Realized: {marketStats?.totalCleanRealizedPnlSol ?? 0} SOL</div>
-            </div>
-          </section>
-
-          {/* Whale Concentration & Creator Extraction */}
-          <div className="breakdown-row">
-            {/* Whale Concentration */}
-            <div className="section-card" style={{ marginBottom: 0 }}>
-              <h3 className="section-title" style={{ fontSize: "1rem", marginBottom: "0.75rem" }}>
-                Whale & Concentration Intelligence
-              </h3>
-              <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-                <div>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem" }}>
-                    <span style={{ color: "var(--text-secondary)" }}>Top 1% Wallets Volume Share:</span>
-                    <strong className="field-mono">{marketStats?.top1PctWalletsSolVolumeSharePct ?? 0}%</strong>
-                  </div>
-                </div>
-                <div>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem" }}>
-                    <span style={{ color: "var(--text-secondary)" }}>Top 5 Wallets Buy Volume:</span>
-                    <strong className="field-mono">
-                      {marketStats?.top5WalletsBuyVolumeSol ?? 0} SOL ({marketStats?.top5WalletsBuyVolumeSharePct ?? 0}%)
-                    </strong>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Creator Analytics Summary */}
-            <div className="section-card" style={{ marginBottom: 0 }}>
-              <h3 className="section-title" style={{ fontSize: "1rem", marginBottom: "0.75rem" }}>
-                Observed Creator Net SOL Extraction
-              </h3>
-              <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem", fontSize: "0.85rem" }}>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Creators Clean / Partial:</span>
-                  <strong>
-                    {creatorStats?.cleanCreatorsCount ?? creatorStats?.creatorsObserved ?? 0} Clean / {creatorStats?.partialCreatorsCount ?? 0} Partial (Total: {creatorStats?.creatorsObserved ?? 0})
-                  </strong>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Selling / Clean Fully Exited:</span>
-                  <strong>
-                    {creatorStats?.creatorsSelling ?? 0} Selling / {creatorStats?.cleanCreatorsFullyExited ?? creatorStats?.creatorsFullyExited ?? 0} Fully Exited
-                  </strong>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Median First-Sell Delay:</span>
-                  <strong className="field-mono">
-                    {creatorStats?.medianCleanFirstSellDelaySec ?? creatorStats?.medianFirstSellDelaySec ?? 0}s (Clean) | {creatorStats?.medianFirstSellDelaySec ?? 0}s (All)
-                  </strong>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Total Net SOL Extracted:</span>
-                  <strong className="field-mono pnl-neg" style={{ color: "#f87171" }}>
-                    {creatorStats?.totalObservedCreatorExtractionSol ?? 0} SOL
-                  </strong>
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Extraction Percentiles (p50 / p90 / Max):</span>
-                  <span className="field-mono" style={{ fontSize: "0.8rem" }}>
-                    {creatorStats?.p50Sol ?? 0} / {creatorStats?.p90Sol ?? 0} / {creatorStats?.largestObservedExtractionSol ?? 0} SOL
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Top Clean Winners and Losers */}
-          <div className="breakdown-row" style={{ marginTop: "1.5rem" }}>
-            <div className="section-card" style={{ marginBottom: 0 }}>
-              <h3 className="section-title" style={{ fontSize: "0.95rem", color: "#34d399", marginBottom: "0.75rem" }}>
-                Top Clean Winning Wallets
-              </h3>
-              <div className="table-container">
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>Wallet</th>
-                      <th>Marked PnL</th>
-                      <th>Realized PnL</th>
-                      <th>Trades</th>
-                      <th>Mints</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {!marketStats?.topCleanWinners || marketStats.topCleanWinners.length === 0 ? (
-                      <tr>
-                        <td colSpan={5} style={{ textAlign: "center", color: "var(--text-muted)", padding: "1rem" }}>
-                          No clean winners observed.
-                        </td>
-                      </tr>
-                    ) : (
-                      marketStats.topCleanWinners.map((w, idx) => (
-                        <tr key={idx}>
-                          <td className="field-mono">{shortenAddress(w.wallet)}</td>
-                          <td className="field-mono pnl-pos">+{w.markedPnlSol.toFixed(4)} SOL</td>
-                          <td className="field-mono">+{w.realizedPnlSol.toFixed(4)} SOL</td>
-                          <td>{w.tradeCount}</td>
-                          <td>{w.mintsTraded}</td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            <div className="section-card" style={{ marginBottom: 0 }}>
-              <h3 className="section-title" style={{ fontSize: "0.95rem", color: "#f87171", marginBottom: "0.75rem" }}>
-                Top Clean Losing Wallets
-              </h3>
-              <div className="table-container">
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>Wallet</th>
-                      <th>Marked PnL</th>
-                      <th>Realized PnL</th>
-                      <th>Trades</th>
-                      <th>Mints</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {!marketStats?.topCleanLosers || marketStats.topCleanLosers.length === 0 ? (
-                      <tr>
-                        <td colSpan={5} style={{ textAlign: "center", color: "var(--text-muted)", padding: "1rem" }}>
-                          No clean losers observed.
-                        </td>
-                      </tr>
-                    ) : (
-                      marketStats.topCleanLosers.map((w, idx) => (
-                        <tr key={idx}>
-                          <td className="field-mono">{shortenAddress(w.wallet)}</td>
-                          <td className="field-mono pnl-neg">{w.markedPnlSol.toFixed(4)} SOL</td>
-                          <td className="field-mono">{w.realizedPnlSol.toFixed(4)} SOL</td>
-                          <td>{w.tradeCount}</td>
-                          <td>{w.mintsTraded}</td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-
-          {/* Top Creator Extractions Table */}
-          <section className="section-card" style={{ marginTop: "1.5rem" }}>
-            <div className="section-header">
-              <h2 className="section-title">Largest Observed Creator Extraction Events</h2>
-              <span className="field-value field-mono" style={{ fontSize: "0.85rem" }}>
-                {creatorStats?.topCreatorExtractions?.length ?? 0} Recorded
-              </span>
-            </div>
-
-            <div className="table-container">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Creator</th>
-                    <th>Mint</th>
-                    <th>Quality</th>
-                    <th>Net SOL Extracted</th>
-                    <th>First Sell Delay</th>
-                    <th>% Inventory Sold</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {!creatorStats?.topCreatorExtractions || creatorStats.topCreatorExtractions.length === 0 ? (
-                    <tr>
-                      <td colSpan={6} style={{ textAlign: "center", color: "var(--text-muted)", padding: "2rem" }}>
-                        No creator extraction events observed.
-                      </td>
-                    </tr>
-                  ) : (
-                    creatorStats.topCreatorExtractions.map((e, idx) => (
-                      <tr key={idx}>
-                        <td className="field-mono">{shortenAddress(e.creatorWallet)}</td>
-                        <td className="field-mono">{shortenAddress(e.mint)}</td>
-                        <td>
-                          <span
-                            className={`status-pill ${e.inventoryQuality === "CLEAN" ? "running" : "queued"}`}
-                            style={{ fontSize: "0.7rem", padding: "0.1rem 0.4rem" }}
-                          >
-                            {e.inventoryQuality || "CLEAN"}
-                          </span>
-                        </td>
-                        <td className="field-mono pnl-neg" style={{ color: "#f87171" }}>
-                          +{e.netExtractionSol.toFixed(4)} SOL
-                        </td>
-                        <td className="field-mono">{e.firstSellDelaySec}s</td>
-                        <td>{e.pctSold !== undefined ? `${e.pctSold.toFixed(1)}%` : "—"}</td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </section>
-        </>
-      )}
-
-      {/* Start Session Modal */}
+      {/* Start session modal */}
       {isModalOpen && (
         <div className="modal-overlay" onClick={() => setIsModalOpen(false)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
@@ -1620,8 +1786,9 @@ export default function App() {
             </div>
 
             <div className="warning-box">
-              <strong>Cost-Controlled Research Run:</strong> Spins up Cloud Run job, streams Pump.fun WebSocket
-              feed to chunked GCS storage, executes live causal paper trading, and aggregates participant analytics.
+              <strong>Cost-Controlled Research Run:</strong> Spins up Cloud Run job, streams
+              Pump.fun WebSocket feed to chunked GCS storage, executes live causal paper trading,
+              and aggregates participant analytics.
             </div>
 
             <label className="field-label">Target Duration</label>
@@ -1644,7 +1811,10 @@ export default function App() {
             </div>
 
             {startError && (
-              <div className="warning-box" style={{ borderColor: "rgba(239, 68, 68, 0.4)", color: "#fca5a5" }}>
+              <div
+                className="warning-box"
+                style={{ borderColor: "rgba(239,68,68,0.4)", color: "#fca5a5" }}
+              >
                 {startError}
               </div>
             )}
@@ -1653,15 +1823,20 @@ export default function App() {
               <button className="btn btn-secondary" onClick={() => setIsModalOpen(false)} disabled={isStarting}>
                 Cancel
               </button>
-              <button className="btn btn-primary" onClick={handleStartSession} disabled={isStarting} id="btn-modal-confirm-start">
-                {isStarting ? "Starting..." : "Launch Cloud Run Job"}
+              <button
+                className="btn btn-primary"
+                onClick={handleStartSession}
+                disabled={isStarting}
+                id="btn-modal-confirm-start"
+              >
+                {isStarting ? "Starting…" : "Launch Cloud Run Job"}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Token Modal */}
+      {/* Token modal */}
       {isTokenModalOpen && (
         <div className="modal-overlay" onClick={() => setIsTokenModalOpen(false)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
@@ -1673,8 +1848,8 @@ export default function App() {
             </div>
 
             <p style={{ color: "var(--text-secondary)", fontSize: "0.85rem", marginBottom: "1rem" }}>
-              Enter your Firebase ID token or Google ID token. This will be stored locally in your browser and sent
-              in the Authorization header to authenticated API endpoints.
+              Enter your Firebase ID token or Google ID token. Stored locally and sent in the
+              Authorization header to authenticated API endpoints.
             </p>
 
             <textarea
@@ -1689,10 +1864,11 @@ export default function App() {
                 fontFamily: "var(--font-mono)",
                 fontSize: "0.8rem",
                 marginBottom: "1rem",
+                resize: "vertical",
               }}
               value={tokenInput}
               onChange={(e) => setTokenInput(e.target.value)}
-              placeholder="eyJhbGciOiJSUzI1NiIs..."
+              placeholder="eyJhbGciOiJSUzI1NiIs…"
             />
 
             <div style={{ display: "flex", justifyContent: "flex-end", gap: "0.75rem" }}>
@@ -1714,10 +1890,14 @@ export default function App() {
         </div>
       )}
 
-      {/* Session Details Modal */}
+      {/* Session details modal */}
       {selectedSession && (
         <div className="modal-overlay" onClick={() => setSelectedSession(null)}>
-          <div className="modal-content" style={{ maxWidth: "600px" }} onClick={(e) => e.stopPropagation()}>
+          <div
+            className="modal-content"
+            style={{ maxWidth: "600px" }}
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="modal-header">
               <h3 className="modal-title">Session Details</h3>
               <button className="modal-close" onClick={() => setSelectedSession(null)}>
@@ -1725,59 +1905,37 @@ export default function App() {
               </button>
             </div>
 
-            <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem", fontSize: "0.875rem" }}>
-              <div>
-                <span className="field-label">Session ID</span>
-                <span className="field-value field-mono">{selectedSession.sessionId}</span>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem" }}>
-                <div>
-                  <span className="field-label">Status</span>
-                  <span className={`status-pill ${selectedSession.status}`}>{selectedSession.status}</span>
+            <div className="data-grid">
+              {[
+                ["Session ID", selectedSession.sessionId, true],
+                ["Status", selectedSession.status],
+                ["Duration", formatDuration(selectedSession.elapsedSec)],
+                ["Started At", new Date(selectedSession.startedAt).toLocaleString()],
+                ["Completed At", selectedSession.completedAt ? new Date(selectedSession.completedAt).toLocaleString() : "—"],
+                ["Total Events", selectedSession.totalEvents.toLocaleString()],
+                ["Launches", selectedSession.launchesDetected.toLocaleString()],
+                ["GCS Chunks", `${selectedSession.currentChunk} chunks`],
+                ["Total Size", formatBytes(selectedSession.bytesPersisted)],
+              ].map(([label, value, mono]) => (
+                <div key={label as string} className="data-row">
+                  <span className="field-label">{label}</span>
+                  <span className={`field-value${mono ? " field-mono" : ""}`}>{value}</span>
                 </div>
-                <div>
-                  <span className="field-label">Duration</span>
-                  <span className="field-value">{formatDuration(selectedSession.elapsedSec)}</span>
-                </div>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem" }}>
-                <div>
-                  <span className="field-label">Started At</span>
-                  <span className="field-value">{new Date(selectedSession.startedAt).toLocaleString()}</span>
-                </div>
-                <div>
-                  <span className="field-label">Completed At</span>
-                  <span className="field-value">
-                    {selectedSession.completedAt ? new Date(selectedSession.completedAt).toLocaleString() : "—"}
-                  </span>
-                </div>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem" }}>
-                <div>
-                  <span className="field-label">Total Events</span>
-                  <span className="field-value">{selectedSession.totalEvents.toLocaleString()}</span>
-                </div>
-                <div>
-                  <span className="field-label">Launches Detected</span>
-                  <span className="field-value">{selectedSession.launchesDetected.toLocaleString()}</span>
-                </div>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem" }}>
-                <div>
-                  <span className="field-label">GCS Chunks Persisted</span>
-                  <span className="field-value">{selectedSession.currentChunk} chunks</span>
-                </div>
-                <div>
-                  <span className="field-label">Total Size</span>
-                  <span className="field-value">{formatBytes(selectedSession.bytesPersisted)}</span>
-                </div>
-              </div>
-              {selectedSession.latestError && (
-                <div className="warning-box" style={{ borderColor: "rgba(239,68,68,0.4)", color: "#fca5a5" }}>
-                  <strong>Error:</strong> {selectedSession.latestError}
-                </div>
-              )}
+              ))}
             </div>
+
+            {selectedSession.latestError && (
+              <div
+                className="warning-box"
+                style={{
+                  marginTop: "1rem",
+                  borderColor: "rgba(239,68,68,0.4)",
+                  color: "#fca5a5",
+                }}
+              >
+                <strong>Error:</strong> {selectedSession.latestError}
+              </div>
+            )}
 
             <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "1.5rem" }}>
               <button className="btn btn-secondary" onClick={() => setSelectedSession(null)}>

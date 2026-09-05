@@ -418,7 +418,12 @@ export class FirestoreTelemetryReporter {
 
     if (this.latestPortfolioStats && this.backend.updatePortfolioStatsDoc) {
       try {
-        await this.backend.updatePortfolioStatsDoc(this.sessionId, this.latestPortfolioStats);
+        const safePortfolioStats = JSON.parse(
+          JSON.stringify(this.latestPortfolioStats, (_key, value: unknown) =>
+            typeof value === "bigint" ? value.toString() : value,
+          ),
+        ) as Record<string, unknown>;
+        await this.backend.updatePortfolioStatsDoc(this.sessionId, safePortfolioStats);
       } catch (err) {
         console.warn("[FirestoreTelemetryReporter] failed to update portfolios:", err);
       }
