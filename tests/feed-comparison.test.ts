@@ -138,11 +138,14 @@ function comparisonRaw(options: {
   readonly connectionEpoch?: number;
   readonly eventType?: "launch" | "trade";
   readonly malformedPayload?: boolean;
+  readonly truncatedLogs?: boolean;
 }): RawLogRecord {
+  const baseLogs = logsFor(options.eventType === "trade" ? tradeEventData() : createEventData());
+  const logs = options.truncatedLogs ? [...baseLogs, "Log truncated"] : baseLogs;
   const original = rawRecord({
     sequence: options.sequence,
     signature: options.signature,
-    logs: logsFor(options.eventType === "trade" ? tradeEventData() : createEventData()),
+    logs,
   });
   return {
     ...original,
@@ -385,4 +388,68 @@ test("requires comparison abort on child failure or early exit", () => {
   assert.equal(childExitRequiresAbort(1, BASE_UNIX_MS + 10_000, BASE_UNIX_MS + 20_000), true);
   assert.equal(childExitRequiresAbort(0, BASE_UNIX_MS + 10_000, BASE_UNIX_MS + 20_000), true);
   assert.equal(childExitRequiresAbort(0, BASE_UNIX_MS + 19_500, BASE_UNIX_MS + 20_000), false);
+});
+
+test("computes multi-window stability, truncation coverage, limits, and storage accounting", async () => {
+  const root = await mkdtemp(join(tmpdir(), "botwiner-windows-"));
+  try {
+    const sig1 = "1".repeat(88);
+    const sig2 = "2".repeat(88);
+    const sig3 = "3".repeat(88);
+    await Promise.all([
+      writeFeed(root, "public", [
+        comparisonRaw({ feedId: "public", processId: 101, sequence: 1, signature: sig1, monotonicNs: 2_005_000_000n, unixMs: BASE_UNIX_MS + 2_000 }),
+        comparisonRaw({ feedId: "public", processId: 101, sequence: 2, signature: sig2, monotonicNs: 2_015_000_000n, unixMs: BASE_UNIX_MS + 12_000 }),
+        comparisonRaw({ feedId: "public", processId: 101, sequence: 3, signature: sig3, monotonicNs: 2_025_000_000n, unixMs: BASE_UNIX_MS + 22_000 }),
+      ]),
+      writeFeed(root, "candidate", [
+        comparisonRaw({ feedId: "candidate", processId: 102, sequence: 1, signature: sig1, monotonicNs: 2_000_000_000n, unixMs: BASE_UNIX_MS + 2_000 }),
+        comparisonRaw({ feedId: "candidate", processId: 102, sequence: 2, signature: sig2, monotonicNs: 2_010_000_000n, unixMs: BASE_UNIX_MS + 12_000 }),
+        comparisonRaw({ feedId: "candidate", processId: 102, sequence: 3, signature: sig3, monotonicNs: 2_020_000_000n, unixMs: BASE_UNIX_MS + 22_000, truncatedLogs: true }),
+      ]),
+    ]);
+    const manifest: FeedComparisonManifest = {
+      ...comparisonManifest("windows-test"),
+      window: {
+        requestedStartUnixMs: BASE_UNIX_MS,
+        requestedEndUnixMs: BASE_UNIX_MS + 30_000,
+        durationSeconds: 30,
+        windowDurationSeconds: 10,
+      },
+    };
+    const report = await analyzeFeedComparison(root, manifest);
+    assert.equal(report.windows.length, 3);
+    assert.equal(report.windowStability.windowCount, 3);
+    assert.equal(report.windowStability.directionalConsistency, true);
+    assert.equal(report.windowStability.stabilityAssessment, "stable-candidate-lead");
+    assert.equal(report.windows[0]?.matchedSignatures, 1);
+    assert.equal(report.windows[1]?.matchedSignatures, 1);
+    assert.equal(report.windows[2]?.matchedSignatures, 1);
+
+    // Truncation aware coverage checks
+    assert.equal(report.truncationAwareCoverage.rawPayloadCompleteness.candidateLogTruncations, 1);
+    assert.equal(report.truncationAwareCoverage.rawPayloadCompleteness.unexplainedPayloadMismatches, 0);
+    assert.equal(report.truncationAwareCoverage.signatureCompleteness.matchedSignatures, 3);
+    assert.equal(report.truncationAwareCoverage.signatureCompleteness.candidateSignatureLossRate, 0);
+
+    // Storage accounting checks
+    assert.ok(report.storage.publicDatasetBytes > 0);
+    assert.ok(report.storage.candidateDatasetBytes > 0);
+    assert.ok(report.storage.projections.estimated15MinMegabytes > 0);
+    assert.ok(report.storage.assessment.includes("Storage consumption is"));
+
+    // Provider limits checks
+    assert.equal(report.providerLimits.candidate.endpointLabel, CANDIDATE_ENDPOINT_LABEL);
+    assert.ok(report.providerLimits.candidate.freePlanCreditTrackingNotice.includes("dashboard.helius.dev"));
+
+    // Markdown rendering
+    await writeFeedComparisonReports(root, report);
+    const md = await readFile(join(root, "feed-comparison-report.md"), "utf8");
+    assert.ok(md.includes("## Window stability"));
+    assert.ok(md.includes("## Truncation-aware event coverage"));
+    assert.ok(md.includes("## Provider limits & observability"));
+    assert.ok(md.includes("## Storage accounting & projections"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

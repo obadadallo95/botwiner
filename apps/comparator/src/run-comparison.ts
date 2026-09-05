@@ -32,6 +32,7 @@ interface CliOptions {
   readonly outputDirectory: string;
   readonly comparisonId: string;
   readonly durationSeconds: number;
+  readonly windowDurationSeconds: number;
   readonly tieToleranceMs: number;
 }
 
@@ -59,11 +60,12 @@ function usage(): string {
     "Usage: pnpm comparison:run [options]",
     "",
     "Options:",
-    "  --output <directory>          Parent comparison directory",
-    "  --comparison-id <id>          Stable sanitized comparison id",
-    "  --duration-seconds <seconds>  Simultaneous collection window (default: 300)",
-    "  --tie-tolerance-ms <ms>       First-arrival tie tolerance (default: 1)",
-    "  --help                        Show this help",
+    "  --output <directory>                   Parent comparison directory",
+    "  --comparison-id <id>                   Stable sanitized comparison id",
+    "  --duration-seconds <seconds>           Simultaneous collection window (default: 300)",
+    "  --window-duration-seconds <seconds>    Slice duration for stability windows (default: 300)",
+    "  --tie-tolerance-ms <ms>                First-arrival tie tolerance (default: 1)",
+    "  --help                                 Show this help",
   ].join("\n");
 }
 
@@ -81,6 +83,7 @@ function parseArguments(arguments_: readonly string[]): CliOptions | null {
   let comparisonId = defaultComparisonId();
   let outputDirectory: string | null = null;
   let durationSeconds = 300;
+  let windowDurationSeconds = 300;
   let tieToleranceMs = DEFAULT_TIE_TOLERANCE_MS;
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
@@ -100,6 +103,11 @@ function parseArguments(arguments_: readonly string[]): CliOptions | null {
       index += 1;
       continue;
     }
+    if (argument === "--window-duration-seconds") {
+      windowDurationSeconds = Number(requireNext(arguments_, index, argument));
+      index += 1;
+      continue;
+    }
     if (argument === "--tie-tolerance-ms") {
       tieToleranceMs = Number(requireNext(arguments_, index, argument));
       index += 1;
@@ -113,6 +121,9 @@ function parseArguments(arguments_: readonly string[]): CliOptions | null {
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
     throw new Error("duration must be a positive number of seconds");
   }
+  if (!Number.isFinite(windowDurationSeconds) || windowDurationSeconds <= 0) {
+    throw new Error("window duration must be a positive number of seconds");
+  }
   if (!Number.isFinite(tieToleranceMs) || tieToleranceMs < 0) {
     throw new Error("tie tolerance must be a non-negative number");
   }
@@ -120,6 +131,7 @@ function parseArguments(arguments_: readonly string[]): CliOptions | null {
     comparisonId,
     outputDirectory: outputDirectory ?? resolve("data", "comparisons", comparisonId),
     durationSeconds,
+    windowDurationSeconds,
     tieToleranceMs,
   };
 }
@@ -310,6 +322,7 @@ function initialManifest(options: CliOptions, baseline: OrchestratorBaseline): F
       requestedStartUnixMs: null,
       requestedEndUnixMs: null,
       durationSeconds: options.durationSeconds,
+      windowDurationSeconds: options.windowDurationSeconds,
     },
     orchestrator: {
       processId: process.pid,

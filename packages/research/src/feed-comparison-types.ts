@@ -51,6 +51,7 @@ export interface FeedComparisonManifest {
     readonly requestedStartUnixMs: number | null;
     readonly requestedEndUnixMs: number | null;
     readonly durationSeconds: number;
+    readonly windowDurationSeconds?: number;
   };
   readonly orchestrator: {
     readonly processId: number;
@@ -164,6 +165,146 @@ export interface DistributionSummary {
   readonly iqr: number | null;
 }
 
+export interface ComparisonWindowMetrics {
+  readonly windowIndex: number;
+  readonly label: string;
+  readonly startUnixMs: number;
+  readonly endUnixMs: number;
+  readonly durationSeconds: number;
+  readonly matchedSignatures: number;
+  readonly publicOnlySignatures: number;
+  readonly candidateOnlySignatures: number;
+  readonly unionSignatures: number;
+  readonly jaccard: number;
+  readonly cleanLatency: {
+    readonly count: number;
+    readonly p50: number | null;
+    readonly p95: number | null;
+    readonly p99: number | null;
+    readonly min: number | null;
+    readonly max: number | null;
+    readonly mean: number | null;
+    readonly standardDeviation: number | null;
+    readonly winner: {
+      readonly candidateFaster: number;
+      readonly publicFaster: number;
+      readonly ties: number;
+      readonly candidateFasterPercentage: number;
+      readonly publicFasterPercentage: number;
+      readonly tiePercentage: number;
+    };
+    readonly tails: {
+      readonly thresholdsMs: readonly number[];
+      readonly candidateLeadCounts: readonly number[];
+      readonly publicLeadCounts: readonly number[];
+    };
+  };
+  readonly disconnects: {
+    readonly public: number;
+    readonly candidate: number;
+  };
+  readonly reconnects: {
+    readonly public: number;
+    readonly candidate: number;
+  };
+  readonly duplicateNotificationRate: {
+    readonly public: number;
+    readonly candidate: number;
+  };
+  readonly parserErrors: {
+    readonly public: number;
+    readonly candidate: number;
+  };
+  readonly candidateLogTruncations: number;
+  readonly parserMismatchesWithLogTruncation: number;
+}
+
+export interface WindowStabilitySummary {
+  readonly windowCount: number;
+  readonly windowDurationSeconds: number;
+  readonly p50DeltasMs: readonly (number | null)[];
+  readonly p95DeltasMs: readonly (number | null)[];
+  readonly p99DeltasMs: readonly (number | null)[];
+  readonly candidateWinPercentages: readonly number[];
+  readonly publicWinPercentages: readonly number[];
+  readonly tiePercentages: readonly number[];
+  readonly directionalConsistency: boolean;
+  readonly p50SpreadMs: number | null;
+  readonly p95SpreadMs: number | null;
+  readonly truncationCounts: readonly number[];
+  readonly stabilityAssessment:
+    | "stable-candidate-lead"
+    | "variable-candidate-lead"
+    | "inconsistent-lead"
+    | "public-lead"
+    | "single-window-baseline";
+  readonly summary: string;
+}
+
+export interface TruncationAwareCoverageSection {
+  readonly signatureCompleteness: {
+    readonly matchedSignatures: number;
+    readonly publicOnlySignatures: number;
+    readonly candidateOnlySignatures: number;
+    readonly unionSignatures: number;
+    readonly jaccard: number;
+    readonly candidateSignatureLossRate: number;
+    readonly publicSignatureLossRate: number;
+    readonly interpretation: string;
+  };
+  readonly rawPayloadCompleteness: {
+    readonly matchedSignatures: number;
+    readonly identicalPayloadSignatures: number;
+    readonly payloadMismatchSignatures: number;
+    readonly candidateLogTruncations: number;
+    readonly publicLogTruncations: number;
+    readonly payloadMismatchesWithLogTruncation: number;
+    readonly unexplainedPayloadMismatches: number;
+    readonly candidatePayloadTruncationRate: number;
+    readonly interpretation: string;
+  };
+  readonly parsedPumpEventCompleteness: {
+    readonly publicNormalizedPumpEvents: number;
+    readonly candidateNormalizedPumpEvents: number;
+    readonly eventCountDelta: number;
+    readonly matchedSignaturesWithIdenticalPumpEvents: number;
+    readonly matchedSignaturesWithPumpEventMismatches: number;
+    readonly pumpEventMismatchesWithLogTruncation: number;
+    readonly unexplainedPumpEventMismatches: number;
+    readonly interpretation: string;
+  };
+}
+
+export interface ProviderLimitAudit {
+  readonly feedId: ComparisonFeedId;
+  readonly endpointLabel: string;
+  readonly subscriptionErrors: number;
+  readonly connectionErrors: number;
+  readonly disconnects: number;
+  readonly reconnects: number;
+  readonly rateLimitOrThrottleCount: number;
+  readonly abnormalGapsCount: number;
+  readonly longestObservedInterMessageGapMs: number | null;
+  readonly observedThrottleDiagnostics: readonly string[];
+  readonly freePlanCreditTrackingNotice: string;
+}
+
+export interface StorageAccountingSummary {
+  readonly publicDatasetBytes: number;
+  readonly candidateDatasetBytes: number;
+  readonly comparisonOutputBytes: number;
+  readonly totalBytes: number;
+  readonly totalMegabytes: number;
+  readonly elapsedMinutes: number;
+  readonly megabytesPerMinute: number;
+  readonly projections: {
+    readonly estimated15MinMegabytes: number;
+    readonly estimated30MinMegabytes: number;
+    readonly estimated120MinMegabytes: number;
+  };
+  readonly assessment: string;
+}
+
 export interface FeedComparisonReport {
   readonly schemaVersion: 1;
   readonly kind: "feed-comparison-report";
@@ -228,6 +369,14 @@ export interface FeedComparisonReport {
     readonly payloadMismatchesWithLogTruncation: number;
     readonly parserMismatchesWithLogTruncation: number;
   };
+  readonly windows: readonly ComparisonWindowMetrics[];
+  readonly windowStability: WindowStabilitySummary;
+  readonly truncationAwareCoverage: TruncationAwareCoverageSection;
+  readonly providerLimits: {
+    readonly public: ProviderLimitAudit;
+    readonly candidate: ProviderLimitAudit;
+  };
+  readonly storage: StorageAccountingSummary;
   readonly methodology: {
     readonly sameCommitment: boolean;
     readonly sameProgramFilter: boolean;
