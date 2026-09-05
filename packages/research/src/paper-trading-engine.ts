@@ -21,6 +21,102 @@ export const PAPER_CONFIG = {
   graduationSolThresholdLamports: 84_500_000_000n, // ~84.5 SOL
 } as const;
 
+export interface PaperStrategyDefinition {
+  readonly id: string;
+  readonly strategyId: string;
+  readonly thesis: string;
+  readonly name: string;
+  readonly description: string;
+  readonly entryRules: {
+    readonly sessionLaunchRequired: boolean;
+    readonly realSolThresholdSol: number;
+    readonly firstCrossingOnly: boolean;
+    readonly minTokenAgeMs: number;
+    readonly minObservedTrades: number;
+    readonly instantBundleFilter: string;
+    readonly reboundCondition: "none";
+    readonly sellVolumeFilter: "none";
+    readonly higherLowFilter: "none";
+  };
+  readonly entryTrigger: {
+    readonly launchObservedInSession: boolean;
+    readonly minRealSolLamports: bigint;
+    readonly minAgeMs: number;
+    readonly minTradeCount: number;
+    readonly disallowSameSlotBundle: boolean;
+    readonly hasReboundFilter: boolean;
+    readonly hasSellVolumeFilter: boolean;
+    readonly hasHigherLowFilter: boolean;
+  };
+  readonly sizing: {
+    readonly curveSolInputSol: number;
+    readonly curveSolInputLamports: string;
+  };
+  readonly costModel: {
+    readonly scenarioId: string;
+    readonly pumpFeeBps: number;
+    readonly baseTxFeeLamports: number;
+    readonly priorityTxFeeLamports: number;
+    readonly jitoTipLamports: number;
+  };
+  readonly exitRules: {
+    readonly tpNetReturnPct: number;
+    readonly slNetReturnPct: number;
+    readonly timeoutSec: number;
+    readonly migrationHandling: string;
+    readonly sessionBoundaryHandling: string;
+  };
+}
+
+export const PAPER_STRATEGY_DEFINITION: PaperStrategyDefinition = {
+  id: PAPER_STRATEGY_ID,
+  strategyId: PAPER_STRATEGY_ID,
+  thesis: "Graduation / Curve-Progress Momentum",
+  name: "Organic 50 SOL Continuation Strategy",
+  description:
+    "Causal curve-continuation strategy entering on the first organic crossing from <50 SOL to >=50 SOL real reserves for tokens launched in session. Sizing is fixed at 0.10 SOL with executable take-profit (+30% net), stop-loss (-20% net), and 5-minute timeout. No rebound condition, no sell-volume filter, and no higher-low condition.",
+  entryRules: {
+    sessionLaunchRequired: true,
+    realSolThresholdSol: Number(PAPER_CONFIG.crossingSolThresholdLamports) / 1e9,
+    firstCrossingOnly: true,
+    minTokenAgeMs: PAPER_CONFIG.minTokenAgeMs,
+    minObservedTrades: PAPER_CONFIG.minTradeCount,
+    instantBundleFilter: "age < 1500ms or single-slot bundled trades",
+    reboundCondition: "none",
+    sellVolumeFilter: "none",
+    higherLowFilter: "none",
+  },
+  entryTrigger: {
+    launchObservedInSession: true,
+    minRealSolLamports: PAPER_CONFIG.crossingSolThresholdLamports,
+    minAgeMs: PAPER_CONFIG.minTokenAgeMs,
+    minTradeCount: PAPER_CONFIG.minTradeCount,
+    disallowSameSlotBundle: true,
+    hasReboundFilter: false,
+    hasSellVolumeFilter: false,
+    hasHigherLowFilter: false,
+  },
+  sizing: {
+    curveSolInputSol: Number(PAPER_CONFIG.positionCurveSolInputLamports) / 1e9,
+    curveSolInputLamports: PAPER_CONFIG.positionCurveSolInputLamports.toString(),
+  },
+  costModel: {
+    scenarioId: PAPER_COST_SCENARIO_ID,
+    pumpFeeBps: Number(PAPER_CONFIG.pumpFeeBps),
+    baseTxFeeLamports: Number(PAPER_CONFIG.baseFeeLamportsPerTx),
+    priorityTxFeeLamports: Number(PAPER_CONFIG.priorityFeeLamportsPerTx),
+    jitoTipLamports: Number(PAPER_CONFIG.jitoTipLamportsPerTx),
+  },
+  exitRules: {
+    tpNetReturnPct: PAPER_CONFIG.tpNetReturnPct,
+    slNetReturnPct: PAPER_CONFIG.slNetReturnPct,
+    timeoutSec: Math.floor(PAPER_CONFIG.timeoutDurationMs / 1000),
+    migrationHandling: "liquidate at final curve state or mark migration-exit-unresolved",
+    sessionBoundaryHandling: "mark session-censored and exclude from closed PnL",
+  },
+} as const;
+
+
 export type PaperPositionStatus =
   | "open"
   | "take-profit"
@@ -91,6 +187,7 @@ export interface PaperPosition {
 export interface PaperTradingStats {
   readonly strategyId: string;
   readonly costScenarioId: string;
+  strategyDefinition?: PaperStrategyDefinition | undefined;
   entriesTriggered: number;
   openPositions: number;
   closedPositions: number;
@@ -799,8 +896,13 @@ export class PaperTradingEngine {
         },
       },
 
+      strategyDefinition: PAPER_STRATEGY_DEFINITION,
       activePositionsSummary,
       recentClosedTrades,
     };
+  }
+
+  public exportSummary(): PaperTradingStats {
+    return this.getStats();
   }
 }

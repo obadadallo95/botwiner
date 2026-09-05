@@ -26,7 +26,8 @@ export interface WalletMintAccounting {
   solReceivedLamports: bigint;
   realizedTradingCashFlowLamports: bigint; // solReceived - solSpent
 
-  costBasisLamportsPerToken: number; // Weighted-average cost basis
+  remainingCostBasisLamports: bigint; // Exact integer remaining cost basis
+  costBasisLamportsPerToken?: number | undefined; // Informational / display only
   realizedPnlLamports: bigint;
 
   // Mark to market
@@ -48,7 +49,8 @@ export interface CreatorTokenAnalytics {
   readonly mint: string;
   readonly creatorWallet: string;
   readonly launchTimestampUnixMs: number;
-  dataQuality: DataQualityState;
+  creatorInventoryQuality: DataQualityState;
+  dataQuality?: DataQualityState | undefined;
 
   tokenBuys: number;
   tokenSells: number;
@@ -61,15 +63,19 @@ export interface CreatorTokenAnalytics {
 
   firstSellTimestampUnixMs?: number | undefined;
   firstSellDelaySec?: number | undefined;
-  pctObservedInventorySold: number;
-  holdingStatus: "holding" | "partially-exited" | "fully-exited";
+  pctObservedInventorySold?: number | undefined;
+  holdingStatus: "holding" | "partially-exited" | "fully-exited" | "unknown-partial";
   lastActivityUnixMs: number;
 }
 
 export interface CreatorAggregateAnalytics {
   creatorsObserved: number;
+  cleanCreatorsCount: number;
+  partialCreatorsCount: number;
   creatorsSelling: number;
-  creatorsFullyExited: number;
+  cleanCreatorsFullyExited: number;
+  creatorsFullyExited: number; // Headline points to cleanCreatorsFullyExited
+  medianCleanFirstSellDelaySec: number;
   medianFirstSellDelaySec: number;
   totalObservedCreatorExtractionSol: number;
   medianObservedCreatorExtractionSol: number;
@@ -84,7 +90,8 @@ export interface CreatorAggregateAnalytics {
     mint: string;
     netExtractionSol: number;
     firstSellDelaySec: number;
-    pctSold: number;
+    pctSold?: number | undefined;
+    inventoryQuality: DataQualityState;
   }>;
 }
 
@@ -174,6 +181,7 @@ export class TraderPnlTracker {
         mint,
         creatorWallet: event.creatorWallet,
         launchTimestampUnixMs: nowMs,
+        creatorInventoryQuality: "CLEAN",
         dataQuality: "CLEAN",
         tokenBuys: 0,
         tokenSells: 0,
@@ -183,7 +191,7 @@ export class TraderPnlTracker {
         solSpentLamports: 0n,
         solReceivedLamports: 0n,
         observedNetSolExtractionLamports: 0n,
-        pctObservedInventorySold: 0,
+        pctObservedInventorySold: undefined,
         holdingStatus: "holding",
         lastActivityUnixMs: nowMs,
       });
@@ -268,6 +276,7 @@ export class TraderPnlTracker {
         solSpentLamports: 0n,
         solReceivedLamports: 0n,
         realizedTradingCashFlowLamports: 0n,
+        remainingCostBasisLamports: 0n,
         costBasisLamportsPerToken: 0,
         realizedPnlLamports: 0n,
         latestExecutableGrossSolLamports: 0n,
@@ -304,16 +313,14 @@ export class TraderPnlTracker {
       pos.tokenUnitsBought += tokenUnits;
       pos.solSpentLamports += solLamports;
 
-      // Weighted-Average Cost (WAC) update
-      const prevInventory = pos.inventoryUnits;
-      const newInventory = prevInventory + tokenUnits;
-      if (newInventory > 0n) {
-        const prevTotalCostLamports =
-          BigInt(Math.round(Number(prevInventory) * pos.costBasisLamportsPerToken));
-        const newTotalCostLamports = prevTotalCostLamports + solLamports;
-        pos.costBasisLamportsPerToken = Number(newTotalCostLamports) / Number(newInventory);
-      }
-      pos.inventoryUnits = newInventory;
+      // Exact integer Weighted-Average Cost basis (WAC)
+      pos.inventoryUnits += tokenUnits;
+      pos.remainingCostBasisLamports += solLamports;
+      pos.costBasisLamportsPerToken =
+        pos.inventoryUnits > 0n
+          ? Number(pos.remainingCostBasisLamports) / Number(pos.inventoryUnits)
+          : 0;
+
       if (pos.inventoryUnits > pos.peakInventoryUnits) {
         pos.peakInventoryUnits = pos.inventoryUnits;
       }
@@ -329,19 +336,43 @@ export class TraderPnlTracker {
           pos.qualityReason = "sold-more-tokens-than-observed-inventory";
           pos.classification = "unknown-partial";
         } else {
-          // Realize PnL on the sold units
-          const costOfSoldTokensLamports = BigInt(
-            Math.round(Number(tokenUnits) * pos.costBasisLamportsPerToken),
-          );
-          const gainOnSaleLamports = solLamports - costOfSoldTokensLamports;
+          const prevInventory = pos.inventoryUnits;
+          let realizedCostLamports = 0n;
+
+          if (tokenUnits === prevInventory) {
+            // Full close: all remaining cost basis is realized, remaining clears to exactly 0n
+            realizedCostLamports = pos.remainingCostBasisLamports;
+            pos.remainingCostBasisLamports = 0n;
+            pos.inventoryUnits = 0n;
+          } else {
+            // Partial sell: proportional basis with deterministic half-up integer rounding
+            realizedCostLamports =
+              ((pos.remainingCostBasisLamports * tokenUnits) + (prevInventory / 2n)) / prevInventory;
+            if (realizedCostLamports > pos.remainingCostBasisLamports) {
+              realizedCostLamports = pos.remainingCostBasisLamports;
+            }
+            pos.remainingCostBasisLamports -= realizedCostLamports;
+            pos.inventoryUnits -= tokenUnits;
+          }
+
+          const gainOnSaleLamports = solLamports - realizedCostLamports;
           pos.realizedPnlLamports += gainOnSaleLamports;
-          pos.inventoryUnits -= tokenUnits;
+          pos.costBasisLamportsPerToken =
+            pos.inventoryUnits > 0n
+              ? Number(pos.remainingCostBasisLamports) / Number(pos.inventoryUnits)
+              : 0;
         }
       } else {
         // Partial: track inventory change cautiously
         pos.inventoryUnits =
           pos.inventoryUnits >= tokenUnits ? pos.inventoryUnits - tokenUnits : 0n;
       }
+    }
+
+    // Invariants assertion
+    if (pos.inventoryUnits === 0n) {
+      pos.remainingCostBasisLamports = 0n;
+      pos.costBasisLamportsPerToken = 0;
     }
 
     pos.realizedTradingCashFlowLamports = pos.solReceivedLamports - pos.solSpentLamports;
@@ -415,9 +446,8 @@ export class TraderPnlTracker {
         : 0;
 
     if (pos.dataQuality === "CLEAN") {
-      const remainingCostLamports = BigInt(
-        Math.round(Number(pos.inventoryUnits) * pos.costBasisLamportsPerToken),
-      );
+      // Pure integer calculation using exact remainingCostBasisLamports
+      const remainingCostLamports = pos.remainingCostBasisLamports;
       pos.unrealizedPnlLamports = sellQuote.netWalletInflowLamports - remainingCostLamports;
       pos.totalMarkedPnlLamports = pos.realizedPnlLamports + pos.unrealizedPnlLamports;
 
@@ -449,6 +479,13 @@ export class TraderPnlTracker {
     } else {
       c.tokenSells += 1;
       c.creatorTokensSold += tokenUnits;
+
+      // Creator quality audit: if selling before any observed buy or selling more than bought, mark PARTIAL
+      if (c.creatorTokensBought === 0n || tokenUnits > c.creatorInventoryUnits) {
+        c.creatorInventoryQuality = "PARTIAL";
+        c.dataQuality = "PARTIAL";
+      }
+
       c.creatorInventoryUnits =
         c.creatorInventoryUnits >= tokenUnits ? c.creatorInventoryUnits - tokenUnits : 0n;
       c.solReceivedLamports += solLamports;
@@ -466,7 +503,8 @@ export class TraderPnlTracker {
       c.pctObservedInventorySold = Number(Math.min(100, Math.max(0, pct)).toFixed(2));
     }
 
-    if (c.creatorTokensSold > 0n && c.creatorInventoryUnits === 0n) {
+    // Only mark fully-exited if creator inventory quality is CLEAN
+    if (c.creatorInventoryQuality === "CLEAN" && c.creatorTokensSold > 0n && c.creatorInventoryUnits === 0n) {
       c.holdingStatus = "fully-exited";
     } else if (c.creatorTokensSold > 0n) {
       c.holdingStatus = "partially-exited";
@@ -677,9 +715,9 @@ export class TraderPnlTracker {
 
     return {
       disclaimer:
-        "Session-scoped estimate. External transaction costs may be incomplete. Mid-session inventory is excluded from clean profitability metrics.",
+        "Session-scoped estimate. External transaction costs may be incomplete. Mid-session inventory is excluded from clean profitability metrics. Estimated curve trading PnL before Pump protocol fees and unobserved external transaction costs.",
       feeCoverageDisclaimer:
-        "Estimated Trading PnL before unobserved external transaction costs (e.g. priority fees and Jito tips).",
+        "Estimated curve trading PnL before Pump protocol fees and unobserved external transaction costs.",
 
       totalObservedWallets: walletPnlSummary.size,
       cleanEligibleWallets,
@@ -726,22 +764,32 @@ export class TraderPnlTracker {
     const creators = Array.from(this.creatorPerMint.values());
     const creatorsObserved = creators.length;
 
+    let cleanCreatorsCount = 0;
+    let partialCreatorsCount = 0;
     let creatorsSelling = 0;
-    let creatorsFullyExited = 0;
+    let cleanCreatorsFullyExited = 0;
     let totalExtractionLamports = 0n;
     let maxExtractionLamports = 0n;
 
     const extractionsLamports: bigint[] = [];
     const sellDelaysSec: number[] = [];
+    const cleanSellDelaysSec: number[] = [];
     const topExtractions: Array<{
       creatorWallet: string;
       mint: string;
       netExtractionSol: number;
       firstSellDelaySec: number;
-      pctSold: number;
+      pctSold?: number | undefined;
+      inventoryQuality: DataQualityState;
     }> = [];
 
     for (const c of creators) {
+      if (c.creatorInventoryQuality === "CLEAN") {
+        cleanCreatorsCount += 1;
+      } else {
+        partialCreatorsCount += 1;
+      }
+
       const netSol = c.observedNetSolExtractionLamports;
       extractionsLamports.push(netSol);
 
@@ -756,10 +804,13 @@ export class TraderPnlTracker {
         creatorsSelling += 1;
         if (c.firstSellDelaySec !== undefined) {
           sellDelaysSec.push(c.firstSellDelaySec);
+          if (c.creatorInventoryQuality === "CLEAN") {
+            cleanSellDelaysSec.push(c.firstSellDelaySec);
+          }
         }
       }
-      if (c.holdingStatus === "fully-exited") {
-        creatorsFullyExited += 1;
+      if (c.creatorInventoryQuality === "CLEAN" && c.holdingStatus === "fully-exited") {
+        cleanCreatorsFullyExited += 1;
       }
 
       if (netSol > 0n) {
@@ -769,19 +820,22 @@ export class TraderPnlTracker {
           netExtractionSol: Number((Number(netSol) / 1e9).toFixed(4)),
           firstSellDelaySec: c.firstSellDelaySec ?? 0,
           pctSold: c.pctObservedInventorySold,
+          inventoryQuality: c.creatorInventoryQuality,
         });
       }
     }
 
-    sellDelaysSec.sort((a, b) => a - b);
-    let medianFirstSellDelaySec = 0;
-    if (sellDelaysSec.length > 0) {
-      const mid = Math.floor(sellDelaysSec.length / 2);
-      medianFirstSellDelaySec =
-        sellDelaysSec.length % 2 !== 0
-          ? sellDelaysSec[mid]!
-          : Math.round((sellDelaysSec[mid - 1]! + sellDelaysSec[mid]!) / 2);
-    }
+    const calcMedian = (arr: number[]): number => {
+      if (arr.length === 0) return 0;
+      const sorted = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2 !== 0
+        ? sorted[mid]!
+        : Math.round((sorted[mid - 1]! + sorted[mid]!) / 2);
+    };
+
+    const medianFirstSellDelaySec = calcMedian(sellDelaysSec);
+    const medianCleanFirstSellDelaySec = calcMedian(cleanSellDelaysSec);
 
     extractionsLamports.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     const count = extractionsLamports.length;
@@ -796,8 +850,12 @@ export class TraderPnlTracker {
 
     return {
       creatorsObserved,
+      cleanCreatorsCount,
+      partialCreatorsCount,
       creatorsSelling,
-      creatorsFullyExited,
+      cleanCreatorsFullyExited,
+      creatorsFullyExited: cleanCreatorsFullyExited,
+      medianCleanFirstSellDelaySec,
       medianFirstSellDelaySec,
       totalObservedCreatorExtractionSol: Number(
         (Number(totalExtractionLamports) / 1e9).toFixed(4),
@@ -812,6 +870,10 @@ export class TraderPnlTracker {
     };
   }
 
+  public exportSummary(): MarketParticipantStats {
+    return this.getStats();
+  }
+
   public getPosition(wallet: string, mint: string): WalletMintAccounting | undefined {
     return this.positions.get(`${wallet}:${mint}`);
   }
@@ -820,3 +882,4 @@ export class TraderPnlTracker {
     return this.creatorPerMint.get(mint);
   }
 }
+

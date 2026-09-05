@@ -434,3 +434,228 @@ test("TraderPnlTracker - Deterministic replay gives identical results", () => {
   const r2 = run();
   assert.deepEqual(r1, r2);
 });
+
+test("TraderPnlTracker - Safe with huge token quantities (> 2^53 units)", () => {
+  const tracker = new TraderPnlTracker();
+  const mint = "mintHuge";
+  const trader = "traderWhale";
+  tracker.onLaunch(createMockLaunch(mint, "creator1", 1000));
+
+  // 2^54 = 18_014_398_509_481_984n (> Number.MAX_SAFE_INTEGER 9_007_199_254_740_991)
+  const hugeUnits = 18_014_398_509_481_984n;
+  const buyCost = 50_000_000_000n; // 50 SOL
+
+  tracker.onTrade(
+    createMockTrade({
+      mint,
+      side: "buy",
+      realSolLamports: 50_000_000_000n,
+      solAmountLamports: buyCost,
+      tokenAmountUnits: hugeUnits,
+      trader,
+      timeMs: 2000,
+    }),
+  );
+
+  let pos = tracker.getPosition(trader, mint)!;
+  assert.equal(pos.inventoryUnits, hugeUnits);
+  assert.equal(pos.remainingCostBasisLamports, buyCost);
+
+  // Sell half: 2^53 units for 30 SOL
+  const halfUnits = hugeUnits / 2n;
+  const sellProceeds = 30_000_000_000n; // 30 SOL
+
+  tracker.onTrade(
+    createMockTrade({
+      mint,
+      side: "sell",
+      realSolLamports: 50_000_000_000n,
+      solAmountLamports: sellProceeds,
+      tokenAmountUnits: halfUnits,
+      trader,
+      timeMs: 4000,
+    }),
+  );
+
+  pos = tracker.getPosition(trader, mint)!;
+  assert.equal(pos.inventoryUnits, halfUnits);
+  assert.equal(pos.remainingCostBasisLamports, 25_000_000_000n); // exactly half basis
+  assert.equal(pos.realizedPnlLamports, 5_000_000_000n); // 30 - 25 = +5 SOL
+
+  // Sell remainder: full close
+  tracker.onTrade(
+    createMockTrade({
+      mint,
+      side: "sell",
+      realSolLamports: 50_000_000_000n,
+      solAmountLamports: 25_000_000_000n,
+      tokenAmountUnits: halfUnits,
+      trader,
+      timeMs: 6000,
+    }),
+  );
+
+  pos = tracker.getPosition(trader, mint)!;
+  assert.equal(pos.inventoryUnits, 0n);
+  assert.equal(pos.remainingCostBasisLamports, 0n);
+  assert.equal(pos.realizedPnlLamports, 5_000_000_000n);
+});
+
+test("TraderPnlTracker - Multi-step partial sells conserve exact integer basis without leakage", () => {
+  const tracker = new TraderPnlTracker();
+  const mint = "mintConserve";
+  const trader = "traderExact";
+  tracker.onLaunch(createMockLaunch(mint, "creator1", 1000));
+
+  // Buy 3 token units for 10 lamports total
+  tracker.onTrade(
+    createMockTrade({
+      mint,
+      side: "buy",
+      realSolLamports: 10_000_000_000n,
+      solAmountLamports: 10n,
+      tokenAmountUnits: 3n,
+      trader,
+      timeMs: 1000,
+    }),
+  );
+
+  // Sell 1: ((10 * 1) + 1) / 3 = 3 lamports cost
+  tracker.onTrade(
+    createMockTrade({
+      mint,
+      side: "sell",
+      realSolLamports: 10_000_000_000n,
+      solAmountLamports: 5n,
+      tokenAmountUnits: 1n,
+      trader,
+      timeMs: 2000,
+    }),
+  );
+  let pos = tracker.getPosition(trader, mint)!;
+  assert.equal(pos.remainingCostBasisLamports, 7n);
+  assert.equal(pos.inventoryUnits, 2n);
+  assert.equal(pos.realizedPnlLamports, 5n - 3n); // +2 lamports
+
+  // Sell 2: ((7 * 1) + 1) / 2 = 4 lamports cost
+  tracker.onTrade(
+    createMockTrade({
+      mint,
+      side: "sell",
+      realSolLamports: 10_000_000_000n,
+      solAmountLamports: 6n,
+      tokenAmountUnits: 1n,
+      trader,
+      timeMs: 3000,
+    }),
+  );
+  pos = tracker.getPosition(trader, mint)!;
+  assert.equal(pos.remainingCostBasisLamports, 3n);
+  assert.equal(pos.inventoryUnits, 1n);
+  assert.equal(pos.realizedPnlLamports, 2n + (6n - 4n)); // +4 lamports
+
+  // Sell 3: full close of last unit: cost is remainingCostBasisLamports (3n), remaining becomes 0n
+  tracker.onTrade(
+    createMockTrade({
+      mint,
+      side: "sell",
+      realSolLamports: 10_000_000_000n,
+      solAmountLamports: 4n,
+      tokenAmountUnits: 1n,
+      trader,
+      timeMs: 4000,
+    }),
+  );
+  pos = tracker.getPosition(trader, mint)!;
+  assert.equal(pos.remainingCostBasisLamports, 0n);
+  assert.equal(pos.inventoryUnits, 0n);
+  // Total sol received: 5 + 6 + 4 = 15 lamports. Total cost: 10 lamports. Net realized: +5 lamports.
+  assert.equal(pos.realizedPnlLamports, 5n);
+});
+
+test("TraderPnlTracker - Creator inventory quality: sell without buy marks PARTIAL and never fully-exited", () => {
+  const tracker = new TraderPnlTracker();
+  const mint = "mintPartialCreator";
+  const creator = "creatorUnobservedBuy";
+  tracker.onLaunch(createMockLaunch(mint, creator, 1000));
+
+  // Creator sells 100,000 tokens without an observed buy
+  tracker.onTrade(
+    createMockTrade({
+      mint,
+      side: "sell",
+      realSolLamports: 10_000_000_000n,
+      solAmountLamports: 5_000_000_000n,
+      tokenAmountUnits: 100_000n,
+      trader: creator,
+      creator,
+      timeMs: 2000,
+    }),
+  );
+
+  const c = tracker.getCreatorAnalytics(mint)!;
+  assert.equal(c.creatorInventoryQuality, "PARTIAL");
+  assert.notEqual(c.holdingStatus, "fully-exited");
+  assert.equal(c.holdingStatus, "partially-exited");
+
+  const stats = tracker.getStats();
+  assert.equal(stats.creatorAnalytics.cleanCreatorsCount, 0);
+  assert.equal(stats.creatorAnalytics.partialCreatorsCount, 1);
+  assert.equal(stats.creatorAnalytics.cleanCreatorsFullyExited, 0);
+  assert.equal(stats.creatorAnalytics.creatorsFullyExited, 0, "Headline fully-exited must count clean only");
+});
+
+test("TraderPnlTracker - Global wallet quality demotion if any position is PARTIAL or UNRESOLVED", () => {
+  const tracker = new TraderPnlTracker();
+  const trader = "traderMultiMint";
+
+  // Token 1: Clean profitable trade
+  const mint1 = "mint1";
+  tracker.onLaunch(createMockLaunch(mint1, "creator1", 1000));
+  tracker.onTrade(
+    createMockTrade({
+      mint: mint1,
+      side: "buy",
+      realSolLamports: 10_000_000_000n,
+      solAmountLamports: 1_000_000_000n,
+      tokenAmountUnits: 10_000n,
+      trader,
+      timeMs: 2000,
+    }),
+  );
+  tracker.onTrade(
+    createMockTrade({
+      mint: mint1,
+      side: "sell",
+      realSolLamports: 10_000_000_000n,
+      solAmountLamports: 2_000_000_000n,
+      tokenAmountUnits: 10_000n,
+      trader,
+      timeMs: 3000,
+    }),
+  );
+
+  let stats = tracker.getStats();
+  assert.equal(stats.cleanEligibleWallets, 1);
+  assert.equal(stats.partialWallets, 0);
+
+  // Token 2: Sells without prior buy -> marks position PARTIAL
+  const mint2 = "mint2";
+  tracker.onLaunch(createMockLaunch(mint2, "creator2", 1000));
+  tracker.onTrade(
+    createMockTrade({
+      mint: mint2,
+      side: "sell",
+      realSolLamports: 10_000_000_000n,
+      solAmountLamports: 1_000_000_000n,
+      tokenAmountUnits: 5_000n,
+      trader,
+      timeMs: 4000,
+    }),
+  );
+
+  stats = tracker.getStats();
+  assert.equal(stats.cleanEligibleWallets, 0, "Wallet must be demoted from CLEAN");
+  assert.equal(stats.partialWallets, 1);
+  assert.equal(stats.cleanClosedWalletCount, 0);
+});

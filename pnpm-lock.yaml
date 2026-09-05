@@ -146,9 +146,15 @@ importers:
       '@botwiner/pumpfun':
         specifier: workspace:*
         version: link:../../packages/pumpfun
+      '@botwiner/research':
+        specifier: workspace:*
+        version: link:../../packages/research
       '@botwiner/storage':
         specifier: workspace:*
         version: link:../../packages/storage
+      '@google-cloud/storage':
+        specifier: ^8.0.1
+        version: 8.0.1(supports-color@7.2.0)
 
   packages/market-data: {}
 

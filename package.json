@@ -20,6 +20,7 @@
     "filter:research": "node --import tsx apps/simulator/src/run-filters.ts",
     "pivot:audit": "node --import tsx apps/simulator/src/run-pivots.ts",
     "rebound:research": "node --import tsx apps/simulator/src/run-rebound.ts",
+    "research:replay-cloud": "node --import tsx apps/replay/src/replay-cloud.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "lint": "eslint .",

@@ -113,6 +113,23 @@ interface PaperTradingData {
     maePct: number;
     status: string;
   }>;
+  strategyDefinition?: {
+    id?: string;
+    strategyId?: string;
+    thesis?: string;
+    name?: string;
+    description?: string;
+    entryRules?: {
+      sessionLaunchRequired?: boolean;
+      realSolThresholdSol?: number;
+      firstCrossingOnly?: boolean;
+      minTokenAgeMs?: number;
+      minObservedTrades?: number;
+      reboundCondition?: string;
+      sellVolumeFilter?: string;
+      higherLowFilter?: string;
+    };
+  };
   recentClosedTrades?: Array<{
     mint: string;
     openedAtIso: string;
@@ -168,8 +185,12 @@ interface MarketParticipantData {
 
 interface CreatorAnalyticsData {
   creatorsObserved: number;
+  cleanCreatorsCount?: number;
+  partialCreatorsCount?: number;
   creatorsSelling: number;
+  cleanCreatorsFullyExited?: number;
   creatorsFullyExited: number;
+  medianCleanFirstSellDelaySec?: number;
   medianFirstSellDelaySec: number;
   totalObservedCreatorExtractionSol: number;
   medianObservedCreatorExtractionSol: number;
@@ -184,6 +205,7 @@ interface CreatorAnalyticsData {
     netExtractionSol: number;
     firstSellDelaySec: number;
     pctSold: number;
+    inventoryQuality?: string;
   }>;
 }
 
@@ -1002,6 +1024,33 @@ export default function App() {
             </div>
           </div>
 
+          {/* Canonical Strategy Specification */}
+          <div className="section-card" style={{ marginBottom: "1.25rem", background: "rgba(255, 255, 255, 0.02)", border: "1px solid rgba(255, 255, 255, 0.08)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem" }}>
+              <div style={{ fontWeight: 600, fontSize: "0.95rem", color: "var(--accent-cyan)" }}>
+                Strategy Specification: organic-50sol-continuation-v1
+              </div>
+              <span className="status-pill running" style={{ fontSize: "0.75rem", padding: "0.15rem 0.5rem" }}>
+                Frozen Rule
+              </span>
+            </div>
+            <div style={{ fontSize: "0.825rem", color: "var(--text-secondary)", lineHeight: 1.5 }}>
+              <div><strong>Thesis:</strong> Graduation / Curve-Progress Momentum (enters on first organic crossing from &lt;50 SOL to &ge;50 SOL real reserves for tokens launched in session).</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "1rem", marginTop: "0.35rem" }}>
+                <span>&bull; Min Age: <strong>&ge; 5s</strong></span>
+                <span>&bull; Min Trades: <strong>&ge; 5</strong></span>
+                <span>&bull; Instant Bundle: <strong>Disallowed (&lt;1.5s / same slot)</strong></span>
+                <span>&bull; Position Sizing: <strong>0.10 SOL fixed input</strong></span>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "1rem", marginTop: "0.35rem", color: "var(--text-muted)" }}>
+                <span>&bull; Rebound Filter: <strong style={{ color: "#34d399" }}>NONE (0)</strong></span>
+                <span>&bull; Sell-Volume Filter: <strong style={{ color: "#34d399" }}>NONE (0)</strong></span>
+                <span>&bull; Higher-Low Filter: <strong style={{ color: "#34d399" }}>NONE (0)</strong></span>
+                <span>&bull; Exits: <strong>+30% Net TP | -20% Net SL | 5m Timeout</strong></span>
+              </div>
+            </div>
+          </div>
+
           {/* Paper Trading KPIs */}
           <section className="kpi-grid">
             <div className="kpi-card">
@@ -1275,10 +1324,10 @@ export default function App() {
         <>
           <div className="disclaimer-banner">
             <div>
-              <strong>Methodology Notice:</strong> {marketStats?.disclaimer || "Session-scoped estimate. External transaction costs may be incomplete. Mid-session inventory is excluded from clean profitability metrics."}
+              <strong>Methodology Notice:</strong> {marketStats?.disclaimer || "Session-scoped estimate. External transaction costs may be incomplete. Mid-session inventory is excluded from clean profitability metrics. Estimated curve trading PnL before Pump protocol fees and unobserved external transaction costs."}
             </div>
-            <div style={{ marginTop: "0.35rem", fontSize: "0.775rem", color: "var(--text-muted)" }}>
-              {marketStats?.feeCoverageDisclaimer || "Estimated Trading PnL before unobserved external transaction costs (e.g. priority fees and Jito tips)."}
+            <div style={{ marginTop: "0.35rem", fontSize: "0.775rem", color: "#f87171" }}>
+              <strong>Fee Coverage Disclaimer:</strong> {marketStats?.feeCoverageDisclaimer || "Estimated curve trading PnL before Pump protocol fees and unobserved external transaction costs."}
             </div>
           </div>
 
@@ -1377,14 +1426,22 @@ export default function App() {
               </h3>
               <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem", fontSize: "0.85rem" }}>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span>Creators Observed / Selling / Exited:</span>
+                  <span>Creators Clean / Partial:</span>
                   <strong>
-                    {creatorStats?.creatorsObserved ?? 0} / {creatorStats?.creatorsSelling ?? 0} / {creatorStats?.creatorsFullyExited ?? 0}
+                    {creatorStats?.cleanCreatorsCount ?? creatorStats?.creatorsObserved ?? 0} Clean / {creatorStats?.partialCreatorsCount ?? 0} Partial (Total: {creatorStats?.creatorsObserved ?? 0})
+                  </strong>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span>Selling / Clean Fully Exited:</span>
+                  <strong>
+                    {creatorStats?.creatorsSelling ?? 0} Selling / {creatorStats?.cleanCreatorsFullyExited ?? creatorStats?.creatorsFullyExited ?? 0} Fully Exited
                   </strong>
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
                   <span>Median First-Sell Delay:</span>
-                  <strong className="field-mono">{creatorStats?.medianFirstSellDelaySec ?? 0}s</strong>
+                  <strong className="field-mono">
+                    {creatorStats?.medianCleanFirstSellDelaySec ?? creatorStats?.medianFirstSellDelaySec ?? 0}s (Clean) | {creatorStats?.medianFirstSellDelaySec ?? 0}s (All)
+                  </strong>
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
                   <span>Total Net SOL Extracted:</span>
@@ -1496,6 +1553,7 @@ export default function App() {
                   <tr>
                     <th>Creator</th>
                     <th>Mint</th>
+                    <th>Quality</th>
                     <th>Net SOL Extracted</th>
                     <th>First Sell Delay</th>
                     <th>% Inventory Sold</th>
@@ -1504,7 +1562,7 @@ export default function App() {
                 <tbody>
                   {!creatorStats?.topCreatorExtractions || creatorStats.topCreatorExtractions.length === 0 ? (
                     <tr>
-                      <td colSpan={5} style={{ textAlign: "center", color: "var(--text-muted)", padding: "2rem" }}>
+                      <td colSpan={6} style={{ textAlign: "center", color: "var(--text-muted)", padding: "2rem" }}>
                         No creator extraction events observed.
                       </td>
                     </tr>
@@ -1513,11 +1571,19 @@ export default function App() {
                       <tr key={idx}>
                         <td className="field-mono">{shortenAddress(e.creatorWallet)}</td>
                         <td className="field-mono">{shortenAddress(e.mint)}</td>
+                        <td>
+                          <span
+                            className={`status-pill ${e.inventoryQuality === "CLEAN" ? "running" : "queued"}`}
+                            style={{ fontSize: "0.7rem", padding: "0.1rem 0.4rem" }}
+                          >
+                            {e.inventoryQuality || "CLEAN"}
+                          </span>
+                        </td>
                         <td className="field-mono pnl-neg" style={{ color: "#f87171" }}>
                           +{e.netExtractionSol.toFixed(4)} SOL
                         </td>
                         <td className="field-mono">{e.firstSellDelaySec}s</td>
-                        <td>{e.pctSold.toFixed(1)}%</td>
+                        <td>{e.pctSold !== undefined ? `${e.pctSold.toFixed(1)}%` : "—"}</td>
                       </tr>
                     ))
                   )}

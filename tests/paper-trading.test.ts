@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   PaperTradingEngine,
+  PAPER_STRATEGY_DEFINITION,
 } from "../packages/research/src/paper-trading-engine.js";
 import type { LaunchMarketEvent, TradeMarketEvent } from "@botwiner/market-data";
 
@@ -470,4 +471,203 @@ test("PaperTradingEngine - Deterministic replay gives identical results", () => 
   const run2 = runSimulation();
 
   assert.deepEqual(run1, run2);
+});
+
+test("PaperTradingEngine - Canonical PAPER_STRATEGY_DEFINITION matches frozen rule", () => {
+  assert.equal(PAPER_STRATEGY_DEFINITION.strategyId, "organic-50sol-continuation-v1");
+  assert.equal(PAPER_STRATEGY_DEFINITION.thesis, "Graduation / Curve-Progress Momentum");
+  assert.equal(PAPER_STRATEGY_DEFINITION.entryTrigger.launchObservedInSession, true);
+  assert.equal(PAPER_STRATEGY_DEFINITION.entryTrigger.minRealSolLamports, 50_000_000_000n);
+  assert.equal(PAPER_STRATEGY_DEFINITION.entryTrigger.minAgeMs, 5000);
+  assert.equal(PAPER_STRATEGY_DEFINITION.entryTrigger.minTradeCount, 5);
+  assert.equal(PAPER_STRATEGY_DEFINITION.entryTrigger.disallowSameSlotBundle, true);
+  assert.equal(PAPER_STRATEGY_DEFINITION.entryTrigger.hasReboundFilter, false);
+  assert.equal(PAPER_STRATEGY_DEFINITION.entryTrigger.hasSellVolumeFilter, false);
+  assert.equal(PAPER_STRATEGY_DEFINITION.entryTrigger.hasHigherLowFilter, false);
+
+  const engine = new PaperTradingEngine();
+  const stats = engine.getStats();
+  assert.equal(stats.strategyId, "organic-50sol-continuation-v1");
+  assert.equal(stats.strategyDefinition?.strategyId, "organic-50sol-continuation-v1");
+});
+
+test("PaperTradingEngine - Boundary test: 4999ms age rejects entry, 5000ms age triggers entry", () => {
+  // Case A: 4999ms age -> Reject
+  const engineA = new PaperTradingEngine();
+  const mintA = "mint4999ms";
+  engineA.onLaunch(createMockLaunch(mintA, "creatorA", 1000));
+  for (let i = 1; i <= 4; i++) {
+    engineA.onTrade(
+      createMockTrade({
+        mint: mintA,
+        side: "buy",
+        realSolLamports: BigInt(i * 10_000_000_000),
+        timeMs: 1000 + i * 1000, // 2000, 3000, 4000, 5000
+        slot: 100 + i,
+      }),
+    );
+  }
+  // 5th trade crosses 50 SOL at t=5999 (age = 4999ms)
+  engineA.onTrade(
+    createMockTrade({
+      mint: mintA,
+      side: "buy",
+      realSolLamports: 50_100_000_000n,
+      timeMs: 5999,
+      slot: 105,
+    }),
+  );
+  assert.equal(engineA.getOpenPositions().length, 0);
+
+  // Case B: 5000ms age -> Trigger
+  const engineB = new PaperTradingEngine();
+  const mintB = "mint5000ms";
+  engineB.onLaunch(createMockLaunch(mintB, "creatorB", 1000));
+  for (let i = 1; i <= 4; i++) {
+    engineB.onTrade(
+      createMockTrade({
+        mint: mintB,
+        side: "buy",
+        realSolLamports: BigInt(i * 10_000_000_000),
+        timeMs: 1000 + i * 1000,
+        slot: 100 + i,
+      }),
+    );
+  }
+  // 5th trade crosses 50 SOL at t=6000 (age = 5000ms)
+  engineB.onTrade(
+    createMockTrade({
+      mint: mintB,
+      side: "buy",
+      realSolLamports: 50_100_000_000n,
+      timeMs: 6000,
+      slot: 105,
+    }),
+  );
+  assert.equal(engineB.getOpenPositions().length, 1);
+  assert.equal(engineB.getOpenPositions()[0]?.mint, mintB);
+});
+
+test("PaperTradingEngine - Boundary test: 4 trades rejects entry, 5 trades triggers entry", () => {
+  // Case A: 4 trades at t=7000 (age 6s >= 5s) -> Reject
+  const engineA = new PaperTradingEngine();
+  const mintA = "mint4Trades";
+  engineA.onLaunch(createMockLaunch(mintA, "creatorA", 1000));
+  for (let i = 1; i <= 3; i++) {
+    engineA.onTrade(
+      createMockTrade({
+        mint: mintA,
+        side: "buy",
+        realSolLamports: BigInt(i * 15_000_000_000),
+        timeMs: 1000 + i * 1500,
+        slot: 100 + i,
+      }),
+    );
+  }
+  // 4th trade crosses 50 SOL at t=7000
+  engineA.onTrade(
+    createMockTrade({
+      mint: mintA,
+      side: "buy",
+      realSolLamports: 50_500_000_000n,
+      timeMs: 7000,
+      slot: 104,
+    }),
+  );
+  assert.equal(engineA.getOpenPositions().length, 0);
+
+  // Case B: 5th trade crosses 50 SOL at t=7500 -> Trigger
+  const engineB = new PaperTradingEngine();
+  const mintB = "mint5Trades";
+  engineB.onLaunch(createMockLaunch(mintB, "creatorB", 1000));
+  for (let i = 1; i <= 4; i++) {
+    engineB.onTrade(
+      createMockTrade({
+        mint: mintB,
+        side: "buy",
+        realSolLamports: BigInt(i * 10_000_000_000),
+        timeMs: 1000 + i * 1500,
+        slot: 100 + i,
+      }),
+    );
+  }
+  // 5th trade crosses 50 SOL at t=7500
+  engineB.onTrade(
+    createMockTrade({
+      mint: mintB,
+      side: "buy",
+      realSolLamports: 50_500_000_000n,
+      timeMs: 7500,
+      slot: 105,
+    }),
+  );
+  assert.equal(engineB.getOpenPositions().length, 1);
+});
+
+test("PaperTradingEngine - Verified absence of rebound or sell volume filters", () => {
+  // Heavy selling (sell volume > 80% of buy volume) does NOT prevent entry
+  const engine = new PaperTradingEngine();
+  const mint = "mintHighSellVol";
+  engine.onLaunch(createMockLaunch(mint, "creator1", 1000));
+
+  // Trade 1: Buy to 30 SOL
+  engine.onTrade(
+    createMockTrade({
+      mint,
+      side: "buy",
+      realSolLamports: 30_000_000_000n,
+      solAmountLamports: 30_000_000_000n,
+      timeMs: 2000,
+      slot: 101,
+    }),
+  );
+  // Trade 2: Heavy sell down to 10 SOL (20 SOL sell volume)
+  engine.onTrade(
+    createMockTrade({
+      mint,
+      side: "sell",
+      realSolLamports: 10_000_000_000n,
+      solAmountLamports: 20_000_000_000n,
+      timeMs: 3000,
+      slot: 102,
+    }),
+  );
+  // Trade 3: Buy to 25 SOL
+  engine.onTrade(
+    createMockTrade({
+      mint,
+      side: "buy",
+      realSolLamports: 25_000_000_000n,
+      solAmountLamports: 15_000_000_000n,
+      timeMs: 4000,
+      slot: 103,
+    }),
+  );
+  // Trade 4: Sell to 15 SOL
+  engine.onTrade(
+    createMockTrade({
+      mint,
+      side: "sell",
+      realSolLamports: 15_000_000_000n,
+      solAmountLamports: 10_000_000_000n,
+      timeMs: 5000,
+      slot: 104,
+    }),
+  );
+  // Trade 5: Buy crossing 50 SOL (age = 7000ms >= 5000ms, trade count = 5)
+  // Total sell volume is 30 SOL vs 85 SOL buy (35% > 30%)
+  engine.onTrade(
+    createMockTrade({
+      mint,
+      side: "buy",
+      realSolLamports: 51_000_000_000n,
+      solAmountLamports: 36_000_000_000n,
+      timeMs: 8000,
+      slot: 105,
+    }),
+  );
+
+  // Position MUST open because organic-50sol-continuation-v1 has NO sell volume or rebound filter
+  assert.equal(engine.getOpenPositions().length, 1);
+  assert.equal(engine.getOpenPositions()[0]?.mint, mint);
 });
