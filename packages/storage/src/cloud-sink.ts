@@ -1,6 +1,12 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { Storage, type Bucket } from "@google-cloud/storage";
+
+export function generateCollisionResistantSessionId(prefix = "session", date = new Date()): string {
+  const dateStr = date.toISOString().replace(/[-:T]/g, "").slice(0, 14);
+  const entropy = randomBytes(4).toString("hex");
+  return `${prefix}-${dateStr}-${entropy}`;
+}
 import {
   createDiagnostic,
   jsonLine,

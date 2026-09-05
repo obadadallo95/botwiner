@@ -2,17 +2,59 @@ import express, { type Request, type Response, type NextFunction } from "express
 import cors from "cors";
 import admin from "firebase-admin";
 import { Firestore } from "@google-cloud/firestore";
-import { JobsClient } from "@google-cloud/run";
+import { JobsClient, ExecutionsClient } from "@google-cloud/run";
+import { generateCollisionResistantSessionId } from "@botwiner/storage";
 
 const app = express();
-app.use(cors());
+
+// Security Headers
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  next();
+});
+
+// Restricted CORS
+const ALLOWED_ORIGINS = new Set([
+  "https://example.invalid/your-dashboard",
+  "https://your-project-id.firebaseapp.com",
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "http://localhost:8080",
+  ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(",").map((s) => s.trim()) : []),
+]);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (e.g. curl, health probes, server-to-server)
+      if (!origin || ALLOWED_ORIGINS.has(origin)) {
+        callback(null, true);
+      } else {
+        callback(null, false);
+      }
+    },
+    credentials: true,
+  })
+);
+
 app.use(express.json());
 
 const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID ?? "your-gcp-project-id";
 const GCP_REGION = process.env.GCP_REGION ?? "europe-west3";
 const GCS_BUCKET = process.env.GCS_BUCKET ?? "your-gcs-bucket";
 const JOB_NAME = process.env.CLOUD_RUN_JOB_NAME ?? "pump-collector-runner";
-const OWNER_EMAIL = process.env.OWNER_EMAIL ?? "obada.dallo95@gmail.com";
+
+// Configuration for owner authorization - fail closed if not configured in production
+const OWNER_EMAIL = process.env.OWNER_EMAIL?.trim() || undefined;
+const OWNER_UID = process.env.OWNER_UID?.trim() || undefined;
+
+function parseBoolean(val: string | undefined): boolean {
+  return typeof val === "string" && val.trim().toLowerCase() === "true";
+}
+const DISABLE_AUTH = parseBoolean(process.env.DISABLE_AUTH);
 
 // Initialize Firebase Admin
 if (admin.apps.length === 0) {
@@ -26,11 +68,52 @@ const firestore = new Firestore({
 });
 
 const jobsClient = new JobsClient();
+const executionsClient = new ExecutionsClient();
 
-// Auth Middleware
+// Seed authorizedUsers collection with configured owner on boot
+async function seedAuthorizedOwner(): Promise<void> {
+  try {
+    const nowIso = new Date().toISOString();
+    if (OWNER_EMAIL) {
+      await firestore.collection("authorizedUsers").doc(OWNER_EMAIL).set(
+        {
+          role: "owner",
+          email: OWNER_EMAIL,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      console.log(`[API] Authorized owner email registered in Firestore: ${OWNER_EMAIL}`);
+    }
+    if (OWNER_UID) {
+      await firestore.collection("authorizedUsers").doc(OWNER_UID).set(
+        {
+          role: "owner",
+          uid: OWNER_UID,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      console.log(`[API] Authorized owner UID registered in Firestore: ${OWNER_UID}`);
+    }
+  } catch (error) {
+    console.warn("[API] Failed to seed authorizedUsers collection:", error);
+  }
+}
+void seedAuthorizedOwner();
+
+// Auth Middleware: requires valid Firebase ID token and verifies owner identity
 async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
-  if (process.env.DISABLE_AUTH === "true") {
+  if (DISABLE_AUTH) {
+    console.warn("[API] WARNING: Auth is disabled via DISABLE_AUTH=true");
     next();
+    return;
+  }
+
+  if (!OWNER_EMAIL && !OWNER_UID) {
+    res.status(503).json({
+      error: "Server authorization configuration missing: OWNER_EMAIL or OWNER_UID must be configured on the server.",
+    });
     return;
   }
 
@@ -40,82 +123,208 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
     return;
   }
 
-  const parts = authHeader.split("Bearer ");
-  const token = parts[1];
-  if (!token || token.trim().length === 0) {
+  const token = authHeader.slice("Bearer ".length).trim();
+  if (token.length === 0) {
     res.status(401).json({ error: "Missing or invalid Bearer token" });
     return;
   }
+
   try {
-    const decoded = await admin.auth().verifyIdToken(token.trim());
-    if (decoded.email && decoded.email !== OWNER_EMAIL && !process.env.ALLOW_ANY_EMAIL) {
-      res.status(403).json({ error: `Unauthorized email: ${decoded.email}` });
+    let decodedEmail: string | undefined;
+    let decodedUid: string | undefined;
+    let isOwnerClaim = false;
+
+    try {
+      const decoded = await admin.auth().verifyIdToken(token);
+      decodedEmail = decoded.email;
+      decodedUid = decoded.uid;
+      isOwnerClaim = decoded.owner === true;
+      (req as Request & { user?: admin.auth.DecodedIdToken }).user = decoded;
+    } catch (fbErr) {
+      // Fallback: verify standard Google ID token (from Google Sign-in or gcloud auth print-identity-token)
+      try {
+        const verifyResp = await fetch(
+          `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(token)}`
+        );
+        if (verifyResp.ok) {
+          const info = (await verifyResp.json()) as {
+            email?: string;
+            sub?: string;
+            email_verified?: string | boolean;
+          };
+          if (info.email_verified === "true" || info.email_verified === true) {
+            decodedEmail = info.email;
+            decodedUid = info.sub;
+          }
+        }
+      } catch {
+        // Ignore fallback error and report fbErr if neither worked
+      }
+
+      if (!decodedEmail && !decodedUid) {
+        throw fbErr;
+      }
+    }
+
+    const isOwner =
+      (OWNER_EMAIL !== undefined && decodedEmail === OWNER_EMAIL) ||
+      (OWNER_UID !== undefined && decodedUid === OWNER_UID) ||
+      isOwnerClaim;
+
+    if (!isOwner) {
+      res.status(403).json({
+        error: `Forbidden: caller (${decodedEmail ?? decodedUid}) is not an authorized owner.`,
+      });
       return;
     }
-    (req as Request & { user?: admin.auth.DecodedIdToken }).user = decoded;
+
     next();
   } catch (error) {
-    res.status(401).json({ error: "Invalid Firebase ID token", details: error instanceof Error ? error.message : String(error) });
+    res.status(401).json({
+      error: "Invalid ID token",
+      details: error instanceof Error ? error.message : String(error),
+    });
   }
-}
-
-interface SessionDocData {
-  lastHeartbeatAt?: string;
-  status?: string;
-  [key: string]: unknown;
 }
 
 interface StartSessionBody {
   durationSeconds?: number | string;
   mode?: string;
   provider?: string;
-  force?: boolean;
 }
 
 interface StopSessionBody {
   sessionId?: string;
 }
 
-// Health check endpoint
-app.get("/healthz", (_req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+// Public Minimal Health Check (no metadata or sensitive info)
+app.get(["/healthz", "/api/healthz", "/api/health"], (_req, res) => {
+  res.json({ status: "ok" });
 });
 
-// Check if any research session is actively running
-app.get("/api/sessions/status", async (_req, res) => {
+// Protected Session Status Check (requires auth)
+app.get("/api/sessions/status", requireAuth, async (_req, res) => {
   try {
-    const snapshot = await firestore
-      .collection("researchSessions")
-      .where("status", "in", ["running", "starting"])
-      .get();
-
+    const lockRef = firestore.collection("researchControl").doc("activeSession");
+    const lockDoc = await lockRef.get();
     const now = Date.now();
+    let active = false;
     let activeSession: Record<string, unknown> | null = null;
 
-    for (const doc of snapshot.docs) {
-      const data = doc.data() as SessionDocData;
-      const heartbeatMs = typeof data.lastHeartbeatAt === "string" ? new Date(data.lastHeartbeatAt).getTime() : 0;
-      // If heartbeat was received within the last 90 seconds, session is genuinely active
-      if (now - heartbeatMs < 90_000) {
-        activeSession = { id: doc.id, ...data };
-        break;
+    if (lockDoc.exists) {
+      const data = lockDoc.data() as {
+        sessionId?: string;
+        lastHeartbeatAt?: string;
+        startedAt?: string;
+        status?: string;
+        [key: string]: unknown;
+      };
+
+      if (data.status === "starting" || data.status === "running" || data.status === "reconnecting") {
+        const hbTime = data.lastHeartbeatAt ? new Date(data.lastHeartbeatAt).getTime() : 0;
+        const startTime = data.startedAt ? new Date(data.startedAt).getTime() : 0;
+        const recentTime = Math.max(hbTime, startTime);
+
+        if (now - recentTime < 90_000) {
+          active = true;
+          if (data.sessionId) {
+            const sDoc = await firestore.collection("researchSessions").doc(data.sessionId).get();
+            if (sDoc.exists) {
+              activeSession = { id: sDoc.id, ...sDoc.data() };
+            } else {
+              activeSession = data;
+            }
+          }
+        }
       }
     }
 
-    res.json({ active: activeSession !== null, activeSession });
+    res.json({ active, activeSession });
   } catch (error) {
-    res.status(500).json({ error: "Failed to check session status", details: error instanceof Error ? error.message : String(error) });
+    res.status(500).json({
+      error: "Failed to check session status",
+      details: error instanceof Error ? error.message : String(error),
+    });
   }
 });
 
-// Start research session
+// Protected Session History (requires auth)
+app.get("/api/sessions/history", requireAuth, async (_req, res) => {
+  try {
+    const snapshot = await firestore
+      .collection("researchSessions")
+      .orderBy("startedAt", "desc")
+      .limit(30)
+      .get();
+    const sessions = snapshot.docs.map((d) => ({ sessionId: d.id, ...d.data() }));
+    res.json({ sessions });
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to fetch sessions history",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+// Protected Live Graduation Stats (requires auth)
+app.get("/api/sessions/:sessionId/stats", requireAuth, async (req, res) => {
+  try {
+    const sessionId = typeof req.params.sessionId === "string" ? req.params.sessionId : undefined;
+    if (!sessionId) {
+      res.status(400).json({ error: "sessionId parameter is required" });
+      return;
+    }
+    const doc = await firestore
+      .collection("researchSessions")
+      .doc(sessionId)
+      .collection("stats")
+      .doc("current")
+      .get();
+    res.json({ stats: doc.exists ? doc.data() : null });
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to fetch session stats",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+// Protected Live Graduation Candidates (requires auth)
+app.get("/api/sessions/:sessionId/graduations", requireAuth, async (req, res) => {
+  try {
+    const sessionId = typeof req.params.sessionId === "string" ? req.params.sessionId : undefined;
+    if (!sessionId) {
+      res.status(400).json({ error: "sessionId parameter is required" });
+      return;
+    }
+    const snapshot = await firestore
+      .collection("researchSessions")
+      .doc(sessionId)
+      .collection("graduations")
+      .orderBy("realSolLamports", "desc")
+      .limit(30)
+      .get();
+    const graduations = snapshot.docs.map((d) => ({ mint: d.id, ...d.data() }));
+    res.json({ graduations });
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to fetch graduations",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+// Protected Start Session (with atomic concurrency lock)
 app.post("/api/sessions/start", requireAuth, async (req, res) => {
+  const sessionId = generateCollisionResistantSessionId("session");
+  const lockRef = firestore.collection("researchControl").doc("activeSession");
+  const sessionRef = firestore.collection("researchSessions").doc(sessionId);
+
   try {
     const body = req.body as StartSessionBody;
     const durationSeconds = body.durationSeconds ?? 3600;
     const mode = typeof body.mode === "string" ? body.mode : "graduation-research";
     const provider = typeof body.provider === "string" ? body.provider : "helius";
-    const force = Boolean(body.force);
 
     const dur = Number(durationSeconds);
     if (!Number.isFinite(dur) || dur < 60 || dur > 86400) {
@@ -123,122 +332,272 @@ app.post("/api/sessions/start", requireAuth, async (req, res) => {
       return;
     }
 
-    // 1. Concurrency check
-    if (!force) {
-      const activeQuery = await firestore
-        .collection("researchSessions")
-        .where("status", "in", ["running", "starting"])
-        .get();
+    const nowIso = new Date().toISOString();
 
+    // 1. Atomic Concurrency Lock Check via Firestore Transaction
+    await firestore.runTransaction(async (transaction) => {
+      const lockDoc = await transaction.get(lockRef);
       const now = Date.now();
-      for (const doc of activeQuery.docs) {
-        const data = doc.data() as SessionDocData;
-        const heartbeatMs = typeof data.lastHeartbeatAt === "string" ? new Date(data.lastHeartbeatAt).getTime() : 0;
-        if (now - heartbeatMs < 90_000) {
-          res.status(409).json({
-            error: "A research session is already active",
-            activeSessionId: doc.id,
-            lastHeartbeatAt: data.lastHeartbeatAt,
-            hint: "Pass { force: true } if you wish to override and launch concurrently",
-          });
-          return;
+
+      if (lockDoc.exists) {
+        const data = lockDoc.data() as {
+          sessionId?: string;
+          lastHeartbeatAt?: string;
+          startedAt?: string;
+          status?: string;
+        };
+
+        if (data.status === "starting" || data.status === "running" || data.status === "reconnecting") {
+          const hbTime = data.lastHeartbeatAt ? new Date(data.lastHeartbeatAt).getTime() : 0;
+          const startTime = data.startedAt ? new Date(data.startedAt).getTime() : 0;
+          const recentTime = Math.max(hbTime, startTime);
+
+          if (now - recentTime < 90_000) {
+            throw new Error(`ACTIVE_SESSION_EXISTS:${data.sessionId ?? "unknown"}`);
+          }
         }
       }
-    }
 
-    // 2. Generate Session ID
-    const dateStr = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
-    const sessionId = `session-${dateStr}`;
+      // Claim lock document
+      transaction.set(lockRef, {
+        sessionId,
+        startedAt: nowIso,
+        lastHeartbeatAt: nowIso,
+        status: "starting",
+        executionName: null,
+        operationName: null,
+      });
 
-    // 3. Pre-create session doc in Firestore
-    const nowIso = new Date().toISOString();
-    await firestore.collection("researchSessions").doc(sessionId).set({
-      sessionId,
-      mode,
-      status: "queued",
-      createdAt: nowIso,
-      startedAt: nowIso,
-      lastHeartbeatAt: nowIso,
-      completedAt: null,
-      requestedDurationSec: dur,
-      elapsedSec: 0,
-      provider,
-      region: GCP_REGION,
-      currentChunk: 1,
-      totalEvents: 0,
-      launchesDetected: 0,
-      tradesDetected: 0,
-      failedTxObserved: 0,
-      parserErrors: 0,
-      disconnectCount: 0,
-      reconnectCount: 0,
-      bytesPersisted: 0,
-      latestEventAt: null,
-      latestError: null,
+      // Create initial session document in same atomic transaction
+      transaction.set(sessionRef, {
+        sessionId,
+        mode,
+        status: "starting",
+        createdAt: nowIso,
+        startedAt: nowIso,
+        lastHeartbeatAt: nowIso,
+        completedAt: null,
+        requestedDurationSec: dur,
+        elapsedSec: 0,
+        provider,
+        region: GCP_REGION,
+        currentChunk: 1,
+        totalEvents: 0,
+        launchesDetected: 0,
+        tradesDetected: 0,
+        failedTxObserved: 0,
+        parserErrors: 0,
+        disconnectCount: 0,
+        reconnectCount: 0,
+        bytesPersisted: 0,
+        latestEventAt: null,
+        latestError: null,
+      });
     });
 
-    // 4. Trigger Cloud Run Job
+    // 2. Dispatch Cloud Run Job
     const jobFullName = `projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/jobs/${JOB_NAME}`;
     console.log(`[API] Dispatching Cloud Run Job ${jobFullName} for session ${sessionId} (${dur}s)`);
 
-    const [operation] = await jobsClient.runJob({
-      name: jobFullName,
-      overrides: {
-        containerOverrides: [
-          {
-            env: [
-              { name: "RESEARCH_SESSION_ID", value: sessionId },
-              { name: "RESEARCH_DURATION_SECONDS", value: String(dur) },
-              { name: "RESEARCH_MODE", value: mode },
-              { name: "GCS_BUCKET", value: GCS_BUCKET },
-              { name: "GCP_PROJECT_ID", value: GCP_PROJECT_ID },
-              { name: "GCP_REGION", value: GCP_REGION },
-              { name: "BOTWINER_FEED_PROVIDER", value: provider },
-              { name: "BOTWINER_SINK", value: "cloud" },
-            ],
-          },
-        ],
-      },
-    });
+    try {
+      const [operation] = await jobsClient.runJob({
+        name: jobFullName,
+        overrides: {
+          containerOverrides: [
+            {
+              env: [
+                { name: "RESEARCH_SESSION_ID", value: sessionId },
+                { name: "RESEARCH_DURATION_SECONDS", value: String(dur) },
+                { name: "RESEARCH_MODE", value: mode },
+                { name: "GCS_BUCKET", value: GCS_BUCKET },
+                { name: "GCP_PROJECT_ID", value: GCP_PROJECT_ID },
+                { name: "GCP_REGION", value: GCP_REGION },
+                { name: "BOTWINER_FEED_PROVIDER", value: provider },
+                { name: "BOTWINER_SINK", value: "cloud" },
+              ],
+            },
+          ],
+        },
+      });
 
-    res.json({
-      success: true,
-      sessionId,
-      status: "starting",
-      requestedDurationSec: dur,
-      operationName: operation.name,
-    });
+      const operationName = operation.name ?? null;
+      const executionName = operation.metadata?.name ?? null;
+
+      // Update session doc and lock with execution identity
+      await Promise.all([
+        sessionRef.update({
+          operationName,
+          executionName,
+        }),
+        lockRef.update({
+          operationName,
+          executionName,
+        }),
+      ]);
+
+      res.json({
+        success: true,
+        sessionId,
+        status: "starting",
+        requestedDurationSec: dur,
+        operationName,
+        executionName,
+      });
+    } catch (dispatchError) {
+      // Release lock on dispatch failure so system is not stuck
+      await lockRef.set(
+        {
+          status: "failed",
+          error: dispatchError instanceof Error ? dispatchError.message : String(dispatchError),
+          failedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+      await sessionRef.update({
+        status: "failed",
+        latestError: dispatchError instanceof Error ? dispatchError.message : String(dispatchError),
+        completedAt: new Date().toISOString(),
+      });
+      throw dispatchError;
+    }
   } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.startsWith("ACTIVE_SESSION_EXISTS:")) {
+      const activeId = msg.split(":")[1];
+      res.status(409).json({
+        error: "A research session is already active",
+        activeSessionId: activeId,
+      });
+      return;
+    }
+
     console.error("[API] Failed to start research session:", error);
-    res.status(500).json({ error: "Failed to dispatch research session", details: error instanceof Error ? error.message : String(error) });
+    res.status(500).json({
+      error: "Failed to dispatch research session",
+      details: msg,
+    });
   }
 });
 
-// Stop active research session
+// Protected Stop Session (Authenticates owner, cancels Cloud Run execution, waits for termination, releases lock)
 app.post("/api/sessions/stop", requireAuth, async (req, res) => {
   try {
     const body = req.body as StopSessionBody;
-    const sessionId = typeof body.sessionId === "string" ? body.sessionId : undefined;
+    const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : undefined;
     if (!sessionId) {
       res.status(400).json({ error: "sessionId is required" });
       return;
     }
 
-    const docRef = firestore.collection("researchSessions").doc(sessionId);
-    const doc = await docRef.get();
-    if (!doc.exists) {
+    const sessionRef = firestore.collection("researchSessions").doc(sessionId);
+    const sessionDoc = await sessionRef.get();
+    if (!sessionDoc.exists) {
       res.status(404).json({ error: `Session ${sessionId} not found` });
       return;
     }
 
-    await docRef.update({
-      status: "cancelled",
-      completedAt: new Date().toISOString(),
-    });
+    const sessionData = sessionDoc.data() as {
+      status?: string;
+      executionName?: string | null;
+      operationName?: string | null;
+      [key: string]: unknown;
+    };
 
-    res.json({ success: true, sessionId, status: "cancelled" });
+    if (sessionData.status === "completed" || sessionData.status === "cancelled" || sessionData.status === "failed") {
+      res.json({
+        success: true,
+        sessionId,
+        status: sessionData.status,
+        message: "Session is already finalized",
+      });
+      return;
+    }
+
+    const jobFullName = `projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/jobs/${JOB_NAME}`;
+    let targetExecutionName = sessionData.executionName ?? null;
+
+    // If executionName was not stored, resolve it from Cloud Run executions list
+    if (!targetExecutionName) {
+      try {
+        const [executions] = await executionsClient.listExecutions({ parent: jobFullName });
+        for (const ex of executions) {
+          const envs = ex.template?.containers?.[0]?.env ?? [];
+          const sessionEnv = envs.find((e) => e.name === "RESEARCH_SESSION_ID");
+          if (sessionEnv && sessionEnv.value === sessionId) {
+            targetExecutionName = ex.name ?? null;
+            break;
+          }
+        }
+      } catch (listErr) {
+        console.warn("[API] Failed to list executions to find target execution:", listErr);
+      }
+    }
+
+    // Cancel Cloud Run execution if located
+    if (targetExecutionName) {
+      console.log(`[API] Cancelling Cloud Run execution ${targetExecutionName} for session ${sessionId}`);
+      try {
+        await executionsClient.cancelExecution({ name: targetExecutionName });
+
+        // Wait up to 12 seconds for Cloud Run execution to observe cancellation/termination
+        const waitStart = Date.now();
+        while (Date.now() - waitStart < 12_000) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          try {
+            const [ex] = await executionsClient.getExecution({ name: targetExecutionName });
+            const completedCondition = ex.conditions?.find((c) => c.type === "Completed");
+            const isFinished = Boolean(
+              ex.completionTime ||
+              ex.deleteTime ||
+              (completedCondition && (completedCondition.state === "CONDITION_SUCCEEDED" || completedCondition.state === "CONDITION_FAILED")) ||
+              (ex.runningCount !== null && ex.runningCount !== undefined && ex.runningCount === 0 && !ex.reconciling)
+            );
+            if (isFinished) {
+              console.log(`[API] Execution ${targetExecutionName} confirmed stopped/cancelled`);
+              break;
+            }
+          } catch {
+            break;
+          }
+        }
+      } catch (cancelError) {
+        console.warn(`[API] cancelExecution returned warning/error for ${targetExecutionName}:`, cancelError);
+      }
+    } else {
+      console.warn(`[API] Could not resolve execution name for session ${sessionId}, updating state directly`);
+    }
+
+    const nowIso = new Date().toISOString();
+
+    // Release active lock and update session doc
+    const lockRef = firestore.collection("researchControl").doc("activeSession");
+    await Promise.all([
+      sessionRef.update({
+        status: "cancelled",
+        completedAt: nowIso,
+      }),
+      lockRef.set(
+        {
+          sessionId,
+          status: "cancelled",
+          cancelledAt: nowIso,
+        },
+        { merge: true }
+      ),
+    ]);
+
+    res.json({
+      success: true,
+      sessionId,
+      status: "cancelled",
+      executionName: targetExecutionName,
+    });
   } catch (error) {
-    res.status(500).json({ error: "Failed to stop session", details: error instanceof Error ? error.message : String(error) });
+    console.error("[API] Failed to stop session:", error);
+    res.status(500).json({
+      error: "Failed to stop session",
+      details: error instanceof Error ? error.message : String(error),
+    });
   }
 });
 

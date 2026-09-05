@@ -40,6 +40,8 @@ export interface FirestoreBackend {
   setSessionDoc(sessionId: string, data: Partial<ResearchSessionDocument>): Promise<void>;
   updateStatsDoc(sessionId: string, stats: GraduationSummaryCounters): Promise<void>;
   setGraduationCandidate(sessionId: string, mint: string, candidate: Record<string, unknown>): Promise<void>;
+  updateActiveLock?(sessionId: string, data: { heartbeatAt: string; status?: string }): Promise<void>;
+  releaseActiveLock?(sessionId: string): Promise<void>;
 }
 
 export class GoogleFirestoreBackend implements FirestoreBackend {
@@ -66,6 +68,19 @@ export class GoogleFirestoreBackend implements FirestoreBackend {
   public async setGraduationCandidate(sessionId: string, mint: string, candidate: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("graduations").doc(mint);
     await docRef.set(candidate, { merge: true });
+  }
+
+  public async updateActiveLock(sessionId: string, data: { heartbeatAt: string; status?: string }): Promise<void> {
+    const lockRef = this.db.collection("researchControl").doc("activeSession");
+    await lockRef.set({ sessionId, ...data }, { merge: true });
+  }
+
+  public async releaseActiveLock(sessionId: string): Promise<void> {
+    const lockRef = this.db.collection("researchControl").doc("activeSession");
+    const doc = await lockRef.get();
+    if (doc.exists && doc.data()?.sessionId === sessionId) {
+      await lockRef.set({ status: "released", releasedAt: new Date().toISOString() }, { merge: true });
+    }
   }
 }
 
@@ -242,6 +257,9 @@ export class FirestoreTelemetryReporter {
 
     try {
       await this.backend.setSessionDoc(this.sessionId, finalDoc);
+      if (this.backend.releaseActiveLock) {
+        await this.backend.releaseActiveLock(this.sessionId);
+      }
     } catch (err) {
       console.warn("[FirestoreTelemetryReporter] failed to write final session doc:", err);
     }
@@ -292,6 +310,9 @@ export class FirestoreTelemetryReporter {
 
     try {
       await this.backend.setSessionDoc(this.sessionId, partial);
+      if (this.backend.updateActiveLock) {
+        await this.backend.updateActiveLock(this.sessionId, { heartbeatAt: nowIso, status: this.status });
+      }
     } catch (err) {
       console.warn("[FirestoreTelemetryReporter] failed to update heartbeat:", err);
     }

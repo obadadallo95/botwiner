@@ -1,19 +1,41 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // Helper function to verify caller is authenticated and authorized owner
+    function isOwner() {
+      return request.auth != null && (
+        request.auth.token.owner == true ||
+        exists(/databases/$(database)/documents/authorizedUsers/$(request.auth.uid)) ||
+        (request.auth.token.email != null && exists(/databases/$(database)/documents/authorizedUsers/$(request.auth.token.email)))
+      );
+    }
+
+    // Research sessions: protected reads for owner only, no client writes
     match /researchSessions/{sessionId} {
-      allow read: if true;
+      allow read: if isOwner();
       allow write: if false;
 
       match /stats/{statId} {
-        allow read: if true;
+        allow read: if isOwner();
         allow write: if false;
       }
 
       match /graduations/{mint} {
-        allow read: if true;
+        allow read: if isOwner();
         allow write: if false;
       }
+    }
+
+    // Authorized users list: protected reads for owner only, no client writes
+    match /authorizedUsers/{userId} {
+      allow read: if isOwner();
+      allow write: if false;
+    }
+
+    // Active session control and lock: protected reads for owner only, no client writes
+    match /researchControl/{docId} {
+      allow read: if isOwner();
+      allow write: if false;
     }
   }
 }

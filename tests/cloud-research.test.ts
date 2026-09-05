@@ -11,6 +11,7 @@ import {
 } from "@botwiner/research";
 import {
   CloudResearchSink,
+  generateCollisionResistantSessionId,
   type CloudStorageUploader,
   type CloudDatasetManifest,
 } from "@botwiner/storage";
@@ -29,6 +30,7 @@ class MockFirestoreBackend implements FirestoreBackend {
   public sessionDoc: Partial<ResearchSessionDocument> = {};
   public statsDoc: GraduationSummaryCounters | null = null;
   public candidates = new Map<string, Record<string, unknown>>();
+  public activeLocks = new Map<string, Record<string, unknown>>();
   public shouldFail = false;
 
   public setSessionDoc(_sessionId: string, data: Partial<ResearchSessionDocument>): Promise<void> {
@@ -46,6 +48,21 @@ class MockFirestoreBackend implements FirestoreBackend {
   public setGraduationCandidate(_sessionId: string, mint: string, candidate: Record<string, unknown>): Promise<void> {
     if (this.shouldFail) return Promise.reject(new Error("simulated firestore candidate error"));
     this.candidates.set(mint, candidate);
+    return Promise.resolve();
+  }
+
+  public updateActiveLock(sessionId: string, data: { heartbeatAt: string; status?: string }): Promise<void> {
+    if (this.shouldFail) return Promise.reject(new Error("simulated lock error"));
+    this.activeLocks.set("activeSession", { sessionId, ...data });
+    return Promise.resolve();
+  }
+
+  public releaseActiveLock(sessionId: string): Promise<void> {
+    if (this.shouldFail) return Promise.reject(new Error("simulated lock error"));
+    const current = this.activeLocks.get("activeSession");
+    if (current && current.sessionId === sessionId) {
+      this.activeLocks.set("activeSession", { sessionId, status: "released" });
+    }
     return Promise.resolve();
   }
 }
@@ -368,4 +385,24 @@ test("FirestoreTelemetryReporter: handles heartbeat, throttled stats, and resili
   await reporter.close("completed");
   assert.equal(backend.sessionDoc.status, "completed");
   assert.ok(backend.sessionDoc.completedAt);
+  assert.equal(backend.activeLocks.get("activeSession")?.status, "released");
+});
+
+test("generateCollisionResistantSessionId produces collision-resistant, well-formatted IDs", () => {
+  const sample = generateCollisionResistantSessionId();
+  // format: session-YYYYMMDDHHMMSS-<8 hex chars>
+  const match = /^session-\d{14}-[a-f0-9]{8}$/.exec(sample);
+  assert.ok(match, `ID "${sample}" should match session timestamp format`);
+
+  // Custom prefix support
+  const custom = generateCollisionResistantSessionId("custom-test");
+  assert.ok(custom.startsWith("custom-test-"), `ID "${custom}" should start with prefix`);
+
+  // Uniqueness across 1,000 rapid iterations
+  const ids = new Set<string>();
+  const count = 1000;
+  for (let i = 0; i < count; i += 1) {
+    ids.add(generateCollisionResistantSessionId());
+  }
+  assert.equal(ids.size, count, "1,000 generated session IDs must all be unique");
 });

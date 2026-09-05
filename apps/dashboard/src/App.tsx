@@ -78,7 +78,25 @@ export default function App() {
   const [selectedDuration, setSelectedDuration] = useState(3600); // 1 hour default
   const [isStarting, setIsStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
-  const [forceOverride, setForceOverride] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const [stopError, setStopError] = useState<string | null>(null);
+
+  // Custom token auth state (for owner identity/bearer token)
+  const [authToken, setAuthToken] = useState<string>(() => localStorage.getItem("botwiner_token") || "");
+  const [isTokenModalOpen, setIsTokenModalOpen] = useState(false);
+  const [tokenInput, setTokenInput] = useState("");
+
+  const getEffectiveToken = async (): Promise<string> => {
+    if (user) {
+      try {
+        const idTok = await user.getIdToken();
+        if (idTok) return idTok;
+      } catch {
+        // fallback
+      }
+    }
+    return authToken;
+  };
 
   // Auth listener
   useEffect(() => {
@@ -87,7 +105,72 @@ export default function App() {
     });
   }, []);
 
-  // Listen to active sessions and session history
+  // Polling fallback to authenticated API endpoints when token is present
+  useEffect(() => {
+    let isMounted = true;
+
+    const pollApi = async () => {
+      const token = await getEffectiveToken();
+      if (!token) return;
+
+      try {
+        // Fetch session status
+        const statusRes = await fetch("/api/sessions/status", {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (statusRes.ok) {
+          const sData = (await statusRes.json()) as { activeSession?: ResearchSession | null };
+          if (isMounted && sData.activeSession) {
+            setActiveSession(sData.activeSession);
+          }
+        }
+
+        // Fetch sessions history
+        const historyRes = await fetch("/api/sessions/history", {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (historyRes.ok) {
+          const hData = (await historyRes.json()) as { sessions?: ResearchSession[] };
+          if (isMounted && Array.isArray(hData.sessions)) {
+            setSessionsHistory(hData.sessions);
+          }
+        }
+
+        // If active session exists, fetch live stats & graduations
+        if (activeSession) {
+          const statsRes = await fetch(`/api/sessions/${activeSession.sessionId}/stats`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (statsRes.ok) {
+            const stData = (await statsRes.json()) as { stats?: GraduationStats | null };
+            if (isMounted && stData.stats) setGradStats(stData.stats);
+          }
+
+          const gradsRes = await fetch(`/api/sessions/${activeSession.sessionId}/graduations`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (gradsRes.ok) {
+            const gData = (await gradsRes.json()) as { graduations?: GraduationCandidate[] };
+            if (isMounted && Array.isArray(gData.graduations)) setCandidates(gData.graduations);
+          }
+        }
+      } catch (err) {
+        console.warn("API poll warning:", err);
+      }
+    };
+
+    void pollApi();
+    const timer = setInterval(() => {
+      void pollApi();
+    }, 4000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(timer);
+    };
+  }, [authToken, user, activeSession?.sessionId]);
+
+  // Listen to active sessions and session history via Firestore SDK
   useEffect(() => {
     const sessionsRef = collection(db, "researchSessions");
     const q = query(sessionsRef, orderBy("startedAt", "desc"), limit(20));
@@ -106,7 +189,8 @@ export default function App() {
         setActiveSession(active || null);
       },
       (error) => {
-        console.error("Failed to subscribe to sessions:", error);
+        // Silently log permission error when client is unauthenticated
+        console.warn("Firestore subscription status:", error.message);
       }
     );
 
@@ -184,7 +268,7 @@ export default function App() {
     setStartError(null);
 
     try {
-      const token = user ? await user.getIdToken() : "";
+      const token = await getEffectiveToken();
       const response = await fetch("/api/sessions/start", {
         method: "POST",
         headers: {
@@ -195,7 +279,6 @@ export default function App() {
           durationSeconds: selectedDuration,
           mode: "graduation-research",
           provider: "helius",
-          force: forceOverride,
         }),
       });
 
@@ -208,7 +291,7 @@ export default function App() {
       const data = (await response.json()) as StartApiResponse;
       if (!response.ok) {
         if (response.status === 409 && data.activeSessionId) {
-          setStartError(`Active session ${data.activeSessionId} is running. Check Force Override to run concurrently.`);
+          setStartError(`A research session (${data.activeSessionId}) is currently active. Only one active session is permitted.`);
         } else {
           setStartError(data.error ?? "Failed to start session");
         }
@@ -217,11 +300,45 @@ export default function App() {
       }
 
       setIsModalOpen(false);
-      setForceOverride(false);
     } catch (err) {
       setStartError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsStarting(false);
+    }
+  };
+
+  const handleStopSession = async (sessionId: string) => {
+    if (!confirm(`Are you sure you want to stop active session ${sessionId}? Cloud Run execution will be terminated immediately.`)) {
+      return;
+    }
+    setIsStopping(true);
+    setStopError(null);
+
+    try {
+      const token = await getEffectiveToken();
+      const response = await fetch("/api/sessions/stop", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ sessionId }),
+      });
+
+      interface StopApiResponse {
+        success?: boolean;
+        sessionId?: string;
+        status?: string;
+        error?: string;
+      }
+      const data = (await response.json()) as StopApiResponse;
+      if (!response.ok) {
+        setStopError(data.error ?? "Failed to stop session");
+      }
+    } catch (err) {
+      setStopError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsStopping(false);
     }
   };
 
@@ -262,6 +379,33 @@ export default function App() {
             Start Research Session
           </button>
 
+          {authToken ? (
+            <div className="user-badge" style={{ borderColor: "rgba(16, 185, 129, 0.4)", background: "rgba(16, 185, 129, 0.1)" }}>
+              <span style={{ color: "#34d399", fontWeight: 600 }}>Owner Token Active</span>
+              <button
+                className="btn btn-secondary"
+                style={{ padding: "0.2rem 0.5rem", fontSize: "0.75rem" }}
+                onClick={() => {
+                  setAuthToken("");
+                  localStorage.removeItem("botwiner_token");
+                }}
+              >
+                Clear
+              </button>
+            </div>
+          ) : (
+            <button
+              className="btn btn-secondary"
+              id="btn-auth-token"
+              onClick={() => {
+                setTokenInput(authToken);
+                setIsTokenModalOpen(true);
+              }}
+            >
+              Set Token
+            </button>
+          )}
+
           {user ? (
             <div className="user-badge">
               {user.photoURL && <img src={user.photoURL} alt="User avatar" className="user-avatar" />}
@@ -279,6 +423,12 @@ export default function App() {
       </header>
 
       {/* Active Session Status Card */}
+      {stopError && (
+        <div className="warning-box" style={{ marginBottom: "1rem", borderColor: "rgba(239, 68, 68, 0.4)", color: "#fca5a5" }}>
+          {stopError}
+        </div>
+      )}
+
       {activeSession && (
         <section className="status-card">
           <div className="status-header">
@@ -299,6 +449,25 @@ export default function App() {
               <span className="limitation-pill" style={{ background: "rgba(6, 182, 212, 0.15)", color: "#67e8f9", borderColor: "rgba(6,182,212,0.3)" }}>
                 {activeSession.region}
               </span>
+              {isLive && (
+                <button
+                  id="btn-stop-session"
+                  className="btn btn-secondary"
+                  style={{
+                    background: "rgba(239, 68, 68, 0.15)",
+                    borderColor: "rgba(239, 68, 68, 0.4)",
+                    color: "#fca5a5",
+                    padding: "0.3rem 0.75rem",
+                    fontSize: "0.85rem",
+                    fontWeight: 600,
+                    cursor: isStopping ? "not-allowed" : "pointer",
+                  }}
+                  disabled={isStopping}
+                  onClick={() => handleStopSession(activeSession.sessionId)}
+                >
+                  {isStopping ? "Stopping..." : "Stop Session"}
+                </button>
+              )}
             </div>
           </div>
 
@@ -617,18 +786,6 @@ export default function App() {
                   6 Hours
                 </button>
               </div>
-
-              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "0.5rem" }}>
-                <input
-                  type="checkbox"
-                  id="force-override"
-                  checked={forceOverride}
-                  onChange={(e) => setForceOverride(e.target.checked)}
-                />
-                <label htmlFor="force-override" style={{ fontSize: "0.8rem", color: "var(--text-secondary)" }}>
-                  Override concurrency protection if another session is running
-                </label>
-              </div>
             </div>
 
             <div style={{ marginTop: "1.5rem", display: "flex", justifyContent: "flex-end", gap: "0.75rem" }}>
@@ -641,6 +798,64 @@ export default function App() {
                 disabled={isStarting}
               >
                 {isStarting ? "Dispatching..." : "Launch Cloud Session"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Token Auth Modal */}
+      {isTokenModalOpen && (
+        <div className="modal-overlay" onClick={() => setIsTokenModalOpen(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "540px" }}>
+            <div className="modal-header">
+              <h2 className="modal-title">Authenticate as Owner</h2>
+              <button className="btn-close" onClick={() => setIsTokenModalOpen(false)}>
+                &times;
+              </button>
+            </div>
+
+            <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginBottom: "1rem" }}>
+              Enter a valid Firebase ID Token or Google Identity Token for <strong>obada.dallo95@gmail.com</strong>.
+            </p>
+
+            <textarea
+              className="token-input"
+              rows={5}
+              placeholder="Paste ID Token here (e.g. from gcloud auth print-identity-token)"
+              value={tokenInput}
+              onChange={(e) => setTokenInput(e.target.value)}
+              style={{
+                width: "100%",
+                background: "rgba(15, 23, 42, 0.6)",
+                border: "1px solid var(--border-color)",
+                borderRadius: "6px",
+                color: "#f8fafc",
+                fontFamily: "monospace",
+                fontSize: "0.8rem",
+                padding: "0.75rem",
+                resize: "vertical",
+              }}
+            />
+
+            <div style={{ marginTop: "1rem", display: "flex", justifyContent: "flex-end", gap: "0.75rem" }}>
+              <button className="btn btn-secondary" onClick={() => setIsTokenModalOpen(false)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  const cleaned = tokenInput.trim();
+                  setAuthToken(cleaned);
+                  if (cleaned) {
+                    localStorage.setItem("botwiner_token", cleaned);
+                  } else {
+                    localStorage.removeItem("botwiner_token");
+                  }
+                  setIsTokenModalOpen(false);
+                }}
+              >
+                Save Token
               </button>
             </div>
           </div>

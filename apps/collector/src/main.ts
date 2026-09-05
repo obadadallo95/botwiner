@@ -753,7 +753,8 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     const finalStatus = failureState.error === undefined && !stoppedBySignal ? "complete" : "aborted";
     await writer.close(finalStatus);
     if (telemetryReporter !== null) {
-      await telemetryReporter.close(finalStatus === "complete" ? "completed" : "failed");
+      const finalStatusToReport = stoppedBySignal ? "cancelled" : (finalStatus === "complete" ? "completed" : "failed");
+      await telemetryReporter.close(finalStatusToReport);
     }
   }
 
