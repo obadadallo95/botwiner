@@ -286,8 +286,9 @@ test("CloudResearchSink: streams gzip compressed chunks with SHA256 checksums an
     chunkMaxRecords: 5, // rotate after 5 records
   });
 
-  // Verify initial manifest uploaded
-  assert.ok(uploader.uploads.has(`sessions/${sessionId}/manifest.json`));
+  // Under Phase 4C.3 Data Diet, initial and per-rotation manifest overwrites are omitted to eliminate GCS hotkeys.
+  // Manifest is finalized upon close(). Immutable .meta.json files are uploaded alongside chunks instead.
+  assert.equal(uploader.uploads.has(`sessions/${sessionId}/manifest.json`), false);
 
   // Write 12 events to trigger 2 rotations + 1 final flush
   for (let i = 1; i <= 12; i++) {
@@ -329,6 +330,9 @@ test("CloudResearchSink: streams gzip compressed chunks with SHA256 checksums an
   assert.ok(uploader.uploads.has(chunk1Path), "chunk 1 should exist");
   assert.ok(uploader.uploads.has(chunk2Path), "chunk 2 should exist");
   assert.ok(uploader.uploads.has(chunk3Path), "chunk 3 should exist");
+  assert.ok(uploader.uploads.has(`sessions/${sessionId}/chunks/events-000001.meta.json`), "chunk 1 meta should exist");
+  assert.ok(uploader.uploads.has(`sessions/${sessionId}/chunks/events-000002.meta.json`), "chunk 2 meta should exist");
+  assert.ok(uploader.uploads.has(`sessions/${sessionId}/chunks/events-000003.meta.json`), "chunk 3 meta should exist");
 
   // Verify chunk 1 decompression and sha256 checksum
   const chunk1Data = uploader.uploads.get(chunk1Path)!;

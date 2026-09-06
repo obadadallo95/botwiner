@@ -234,6 +234,7 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
 
 interface StartSessionBody {
   durationSeconds?: number | string;
+  segmentDurationSeconds?: number | string;
   mode?: string;
   provider?: string;
 }
@@ -487,6 +488,33 @@ app.get("/api/sessions/:sessionId/paper-trades", requireAuth, async (req, res) =
   }
 });
 
+// Protected Get Session Segments (returns sequential segments with handoff metrics and checkpoints)
+app.get("/api/sessions/:sessionId/segments", requireAuth, async (req, res) => {
+  const rawSessionId = req.params.sessionId;
+  const sessionId = typeof rawSessionId === "string" ? rawSessionId.trim() : undefined;
+  if (!sessionId) {
+    res.status(400).json({ error: "sessionId parameter is required" });
+    return;
+  }
+
+  try {
+    const snapshot = await firestore
+      .collection("researchSessions")
+      .doc(sessionId)
+      .collection("segments")
+      .orderBy("segmentIndex", "asc")
+      .get();
+
+    const segments = snapshot.docs.map((d) => ({ segmentId: d.id, ...d.data() }));
+    res.json({ segments });
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to fetch session segments",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
 // Protected Start Session (with atomic concurrency lock)
 app.post("/api/sessions/start", requireAuth, async (req, res) => {
   const sessionId = generateCollisionResistantSessionId("session");
@@ -504,6 +532,14 @@ app.post("/api/sessions/start", requireAuth, async (req, res) => {
       res.status(400).json({ error: "durationSeconds must be between 60 (1m) and 86400 (24h)" });
       return;
     }
+
+    const rawSegmentDur = body.segmentDurationSeconds ? Number(body.segmentDurationSeconds) : undefined;
+    const segmentDurationSeconds =
+      rawSegmentDur && Number.isFinite(rawSegmentDur) && rawSegmentDur >= 60
+        ? Math.min(rawSegmentDur, dur)
+        : Math.min(1800, dur);
+    const totalSegmentsExpected = Math.max(1, Math.ceil(dur / segmentDurationSeconds));
+    const firstSegmentId = `${sessionId}-seg-0001`;
 
     const nowIso = new Date().toISOString();
 
@@ -582,6 +618,8 @@ app.post("/api/sessions/start", requireAuth, async (req, res) => {
         startedAt: nowIso,
         lastHeartbeatAt: nowIso,
         status: "starting",
+        currentSegmentId: firstSegmentId,
+        currentSegmentIndex: 1,
         executionName: null,
         operationName: null,
       });
@@ -596,6 +634,10 @@ app.post("/api/sessions/start", requireAuth, async (req, res) => {
         lastHeartbeatAt: nowIso,
         completedAt: null,
         requestedDurationSec: dur,
+        segmentDurationSeconds,
+        totalSegmentsExpected,
+        currentSegmentIndex: 1,
+        currentSegmentId: firstSegmentId,
         elapsedSec: 0,
         provider,
         region: GCP_REGION,
@@ -615,7 +657,7 @@ app.post("/api/sessions/start", requireAuth, async (req, res) => {
 
     // 2. Dispatch Cloud Run Job
     const jobFullName = `projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/jobs/${JOB_NAME}`;
-    console.log(`[API] Dispatching Cloud Run Job ${jobFullName} for session ${sessionId} (${dur}s)`);
+    console.log(`[API] Dispatching Cloud Run Job ${jobFullName} for session ${sessionId} (${dur}s, segment: ${segmentDurationSeconds}s, segments: ${totalSegmentsExpected})`);
 
     try {
       const [operation] = await jobsClient.runJob({
@@ -625,6 +667,11 @@ app.post("/api/sessions/start", requireAuth, async (req, res) => {
             {
               env: [
                 { name: "RESEARCH_SESSION_ID", value: sessionId },
+                { name: "RESEARCH_SEGMENT_INDEX", value: "1" },
+                { name: "RESEARCH_SEGMENT_ID", value: firstSegmentId },
+                { name: "RESEARCH_TOTAL_SEGMENTS", value: String(totalSegmentsExpected) },
+                { name: "RESEARCH_SEGMENT_DURATION_SECONDS", value: String(segmentDurationSeconds) },
+                { name: "RESEARCH_LOGICAL_DURATION_SECONDS", value: String(dur) },
                 { name: "RESEARCH_DURATION_SECONDS", value: String(dur) },
                 { name: "RESEARCH_MODE", value: mode },
                 { name: "GCS_BUCKET", value: GCS_BUCKET },
@@ -658,6 +705,9 @@ app.post("/api/sessions/start", requireAuth, async (req, res) => {
         sessionId,
         status: "starting",
         requestedDurationSec: dur,
+        segmentDurationSeconds,
+        totalSegmentsExpected,
+        firstSegmentId,
         operationName,
         executionName,
       });
@@ -692,6 +742,245 @@ app.post("/api/sessions/start", requireAuth, async (req, res) => {
     console.error("[API] Failed to start research session:", error);
     res.status(500).json({
       error: "Failed to dispatch research session",
+      details: msg,
+    });
+  }
+});
+
+// Protected Resume Session (with atomic concurrency lock and durable checkpoint)
+app.post("/api/sessions/:sessionId/resume", requireAuth, async (req, res) => {
+  const rawSessionId = req.params.sessionId;
+  const sessionId = typeof rawSessionId === "string" ? rawSessionId.trim() : undefined;
+  if (!sessionId) {
+    res.status(400).json({ error: "sessionId parameter is required" });
+    return;
+  }
+
+  const sessionRef = firestore.collection("researchSessions").doc(sessionId);
+  const lockRef = firestore.collection("researchControl").doc("activeSession");
+
+  try {
+    const sessionDoc = await sessionRef.get();
+    if (!sessionDoc.exists) {
+      res.status(404).json({ error: `Session ${sessionId} not found` });
+      return;
+    }
+
+    const sessionData = sessionDoc.data() as {
+      status?: string;
+      requestedDurationSec?: number;
+      segmentDurationSeconds?: number;
+      totalSegmentsExpected?: number;
+      mode?: string;
+      provider?: string;
+      checkpointPath?: string | null;
+      currentSegmentIndex?: number;
+      [key: string]: unknown;
+    };
+
+    if (sessionData.status === "completed") {
+      res.status(400).json({ error: "Session is already completed" });
+      return;
+    }
+
+    // 0. Pre-check active lock for dead Cloud Run execution before transaction
+    const preLockDoc = await lockRef.get();
+    if (preLockDoc.exists) {
+      const preData = preLockDoc.data() as {
+        sessionId?: string;
+        lastHeartbeatAt?: string;
+        startedAt?: string;
+        status?: string;
+        executionName?: string | null;
+      };
+
+      if (preData.status === "starting" || preData.status === "running" || preData.status === "reconnecting") {
+        const hbTime = preData.lastHeartbeatAt ? new Date(preData.lastHeartbeatAt).getTime() : 0;
+        const startTime = preData.startedAt ? new Date(preData.startedAt).getTime() : 0;
+        const recentTime = Math.max(hbTime, startTime);
+        const now = Date.now();
+
+        if (now - recentTime < 90_000) {
+          res.status(409).json({
+            error: "A research session is already actively running",
+            activeSessionId: preData.sessionId,
+          });
+          return;
+        }
+
+        if (preData.executionName) {
+          const execStatus = await checkExecutionFinished(executionsClient, preData.executionName);
+          if (!execStatus.finished) {
+            res.status(409).json({
+              error: `Active Cloud Run execution ${preData.executionName} is still running`,
+              sessionId: preData.sessionId,
+            });
+            return;
+          }
+          await lockRef.delete();
+        } else {
+          await lockRef.delete();
+        }
+      }
+    }
+
+    // Find the latest checkpoint from subcollection or session document
+    let checkpointPath = sessionData.checkpointPath ?? undefined;
+    let lastSegmentIndex = sessionData.currentSegmentIndex ?? 1;
+
+    const segmentsSnap = await sessionRef
+      .collection("segments")
+      .orderBy("segmentIndex", "desc")
+      .limit(1)
+      .get();
+
+    if (!segmentsSnap.empty) {
+      const lastSeg = segmentsSnap.docs[0]?.data();
+      if (lastSeg && typeof lastSeg.checkpointPath === "string") {
+        checkpointPath = lastSeg.checkpointPath;
+      }
+      if (lastSeg && typeof lastSeg.segmentIndex === "number") {
+        lastSegmentIndex = lastSeg.segmentIndex;
+      }
+    }
+
+    if (!checkpointPath) {
+      res.status(400).json({ error: `No durable checkpoint found for session ${sessionId}` });
+      return;
+    }
+
+    const nextSegmentIndex = lastSegmentIndex + 1;
+    const requestedDur = sessionData.requestedDurationSec ?? 3600;
+    const segmentDur = sessionData.segmentDurationSeconds ?? 1800;
+    const totalSegments = sessionData.totalSegmentsExpected ?? Math.max(1, Math.ceil(requestedDur / segmentDur));
+
+    if (nextSegmentIndex > totalSegments) {
+      res.status(400).json({ error: `All ${totalSegments} segments already executed for session ${sessionId}` });
+      return;
+    }
+
+    const nextSegmentId = `${sessionId}-seg-${String(nextSegmentIndex).padStart(4, "0")}`;
+    const nowIso = new Date().toISOString();
+
+    // 1. Atomic Concurrency Lock Check
+    await firestore.runTransaction(async (transaction) => {
+      const lockDoc = await transaction.get(lockRef);
+      const now = Date.now();
+
+      if (lockDoc.exists) {
+        const data = lockDoc.data() as {
+          sessionId?: string;
+          lastHeartbeatAt?: string;
+          startedAt?: string;
+          status?: string;
+        };
+
+        if (data.status === "starting" || data.status === "running" || data.status === "reconnecting") {
+          const hbTime = data.lastHeartbeatAt ? new Date(data.lastHeartbeatAt).getTime() : 0;
+          const startTime = data.startedAt ? new Date(data.startedAt).getTime() : 0;
+          const recentTime = Math.max(hbTime, startTime);
+
+          if (now - recentTime < 90_000) {
+            throw new Error(`ACTIVE_SESSION_EXISTS:${data.sessionId ?? "unknown"}`);
+          }
+        }
+      }
+
+      transaction.set(lockRef, {
+        sessionId,
+        startedAt: nowIso,
+        lastHeartbeatAt: nowIso,
+        status: "starting",
+        currentSegmentId: nextSegmentId,
+        currentSegmentIndex: nextSegmentIndex,
+        executionName: null,
+        operationName: null,
+      });
+
+      transaction.update(sessionRef, {
+        status: "starting",
+        currentSegmentId: nextSegmentId,
+        currentSegmentIndex: nextSegmentIndex,
+        lastHeartbeatAt: nowIso,
+      });
+    });
+
+    // 2. Dispatch Cloud Run Job
+    const jobFullName = `projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/jobs/${JOB_NAME}`;
+    console.log(`[API] Resuming session ${sessionId}: dispatching segment ${nextSegmentIndex}/${totalSegments} (${nextSegmentId}) with checkpoint ${checkpointPath}`);
+
+    try {
+      const [operation] = await jobsClient.runJob({
+        name: jobFullName,
+        overrides: {
+          containerOverrides: [
+            {
+              env: [
+                { name: "RESEARCH_SESSION_ID", value: sessionId },
+                { name: "RESEARCH_SEGMENT_INDEX", value: String(nextSegmentIndex) },
+                { name: "RESEARCH_SEGMENT_ID", value: nextSegmentId },
+                { name: "RESEARCH_TOTAL_SEGMENTS", value: String(totalSegments) },
+                { name: "RESEARCH_SEGMENT_DURATION_SECONDS", value: String(segmentDur) },
+                { name: "RESEARCH_LOGICAL_DURATION_SECONDS", value: String(requestedDur) },
+                { name: "RESEARCH_DURATION_SECONDS", value: String(requestedDur) },
+                { name: "RESEARCH_CHECKPOINT_PATH", value: checkpointPath },
+                { name: "RESEARCH_MODE", value: sessionData.mode ?? "graduation-research" },
+                { name: "GCS_BUCKET", value: GCS_BUCKET },
+                { name: "GCP_PROJECT_ID", value: GCP_PROJECT_ID },
+                { name: "GCP_REGION", value: GCP_REGION },
+                { name: "BOTWINER_FEED_PROVIDER", value: sessionData.provider ?? "helius" },
+                { name: "BOTWINER_SINK", value: "cloud" },
+              ],
+            },
+          ],
+        },
+      });
+
+      const operationName = operation.name ?? null;
+      const executionName = operation.metadata?.name ?? null;
+
+      await Promise.all([
+        sessionRef.update({ operationName, executionName }),
+        lockRef.update({ operationName, executionName }),
+      ]);
+
+      res.json({
+        success: true,
+        sessionId,
+        status: "starting",
+        segmentIndex: nextSegmentIndex,
+        segmentId: nextSegmentId,
+        checkpointPath,
+        operationName,
+        executionName,
+      });
+    } catch (dispatchError) {
+      await lockRef.set(
+        {
+          status: "failed",
+          error: dispatchError instanceof Error ? dispatchError.message : String(dispatchError),
+          failedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+      await sessionRef.update({
+        latestError: dispatchError instanceof Error ? dispatchError.message : String(dispatchError),
+      });
+      throw dispatchError;
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.startsWith("ACTIVE_SESSION_EXISTS:")) {
+      const activeId = msg.split(":")[1];
+      res.status(409).json({
+        error: "A research session is already active",
+        activeSessionId: activeId,
+      });
+      return;
+    }
+    console.error("[API] Failed to resume research session:", error);
+    res.status(500).json({
+      error: "Failed to resume session",
       details: msg,
     });
   }

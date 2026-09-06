@@ -26,6 +26,10 @@ export interface ResearchSessionDocument {
   readonly provider: string;
   readonly region: string;
   currentChunk: number;
+  currentSegmentId?: string | undefined;
+  currentSegmentIndex?: number | undefined;
+  totalSegmentsExpected?: number | undefined;
+  checkpointPath?: string | undefined;
   totalEvents: number;
   launchesDetected: number;
   tradesDetected: number;
@@ -36,8 +40,8 @@ export interface ResearchSessionDocument {
   bytesPersisted: number;
   latestEventAt: string | null;
   latestError: string | null;
-  skippedStatsFlushes?: number;
-  skippedHeartbeatFlushes?: number;
+  skippedStatsFlushes?: number | undefined;
+  skippedHeartbeatFlushes?: number | undefined;
 }
 
 export function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operationName: string): Promise<T> {
@@ -61,7 +65,8 @@ export interface FirestoreBackend {
   updateMarketPnlDoc?(sessionId: string, stats: Record<string, unknown>): Promise<void>;
   updateCreatorAnalyticsDoc?(sessionId: string, stats: Record<string, unknown>): Promise<void>;
   savePaperTradeDoc?(sessionId: string, tradeId: string, trade: Record<string, unknown>): Promise<void>;
-  updateActiveLock?(sessionId: string, data: { heartbeatAt: string; status?: string }): Promise<void>;
+  setSegmentDoc?(sessionId: string, segmentId: string, data: Record<string, unknown>): Promise<void>;
+  updateActiveLock?(sessionId: string, data: { heartbeatAt: string; status?: string | undefined; currentSegmentId?: string | undefined; segmentIndex?: number | undefined }): Promise<void>;
   releaseActiveLock?(sessionId: string): Promise<void>;
 }
 
@@ -69,7 +74,7 @@ export class GoogleFirestoreBackend implements FirestoreBackend {
   public readonly db: Firestore;
   private readonly operationTimeoutMs: number;
 
-  public constructor(projectId?: string, databaseId = "(default)", operationTimeoutMs = 10_000) {
+  public constructor(projectId?: string, databaseId = "(default)", operationTimeoutMs = 30_000) {
     const options: ConstructorParameters<typeof Firestore>[0] = { databaseId };
     if (projectId !== undefined) {
       options.projectId = projectId;
@@ -81,6 +86,11 @@ export class GoogleFirestoreBackend implements FirestoreBackend {
   public async setSessionDoc(sessionId: string, data: Partial<ResearchSessionDocument>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId);
     await withTimeout(docRef.set(toBigIntSafeObject(data), { merge: true }), this.operationTimeoutMs, "setSessionDoc");
+  }
+
+  public async setSegmentDoc(sessionId: string, segmentId: string, data: Record<string, unknown>): Promise<void> {
+    const docRef = this.db.collection("researchSessions").doc(sessionId).collection("segments").doc(segmentId);
+    await withTimeout(docRef.set(toBigIntSafeObject(data), { merge: true }), this.operationTimeoutMs, "setSegmentDoc");
   }
 
   public async updateStatsDoc(sessionId: string, stats: GraduationSummaryCounters): Promise<void> {
@@ -118,7 +128,7 @@ export class GoogleFirestoreBackend implements FirestoreBackend {
     await withTimeout(docRef.set(toBigIntSafeObject(candidate), { merge: true }), this.operationTimeoutMs, "setGraduationCandidate");
   }
 
-  public async updateActiveLock(sessionId: string, data: { heartbeatAt: string; status?: string }): Promise<void> {
+  public async updateActiveLock(sessionId: string, data: { heartbeatAt: string; status?: string; currentSegmentId?: string; segmentIndex?: number }): Promise<void> {
     const lockRef = this.db.collection("researchControl").doc("activeSession");
     await withTimeout(lockRef.set(toBigIntSafeObject({ sessionId, ...data }), { merge: true }), this.operationTimeoutMs, "updateActiveLock");
   }
@@ -141,6 +151,9 @@ export interface FirestoreTelemetryReporterOptions {
   readonly provider: string;
   readonly region: string;
   readonly requestedDurationSec: number | null;
+  readonly segmentId?: string | undefined;
+  readonly segmentIndex?: number | undefined;
+  readonly totalSegmentsExpected?: number | undefined;
   readonly gcpProjectId?: string | undefined;
   readonly firestoreDatabase?: string | undefined;
   readonly backend?: FirestoreBackend | undefined;
@@ -154,9 +167,11 @@ export class FirestoreTelemetryReporter {
   private readonly provider: string;
   private readonly region: string;
   private readonly requestedDurationSec: number | null;
+  private readonly segmentId?: string | undefined;
+  private readonly segmentIndex?: number | undefined;
+  private readonly totalSegmentsExpected?: number | undefined;
   private readonly backend: FirestoreBackend;
   private readonly heartbeatIntervalMs: number;
-  private readonly statsIntervalMs: number;
   private readonly startedAtUnixMs: number;
 
   private status: ResearchSessionStatus = "starting";
@@ -167,7 +182,6 @@ export class FirestoreTelemetryReporter {
   private reconnectCount = 0;
 
   private heartbeatTimer?: NodeJS.Timeout | undefined;
-  private statsTimer?: NodeJS.Timeout | undefined;
   private closed = false;
   private statsFlushInFlight = false;
   private heartbeatFlushInFlight = false;
@@ -188,8 +202,10 @@ export class FirestoreTelemetryReporter {
     this.provider = options.provider;
     this.region = options.region;
     this.requestedDurationSec = options.requestedDurationSec;
-    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 15_000;
-    this.statsIntervalMs = options.statsIntervalMs ?? 5_000;
+    this.segmentId = options.segmentId;
+    this.segmentIndex = options.segmentIndex;
+    this.totalSegmentsExpected = options.totalSegmentsExpected;
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 60_000;
     this.startedAtUnixMs = Date.now();
 
     if (options.backend) {
@@ -230,6 +246,9 @@ export class FirestoreTelemetryReporter {
       provider: this.provider,
       region: this.region,
       currentChunk: 1,
+      currentSegmentId: this.segmentId,
+      currentSegmentIndex: this.segmentIndex,
+      totalSegmentsExpected: this.totalSegmentsExpected,
       totalEvents: 0,
       launchesDetected: 0,
       tradesDetected: 0,
@@ -251,7 +270,49 @@ export class FirestoreTelemetryReporter {
     }
 
     this.startHeartbeat();
-    this.startStatsLoop();
+  }
+
+  public async recordSegmentStart(metadata: Record<string, unknown> = {}): Promise<void> {
+    if (!this.segmentId || !this.backend.setSegmentDoc) return;
+    const nowIso = new Date().toISOString();
+    await this.backend.setSegmentDoc(this.sessionId, this.segmentId, {
+      segmentId: this.segmentId,
+      segmentIndex: this.segmentIndex ?? 1,
+      status: "running",
+      startedAt: nowIso,
+      ...metadata,
+    });
+    await this.backend.setSessionDoc(this.sessionId, {
+      currentSegmentId: this.segmentId,
+      currentSegmentIndex: this.segmentIndex ?? 1,
+      status: "running",
+      lastHeartbeatAt: nowIso,
+    });
+  }
+
+  public async recordSegmentCheckpoint(checkpointPath: string, metrics: Record<string, unknown> = {}): Promise<void> {
+    if (!this.segmentId || !this.backend.setSegmentDoc) return;
+    const nowIso = new Date().toISOString();
+    await this.backend.setSegmentDoc(this.sessionId, this.segmentId, {
+      status: "checkpointed",
+      checkpointedAt: nowIso,
+      checkpointPath,
+      ...metrics,
+    });
+    await this.backend.setSessionDoc(this.sessionId, {
+      checkpointPath,
+      lastHeartbeatAt: nowIso,
+    });
+  }
+
+  public async recordSegmentComplete(metrics: Record<string, unknown> = {}): Promise<void> {
+    if (!this.segmentId || !this.backend.setSegmentDoc) return;
+    const nowIso = new Date().toISOString();
+    await this.backend.setSegmentDoc(this.sessionId, this.segmentId, {
+      status: "completed",
+      completedAt: nowIso,
+      ...metrics,
+    });
   }
 
   public markRunning(): void {
@@ -304,6 +365,41 @@ export class FirestoreTelemetryReporter {
 
   public queuePaperTrade(trade: PaperPosition): void {
     this.pendingPaperTrades.set(`${trade.mint}-${trade.openedAtUnixMs}`, trade);
+    // Write event-driven paper trade immediately
+    this.recordPaperTrade(trade).catch((err) => {
+      console.warn("[FirestoreTelemetryReporter] failed to write paper trade:", err);
+    });
+  }
+
+  public async recordPaperTrade(trade: PaperPosition): Promise<void> {
+    if (!this.backend.savePaperTradeDoc) return;
+    const tradeId = `${trade.mint}-${trade.openedAtUnixMs}`;
+    const serializable = {
+      strategyId: trade.strategyId,
+      mint: trade.mint,
+      openedAtUnixMs: trade.openedAtUnixMs,
+      openedAtIso: new Date(trade.openedAtUnixMs).toISOString(),
+      closedAtUnixMs: trade.closedAtUnixMs ?? null,
+      closedAtIso: trade.closedAtUnixMs ? new Date(trade.closedAtUnixMs).toISOString() : null,
+      status: trade.status,
+      exitReason: trade.exitReason ?? null,
+      holdDurationSec: trade.holdDurationSec ?? null,
+      curveSolInputLamports: trade.curveSolInputLamports.toString(),
+      totalWalletOutflowLamports: trade.totalWalletOutflowLamports.toString(),
+      tokenQuantity: trade.tokenQuantity.toString(),
+      grossPnlLamports: trade.grossPnlLamports?.toString() ?? null,
+      netPnlLamports: trade.netPnlLamports?.toString() ?? null,
+      netReturnPct: trade.netReturnPct ?? null,
+      maxFavorableExcursionPct: trade.maxFavorableExcursionPct,
+      maxAdverseExcursionPct: trade.maxAdverseExcursionPct,
+      entryPumpFeeLamports: trade.entryPumpFeeLamports.toString(),
+      entryTxCostLamports: trade.entryTxCostLamports.toString(),
+      totalPumpFeesLamports: trade.totalPumpFeesLamports?.toString() ?? null,
+      totalTxCostsLamports: trade.totalTxCostsLamports?.toString() ?? null,
+      triggerState: trade.triggerState,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.backend.savePaperTradeDoc(this.sessionId, tradeId, serializable);
   }
 
   public recordError(error: Error | string): void {
@@ -321,10 +417,6 @@ export class FirestoreTelemetryReporter {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = undefined;
-    }
-    if (this.statsTimer) {
-      clearInterval(this.statsTimer);
-      this.statsTimer = undefined;
     }
 
     this.status = finalStatus;
@@ -347,6 +439,8 @@ export class FirestoreTelemetryReporter {
       lastHeartbeatAt: nowIso,
       elapsedSec,
       currentChunk: this.currentChunk,
+      currentSegmentId: this.segmentId,
+      currentSegmentIndex: this.segmentIndex,
       bytesPersisted: this.bytesPersisted,
       totalEvents: this.latestCounts?.normalizedEvents ?? 0,
       launchesDetected: this.latestCounts?.launches ?? 0,
@@ -371,6 +465,62 @@ export class FirestoreTelemetryReporter {
     }
   }
 
+  public async closeSegment(segmentId: string, segmentIndex: number, nextSegmentId?: string): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
+
+    const nowIso = new Date().toISOString();
+    const elapsedSec = Math.floor((Date.now() - this.startedAtUnixMs) / 1000);
+
+    if (this.statsFlushInFlight) {
+      let waitedMs = 0;
+      while (this.statsFlushInFlight && waitedMs < 3000) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        waitedMs += 100;
+      }
+    }
+    await this.flushStatsNow(true);
+
+    const partial: Partial<ResearchSessionDocument> = {
+      lastHeartbeatAt: nowIso,
+      elapsedSec,
+      currentChunk: this.currentChunk,
+      currentSegmentId: nextSegmentId ?? segmentId,
+      currentSegmentIndex: segmentIndex,
+      bytesPersisted: this.bytesPersisted,
+      reconnectCount: this.reconnectCount,
+      skippedStatsFlushes: this.skippedStatsFlushes,
+      skippedHeartbeatFlushes: this.skippedHeartbeatFlushes,
+    };
+    if (this.latestCounts) {
+      partial.totalEvents = this.latestCounts.normalizedEvents;
+      partial.launchesDetected = this.latestCounts.launches;
+      partial.tradesDetected = this.latestCounts.trades;
+      partial.failedTxObserved = this.latestCounts.failedTransactions;
+      partial.parserErrors = this.latestCounts.malformedPumpEvents;
+      partial.disconnectCount = this.latestCounts.disconnects;
+    }
+
+    try {
+      await this.backend.setSessionDoc(this.sessionId, partial);
+      if (this.backend.updateActiveLock) {
+        await this.backend.updateActiveLock(this.sessionId, {
+          heartbeatAt: nowIso,
+          status: "running",
+          currentSegmentId: nextSegmentId ?? segmentId,
+          segmentIndex: segmentIndex + 1,
+        });
+      }
+    } catch (err) {
+      console.warn("[FirestoreTelemetryReporter] failed to update session doc on segment close:", err);
+    }
+  }
+
   private startHeartbeat(): void {
     this.heartbeatTimer = setInterval(() => {
       this.flushHeartbeatNow().catch((err) => {
@@ -378,15 +528,6 @@ export class FirestoreTelemetryReporter {
       });
     }, this.heartbeatIntervalMs);
     this.heartbeatTimer.unref?.();
-  }
-
-  private startStatsLoop(): void {
-    this.statsTimer = setInterval(() => {
-      this.flushStatsNow().catch((err) => {
-        console.warn("[FirestoreTelemetryReporter] stats write failed:", err);
-      });
-    }, this.statsIntervalMs);
-    this.statsTimer.unref?.();
   }
 
   public async flushHeartbeatNow(force = false): Promise<void> {
@@ -406,6 +547,8 @@ export class FirestoreTelemetryReporter {
         lastHeartbeatAt: nowIso,
         elapsedSec,
         currentChunk: this.currentChunk,
+        currentSegmentId: this.segmentId,
+        currentSegmentIndex: this.segmentIndex,
         bytesPersisted: this.bytesPersisted,
         reconnectCount: this.reconnectCount,
         latestError: this.latestError,
@@ -428,7 +571,12 @@ export class FirestoreTelemetryReporter {
       try {
         await this.backend.setSessionDoc(this.sessionId, partial);
         if (this.backend.updateActiveLock) {
-          await this.backend.updateActiveLock(this.sessionId, { heartbeatAt: nowIso, status: this.status });
+          await this.backend.updateActiveLock(this.sessionId, {
+            heartbeatAt: nowIso,
+            status: this.status,
+            currentSegmentId: this.segmentId,
+            segmentIndex: this.segmentIndex,
+          });
         }
       } catch (err) {
         console.warn("[FirestoreTelemetryReporter] failed to update heartbeat:", err);

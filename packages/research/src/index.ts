@@ -17,3 +17,4 @@ export * from "./cloud-telemetry.js";
 export * from "./paper-trading-engine.js";
 export * from "./trader-pnl-tracker.js";
 export * from "./portfolio-engine.js";
+export * from "./checkpoint.js";

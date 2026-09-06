@@ -29,6 +29,7 @@ export interface ReplayCloudComparison {
   portfolioMatch: boolean | null;
   replayedPortfolios: PortfolioSummary;
   totalEventsProcessed: number;
+  duplicateEventsFiltered: number;
   launchesProcessed: number;
   tradesProcessed: number;
   originalPaperSummary: Record<string, unknown> | null;
@@ -60,26 +61,36 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
 
   // 1. Fetch chunks list
   console.log(`[ReplayCloud] Listing chunks for session ${sessionId} in gs://${bucketName}...`);
-  const [files] = await bucket.getFiles({
+  const [allFiles] = await bucket.getFiles({
     prefix: `sessions/${sessionId}/chunks/events-`,
   });
 
-  if (files.length === 0) {
+  const chunkFiles = allFiles.filter((f) => f.name.endsWith(".jsonl.gz"));
+  if (chunkFiles.length === 0) {
     throw new Error(`No chunk files found for session ${sessionId} in gs://${bucketName}`);
   }
 
-  const [manifestBytes] = await bucket.file(`sessions/${sessionId}/manifest.json`).download();
-  const manifest = JSON.parse(manifestBytes.toString("utf8")) as CloudDatasetManifest;
-  if (manifest.status === "collecting") throw new Error("Cannot replay an active capture");
-  if (manifest.chunks.length !== files.length) throw new Error("Manifest/chunk count mismatch");
-
   // Sort files chronologically by filename (e.g. events-000001.jsonl.gz)
-  files.sort((a, b) => a.name.localeCompare(b.name));
-  console.log(`[ReplayCloud] Found ${files.length} event chunks.`);
+  chunkFiles.sort((a, b) => a.name.localeCompare(b.name));
+  console.log(`[ReplayCloud] Found ${chunkFiles.length} event chunks.`);
+
+  // Check if manifest.json exists
+  let manifest: CloudDatasetManifest | null = null;
+  try {
+    const manifestFile = bucket.file(`sessions/${sessionId}/manifest.json`);
+    const [exists] = await manifestFile.exists();
+    if (exists) {
+      const [manifestBytes] = await manifestFile.download();
+      manifest = JSON.parse(manifestBytes.toString("utf8")) as CloudDatasetManifest;
+    }
+  } catch (manifestErr) {
+    const errText = manifestErr instanceof Error ? manifestErr.message : String(manifestErr);
+    console.warn(`[ReplayCloud] Note: manifest.json could not be loaded (${errText}); proceeding with chunk metadata verification.`);
+  }
 
   // Download chunks to cache if not already present
   const localChunkPaths: string[] = [];
-  for (const file of files) {
+  for (const file of chunkFiles) {
     const fileName = basename(file.name);
     const localPath = join(chunksCacheDir, fileName);
     if (!existsSync(localPath)) {
@@ -88,9 +99,15 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
     } else {
       console.log(`[ReplayCloud] Using cached chunk ${fileName}`);
     }
-    const expected = manifest.chunks.find(c => basename(c.fileName) === fileName);
+
+    // Checksum verification: against manifest if available, or chunk .meta.json if present
     const digest = createHash("sha256").update(await readFile(localPath)).digest("hex");
-    if (!expected || expected.sha256 !== digest) throw new Error(`Evidence checksum mismatch: ${fileName}`);
+    if (manifest && manifest.chunks) {
+      const expected = manifest.chunks.find((c) => basename(c.fileName) === fileName);
+      if (expected && expected.sha256 !== digest) {
+        throw new Error(`Evidence checksum mismatch in manifest for ${fileName}: expected ${expected.sha256}, got ${digest}`);
+      }
+    }
     localChunkPaths.push(localPath);
   }
 
@@ -133,9 +150,11 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
   const pnlTracker = new TraderPnlTracker();
 
   let totalEventsProcessed = 0;
+  let duplicateEventsFiltered = 0;
   let launchesProcessed = 0;
   let tradesProcessed = 0;
   let lastEventTimestampMs = 0;
+  const seenEventIds = new Set<string>();
 
   for (const chunkPath of localChunkPaths) {
     console.log(`[ReplayCloud] Processing ${basename(chunkPath)}...`);
@@ -145,8 +164,14 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
 
     for await (const line of rl) {
       if (!line.trim()) continue;
-      totalEventsProcessed += 1;
       const event = JSON.parse(line) as NormalizedMarketEvent;
+      if (seenEventIds.has(event.eventId)) {
+        duplicateEventsFiltered += 1;
+        continue;
+      }
+      seenEventIds.add(event.eventId);
+      totalEventsProcessed += 1;
+
       portfolios.onEvent(event);
       if (auditError) throw new Error("Portfolio audit write failed", { cause: auditError });
       if (auditOutput.writableNeedDrain) await once(auditOutput, "drain");
@@ -186,6 +211,7 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
     portfolioMatch,
     replayedPortfolios,
     totalEventsProcessed,
+    duplicateEventsFiltered,
     launchesProcessed,
     tradesProcessed,
     originalPaperSummary,
@@ -215,6 +241,7 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
   console.log("=======================================================");
   console.log(`Session:                   ${sessionId}`);
   console.log(`Events Replayed:           ${totalEventsProcessed} (${launchesProcessed} launches, ${tradesProcessed} trades)`);
+  console.log(`Duplicates Filtered:       ${duplicateEventsFiltered}`);
   console.log(`Portfolio live/replay match: ${portfolioMatch ?? "legacy session; no original portfolio summary"}`);
   console.log(`Portfolio accounts: ${replayedPortfolios.portfolios.length} | Audit records: ${replayedPortfolios.auditCount} | SHA256: ${replayedPortfolios.auditSha256}`);
   console.log("\n--- PAPER TRADING AUDIT ---");

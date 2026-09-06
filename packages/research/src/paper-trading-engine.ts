@@ -251,6 +251,69 @@ export interface PaperTradingStats {
   }>;
 }
 
+export interface SerializedObservedTokenState {
+  readonly mint: string;
+  readonly creatorWallet: string;
+  readonly launchTimestampUnixMs: number;
+  readonly firstSlot?: number | undefined;
+  lastSlot?: number | undefined;
+  tradeCount: number;
+  buyCount: number;
+  sellCount: number;
+  currentRealSolLamports: string;
+  crossed50AtUnixMs?: number | undefined;
+  crossed84_5AtUnixMs?: number | undefined;
+  recentBuyVolumeLamports: string;
+  recentSellVolumeLamports: string;
+  latestActivityUnixMs: number;
+}
+
+export interface SerializedPaperPosition {
+  readonly strategyId: typeof PAPER_STRATEGY_ID;
+  readonly mint: string;
+  readonly openedAtUnixMs: number;
+  readonly triggerAtUnixMs: number;
+  readonly triggerState: PaperTriggerState;
+  readonly entryReserves: {
+    readonly virtualSolLamports: string;
+    readonly virtualTokenBaseUnits: string;
+    readonly realSolLamports: string;
+  };
+  readonly curveSolInputLamports: string;
+  readonly entryPumpFeeLamports: string;
+  readonly entryTxCostLamports: string;
+  readonly totalWalletOutflowLamports: string;
+  readonly tokenQuantity: string;
+  currentExecutableGrossValueLamports: string;
+  currentEstimatedNetLiquidationValueLamports: string;
+  unrealizedGrossPnlLamports: string;
+  unrealizedNetPnlLamports: string;
+  unrealizedNetReturnPct: number;
+  maxFavorableExcursionPct: number;
+  maxAdverseExcursionPct: number;
+  lastUpdatedUnixMs: number;
+  status: PaperPositionStatus;
+  closedAtUnixMs?: number | undefined;
+  exitReason?: PaperPositionStatus | undefined;
+  exitGrossCurveSolLamports?: string | undefined;
+  exitPumpFeeLamports?: string | undefined;
+  exitTxCostLamports?: string | undefined;
+  totalPumpFeesLamports?: string | undefined;
+  totalTxCostsLamports?: string | undefined;
+  netPnlLamports?: string | undefined;
+  grossPnlLamports?: string | undefined;
+  netReturnPct?: number | undefined;
+  holdDurationSec?: number | undefined;
+}
+
+export interface SerializedPaperTradingState {
+  observedTokens: SerializedObservedTokenState[];
+  positions: SerializedPaperPosition[];
+  closedTrades: SerializedPaperPosition[];
+  censoredTrades: SerializedPaperPosition[];
+  unresolvedMigrationTrades: SerializedPaperPosition[];
+}
+
 interface ObservedTokenState {
   readonly mint: string;
   readonly creatorWallet: string;
@@ -904,5 +967,155 @@ export class PaperTradingEngine {
 
   public exportSummary(): PaperTradingStats {
     return this.getStats();
+  }
+
+  public exportState(): SerializedPaperTradingState {
+    const serializePos = (p: PaperPosition): SerializedPaperPosition => ({
+      strategyId: p.strategyId,
+      mint: p.mint,
+      openedAtUnixMs: p.openedAtUnixMs,
+      triggerAtUnixMs: p.triggerAtUnixMs,
+      triggerState: p.triggerState,
+      entryReserves: {
+        virtualSolLamports: p.entryReserves.virtualSolLamports.toString(),
+        virtualTokenBaseUnits: p.entryReserves.virtualTokenBaseUnits.toString(),
+        realSolLamports: p.entryReserves.realSolLamports.toString(),
+      },
+      curveSolInputLamports: p.curveSolInputLamports.toString(),
+      entryPumpFeeLamports: p.entryPumpFeeLamports.toString(),
+      entryTxCostLamports: p.entryTxCostLamports.toString(),
+      totalWalletOutflowLamports: p.totalWalletOutflowLamports.toString(),
+      tokenQuantity: p.tokenQuantity.toString(),
+      currentExecutableGrossValueLamports: p.currentExecutableGrossValueLamports.toString(),
+      currentEstimatedNetLiquidationValueLamports: p.currentEstimatedNetLiquidationValueLamports.toString(),
+      unrealizedGrossPnlLamports: p.unrealizedGrossPnlLamports.toString(),
+      unrealizedNetPnlLamports: p.unrealizedNetPnlLamports.toString(),
+      unrealizedNetReturnPct: p.unrealizedNetReturnPct,
+      maxFavorableExcursionPct: p.maxFavorableExcursionPct,
+      maxAdverseExcursionPct: p.maxAdverseExcursionPct,
+      lastUpdatedUnixMs: p.lastUpdatedUnixMs,
+      status: p.status,
+      closedAtUnixMs: p.closedAtUnixMs,
+      exitReason: p.exitReason,
+      exitGrossCurveSolLamports: p.exitGrossCurveSolLamports?.toString(),
+      exitPumpFeeLamports: p.exitPumpFeeLamports?.toString(),
+      exitTxCostLamports: p.exitTxCostLamports?.toString(),
+      totalPumpFeesLamports: p.totalPumpFeesLamports?.toString(),
+      totalTxCostsLamports: p.totalTxCostsLamports?.toString(),
+      netPnlLamports: p.netPnlLamports?.toString(),
+      grossPnlLamports: p.grossPnlLamports?.toString(),
+      netReturnPct: p.netReturnPct,
+      holdDurationSec: p.holdDurationSec,
+    });
+
+    const observedTokens: SerializedObservedTokenState[] = [];
+    for (const [mint, t] of this.observedTokens.entries()) {
+      if (t.tradeCount > 0 || t.launchTimestampUnixMs > 0) {
+        observedTokens.push({
+          mint,
+          creatorWallet: t.creatorWallet,
+          launchTimestampUnixMs: t.launchTimestampUnixMs,
+          firstSlot: t.firstSlot,
+          lastSlot: t.lastSlot,
+          tradeCount: t.tradeCount,
+          buyCount: t.buyCount,
+          sellCount: t.sellCount,
+          currentRealSolLamports: t.currentRealSolLamports.toString(),
+          crossed50AtUnixMs: t.crossed50AtUnixMs,
+          crossed84_5AtUnixMs: t.crossed84_5AtUnixMs,
+          recentBuyVolumeLamports: t.recentBuyVolumeLamports.toString(),
+          recentSellVolumeLamports: t.recentSellVolumeLamports.toString(),
+          latestActivityUnixMs: t.latestActivityUnixMs,
+        });
+      }
+    }
+
+    return {
+      observedTokens,
+      positions: Array.from(this.positions.values()).map(serializePos),
+      closedTrades: this.closedTrades.map(serializePos),
+      censoredTrades: this.censoredTrades.map(serializePos),
+      unresolvedMigrationTrades: this.unresolvedMigrationTrades.map(serializePos),
+    };
+  }
+
+  public importState(state: SerializedPaperTradingState): void {
+    const deserializePos = (s: SerializedPaperPosition): PaperPosition => ({
+      strategyId: s.strategyId,
+      mint: s.mint,
+      openedAtUnixMs: s.openedAtUnixMs,
+      triggerAtUnixMs: s.triggerAtUnixMs,
+      triggerState: s.triggerState,
+      entryReserves: {
+        virtualSolLamports: BigInt(s.entryReserves.virtualSolLamports),
+        virtualTokenBaseUnits: BigInt(s.entryReserves.virtualTokenBaseUnits),
+        realSolLamports: BigInt(s.entryReserves.realSolLamports),
+      },
+      curveSolInputLamports: BigInt(s.curveSolInputLamports),
+      entryPumpFeeLamports: BigInt(s.entryPumpFeeLamports),
+      entryTxCostLamports: BigInt(s.entryTxCostLamports),
+      totalWalletOutflowLamports: BigInt(s.totalWalletOutflowLamports),
+      tokenQuantity: BigInt(s.tokenQuantity),
+      currentExecutableGrossValueLamports: BigInt(s.currentExecutableGrossValueLamports),
+      currentEstimatedNetLiquidationValueLamports: BigInt(s.currentEstimatedNetLiquidationValueLamports),
+      unrealizedGrossPnlLamports: BigInt(s.unrealizedGrossPnlLamports),
+      unrealizedNetPnlLamports: BigInt(s.unrealizedNetPnlLamports),
+      unrealizedNetReturnPct: s.unrealizedNetReturnPct,
+      maxFavorableExcursionPct: s.maxFavorableExcursionPct,
+      maxAdverseExcursionPct: s.maxAdverseExcursionPct,
+      lastUpdatedUnixMs: s.lastUpdatedUnixMs,
+      status: s.status,
+      closedAtUnixMs: s.closedAtUnixMs,
+      exitReason: s.exitReason,
+      exitGrossCurveSolLamports: s.exitGrossCurveSolLamports !== undefined ? BigInt(s.exitGrossCurveSolLamports) : undefined,
+      exitPumpFeeLamports: s.exitPumpFeeLamports !== undefined ? BigInt(s.exitPumpFeeLamports) : undefined,
+      exitTxCostLamports: s.exitTxCostLamports !== undefined ? BigInt(s.exitTxCostLamports) : undefined,
+      totalPumpFeesLamports: s.totalPumpFeesLamports !== undefined ? BigInt(s.totalPumpFeesLamports) : undefined,
+      totalTxCostsLamports: s.totalTxCostsLamports !== undefined ? BigInt(s.totalTxCostsLamports) : undefined,
+      netPnlLamports: s.netPnlLamports !== undefined ? BigInt(s.netPnlLamports) : undefined,
+      grossPnlLamports: s.grossPnlLamports !== undefined ? BigInt(s.grossPnlLamports) : undefined,
+      netReturnPct: s.netReturnPct,
+      holdDurationSec: s.holdDurationSec,
+    });
+
+    this.observedTokens.clear();
+    for (const t of state.observedTokens) {
+      this.observedTokens.set(t.mint, {
+        mint: t.mint,
+        creatorWallet: t.creatorWallet,
+        launchTimestampUnixMs: t.launchTimestampUnixMs,
+        firstSlot: t.firstSlot,
+        lastSlot: t.lastSlot,
+        tradeCount: t.tradeCount,
+        buyCount: t.buyCount,
+        sellCount: t.sellCount,
+        currentRealSolLamports: BigInt(t.currentRealSolLamports),
+        crossed50AtUnixMs: t.crossed50AtUnixMs,
+        crossed84_5AtUnixMs: t.crossed84_5AtUnixMs,
+        recentBuyVolumeLamports: BigInt(t.recentBuyVolumeLamports),
+        recentSellVolumeLamports: BigInt(t.recentSellVolumeLamports),
+        latestActivityUnixMs: t.latestActivityUnixMs,
+      });
+    }
+
+    this.positions.clear();
+    for (const p of state.positions) {
+      this.positions.set(p.mint, deserializePos(p));
+    }
+
+    this.closedTrades.length = 0;
+    for (const p of state.closedTrades) {
+      this.closedTrades.push(deserializePos(p));
+    }
+
+    this.censoredTrades.length = 0;
+    for (const p of state.censoredTrades) {
+      this.censoredTrades.push(deserializePos(p));
+    }
+
+    this.unresolvedMigrationTrades.length = 0;
+    for (const p of state.unresolvedMigrationTrades) {
+      this.unresolvedMigrationTrades.push(deserializePos(p));
+    }
   }
 }

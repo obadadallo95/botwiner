@@ -94,6 +94,9 @@ importers:
       '@botwiner/storage':
         specifier: workspace:*
         version: link:../../packages/storage
+      '@google-cloud/run':
+        specifier: ^4.0.0
+        version: 4.0.0(supports-color@7.2.0)
 
   apps/comparator:
     dependencies:

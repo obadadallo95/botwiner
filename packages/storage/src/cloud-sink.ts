@@ -147,6 +147,7 @@ export interface GcsStorageUploaderOptions {
   readonly maxAttempts?: number;
   readonly baseDelayMs?: number;
   readonly maxDelayMs?: number;
+  readonly timeoutMs?: number;
   readonly sleepFn?: (ms: number) => Promise<void>;
   readonly bucketFactory?: () => Bucket;
   readonly logger?: {
@@ -157,6 +158,7 @@ export interface GcsStorageUploaderOptions {
 
 export interface CloudStorageUploader {
   uploadBuffer(destinationPath: string, buffer: Buffer, contentType: string): Promise<void>;
+  downloadBuffer?(sourcePath: string): Promise<Buffer>;
 }
 
 export class GcsStorageUploader implements CloudStorageUploader {
@@ -206,21 +208,35 @@ export class GcsStorageUploader implements CloudStorageUploader {
   public async uploadBuffer(destinationPath: string, buffer: Buffer, contentType: string): Promise<void> {
     const maxAttempts = this.retryOptions.maxAttempts ?? 8;
     const baseDelayMs = this.retryOptions.baseDelayMs ?? 1000;
-    const maxDelayMs = this.retryOptions.maxDelayMs ?? 15000;
+    const maxDelayMs = this.retryOptions.maxDelayMs ?? 30000;
+    const timeoutMs = this.retryOptions.timeoutMs ?? 60000;
     const sleep = this.retryOptions.sleepFn ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
     let attempt = 0;
     while (attempt < maxAttempts) {
       attempt += 1;
+      let timer: NodeJS.Timeout | undefined;
       try {
         const file = this.bucket.file(destinationPath);
-        await file.save(buffer, {
-          resumable: false,
-          contentType,
-          metadata: {
-            cacheControl: "no-cache",
-          },
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            const err = new Error(`GCS upload for "${destinationPath}" timed out after ${timeoutMs}ms`);
+            (err as unknown as Record<string, unknown>).code = "ETIMEDOUT";
+            reject(err);
+          }, timeoutMs);
         });
+
+        await Promise.race([
+          file.save(buffer, {
+            resumable: false,
+            contentType,
+            timeout: timeoutMs,
+            metadata: {
+              cacheControl: "no-cache",
+            },
+          }),
+          timeoutPromise,
+        ]);
         return;
       } catch (error) {
         const retryable = isRetryableStorageError(error);
@@ -236,12 +252,13 @@ export class GcsStorageUploader implements CloudStorageUploader {
           throw error;
         }
 
-        // Recreate the storage client transport to discard broken sockets / pooled keepalive connections
-        this.recreateStorageClient();
+        const exponentialDelay = baseDelayMs * Math.pow(2, attempt - 1);
+        const jitter = Math.random() * 500;
+        const delayMs = Math.min(maxDelayMs, Math.round(exponentialDelay + jitter));
 
-        const backoffMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
-        const jitterMs = Math.floor(Math.random() * 500);
-        const delayMs = backoffMs + jitterMs;
+        if (errCode === "ECONNRESET" || errCode === "EPIPE" || errCode === "ETIMEDOUT") {
+          this.recreateStorageClient();
+        }
 
         this.logger.warn(
           `[GcsStorageUploader] Transient upload failure for "${destinationPath}" on attempt ${attempt}/${maxAttempts} (${errCode}). Retrying in ${delayMs}ms...`,
@@ -249,9 +266,26 @@ export class GcsStorageUploader implements CloudStorageUploader {
         );
 
         await sleep(delayMs);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
       }
     }
   }
+
+  public async downloadBuffer(sourcePath: string): Promise<Buffer> {
+    const file = this.bucket.file(sourcePath);
+    const [contents] = await file.download();
+    return contents;
+  }
+}
+
+export async function downloadGcsFile(bucketName: string, filePath: string, projectId?: string): Promise<Buffer> {
+  const options: ConstructorParameters<typeof Storage>[0] = {};
+  if (projectId !== undefined) options.projectId = projectId;
+  const storage = new Storage(options);
+  const file = storage.bucket(bucketName).file(filePath);
+  const [contents] = await file.download();
+  return contents;
 }
 
 export interface CloudResearchSinkOptions extends CreateDatasetOptions {
@@ -261,6 +295,10 @@ export interface CloudResearchSinkOptions extends CreateDatasetOptions {
   readonly durationSeconds?: number | null | undefined;
   readonly chunkIntervalMs?: number | undefined;
   readonly chunkMaxRecords?: number | undefined;
+  readonly startChunkIndex?: number | undefined;
+  readonly initialChunks?: readonly CloudChunkMetadata[] | undefined;
+  readonly initialDiagnosticChunks?: readonly CloudDiagnosticsChunkMetadata[] | undefined;
+  readonly initialCompressedBytes?: number | undefined;
   readonly onChunkRotated?: ((metadata: CloudChunkMetadata) => void) | undefined;
   readonly onTerminalError?: ((error: Error) => void) | undefined;
 }
@@ -311,6 +349,17 @@ export class CloudResearchSink implements ResearchSink {
     this.requestedDurationSec = options.durationSeconds ?? null;
     this.chunkIntervalMs = options.chunkIntervalMs ?? 60_000;
     this.chunkMaxRecords = options.chunkMaxRecords ?? 10_000;
+    this.currentChunkIndex = options.startChunkIndex ?? 1;
+    this.lastCommittedChunkIndex = (options.startChunkIndex ?? 1) - 1;
+    if (options.initialChunks) {
+      this.chunks.push(...options.initialChunks);
+    }
+    if (options.initialDiagnosticChunks) {
+      this.diagnosticChunks.push(...options.initialDiagnosticChunks);
+    }
+    if (options.initialCompressedBytes) {
+      this.totalCompressedBytes = options.initialCompressedBytes;
+    }
     if (options.onChunkRotated !== undefined) {
       this.onChunkRotated = options.onChunkRotated;
     }
@@ -330,9 +379,11 @@ export class CloudResearchSink implements ResearchSink {
   }
 
   public static async create(options: CloudResearchSinkOptions): Promise<CloudResearchSink> {
-    const sink = new CloudResearchSink(options);
-    await sink.syncManifest();
-    return sink;
+    return await Promise.resolve(new CloudResearchSink(options));
+  }
+
+  public getUploader(): CloudStorageUploader {
+    return this.uploader;
   }
 
   public getSessionId(): string {
@@ -520,6 +571,15 @@ export class CloudResearchSink implements ResearchSink {
         endAtUnixMs: endMs,
       };
 
+      // Write immutable per-chunk metadata (zero mutable hotspotting)
+      const metaFileName = `chunks/events-${chunkIdxPadded}.meta.json`;
+      const metaDestinationPath = `sessions/${this.options.sessionId}/${metaFileName}`;
+      await this.uploader.uploadBuffer(
+        metaDestinationPath,
+        Buffer.from(bigintSafeJsonStringify(chunkMeta, 2), "utf8"),
+        "application/json",
+      );
+
       const existingIdx = this.chunks.findIndex((c) => c.index === chunkIdx);
       const existingChunk = existingIdx >= 0 ? this.chunks[existingIdx] : undefined;
       if (existingChunk !== undefined) {
@@ -555,6 +615,14 @@ export class CloudResearchSink implements ResearchSink {
         sha256,
       };
 
+      const diagMetaFileName = `diagnostics/diagnostics-${chunkIdxPadded}.meta.json`;
+      const diagMetaDestinationPath = `sessions/${this.options.sessionId}/${diagMetaFileName}`;
+      await this.uploader.uploadBuffer(
+        diagMetaDestinationPath,
+        Buffer.from(bigintSafeJsonStringify(diagMeta, 2), "utf8"),
+        "application/json",
+      );
+
       const existingDiagIdx = this.diagnosticChunks.findIndex((d) => d.index === chunkIdx);
       const existingDiag = existingDiagIdx >= 0 ? this.diagnosticChunks[existingDiagIdx] : undefined;
       if (existingDiag !== undefined) {
@@ -572,12 +640,17 @@ export class CloudResearchSink implements ResearchSink {
     this.currentDiagnosticsBuffer = [];
     this.currentChunkStartMs = Date.now();
     this.currentChunkIndex += 1;
-
-    // Update manifest in flight
-    await this.syncManifest();
   }
 
-  private async syncManifest(endedAt: string | null = null): Promise<void> {
+  public getChunks(): readonly CloudChunkMetadata[] {
+    return [...this.chunks];
+  }
+
+  public getDiagnosticChunks(): readonly CloudDiagnosticsChunkMetadata[] {
+    return [...this.diagnosticChunks];
+  }
+
+  public async syncManifest(endedAt: string | null = null): Promise<void> {
     const manifest: CloudDatasetManifest = {
       schemaVersion: 1,
       sessionId: this.options.sessionId,

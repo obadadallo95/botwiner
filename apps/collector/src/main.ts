@@ -1,4 +1,5 @@
 import { basename, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import {
@@ -26,13 +27,25 @@ import {
   type ReceivedGrpcMessage,
   type ReceivedLogsMessage,
 } from "@botwiner/solana";
-import { DatasetWriter, CloudResearchSink, type ResearchSink } from "@botwiner/storage";
+import {
+  DatasetWriter,
+  CloudResearchSink,
+  downloadGcsFile,
+  type ResearchSink,
+  type CloudChunkMetadata,
+  type CloudDiagnosticsChunkMetadata,
+} from "@botwiner/storage";
 import {
   GraduationTracker,
   FirestoreTelemetryReporter,
   PaperTradingEngine,
   MultiPortfolioEngine,
   TraderPnlTracker,
+  createCheckpointFromEngines,
+  restoreEnginesFromCheckpoint,
+  deserializeCheckpoint,
+  serializeCheckpoint,
+  type CheckpointCursor,
 } from "@botwiner/research";
 
 interface CollectorCliOptions {
@@ -49,6 +62,12 @@ interface CollectorCliOptions {
   readonly ntpIntervalSeconds: number;
   readonly sink: "local" | "cloud";
   readonly sessionId: string;
+  readonly segmentId: string;
+  readonly segmentIndex: number;
+  readonly totalSegmentsExpected: number;
+  readonly segmentDurationSeconds: number;
+  readonly logicalDurationSeconds: number;
+  readonly checkpointPath: string | undefined;
   readonly comparison: {
     readonly comparisonId: string;
     readonly feedId: "public" | "candidate";
@@ -146,6 +165,17 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
       ? "cloud"
       : "local";
   let sessionId = process.env.RESEARCH_SESSION_ID ?? basename(outputDirectory);
+  let segmentIndex = Number(process.env.RESEARCH_SEGMENT_INDEX ?? "1");
+  let segmentDurationSeconds = Number(process.env.RESEARCH_SEGMENT_DURATION_SECONDS ?? "1800");
+  let logicalDurationSeconds = Number(
+    process.env.RESEARCH_LOGICAL_DURATION_SECONDS ?? (durationSeconds ?? segmentDurationSeconds)
+  );
+  let checkpointPath: string | undefined = process.env.RESEARCH_CHECKPOINT_PATH;
+  let totalSegmentsExpected = Number(
+    process.env.RESEARCH_TOTAL_SEGMENTS ?? Math.max(1, Math.ceil(logicalDurationSeconds / segmentDurationSeconds))
+  );
+  let segmentId =
+    process.env.RESEARCH_SEGMENT_ID ?? `${sessionId}-seg-${String(segmentIndex).padStart(4, "0")}`;
   let ntpHost: string | null = process.env.NTP_HOST ?? "time.cloudflare.com";
   let ntpIntervalSeconds = Number(process.env.NTP_INTERVAL_SECONDS ?? "300");
   const comparisonId = process.env.BOTWINER_COMPARISON_ID;
@@ -179,6 +209,12 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
         ntpIntervalSeconds,
         sink,
         sessionId,
+        segmentId,
+        segmentIndex,
+        totalSegmentsExpected,
+        segmentDurationSeconds,
+        logicalDurationSeconds,
+        checkpointPath,
         comparison,
       };
     }
@@ -223,6 +259,40 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
       if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
         throw new Error(`invalid duration: ${raw}`);
       }
+      index += 1;
+      continue;
+    }
+    if (argument === "--segment-index") {
+      const raw = requireNext(arguments_, index, argument);
+      segmentIndex = Number(raw);
+      index += 1;
+      continue;
+    }
+    if (argument === "--segment-id") {
+      segmentId = requireNext(arguments_, index, argument);
+      index += 1;
+      continue;
+    }
+    if (argument === "--segment-duration-seconds") {
+      const raw = requireNext(arguments_, index, argument);
+      segmentDurationSeconds = Number(raw);
+      index += 1;
+      continue;
+    }
+    if (argument === "--logical-duration-seconds") {
+      const raw = requireNext(arguments_, index, argument);
+      logicalDurationSeconds = Number(raw);
+      index += 1;
+      continue;
+    }
+    if (argument === "--checkpoint-path") {
+      checkpointPath = requireNext(arguments_, index, argument);
+      index += 1;
+      continue;
+    }
+    if (argument === "--total-segments") {
+      const raw = requireNext(arguments_, index, argument);
+      totalSegmentsExpected = Number(raw);
       index += 1;
       continue;
     }
@@ -299,6 +369,23 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
   if (endpointLabel.length === 0 || endpointLabel.length > 100 || /[?&#@=\s]/u.test(endpointLabel)) {
     throw new Error("endpoint label must not contain credentials, query parameters, or whitespace");
   }
+
+  // Calculate this worker process's run duration
+  if (durationSeconds !== null && process.env.RESEARCH_LOGICAL_DURATION_SECONDS === undefined && !arguments_.includes("--logical-duration-seconds")) {
+    logicalDurationSeconds = durationSeconds;
+    if (process.env.RESEARCH_SEGMENT_DURATION_SECONDS === undefined && !arguments_.includes("--segment-duration-seconds")) {
+      segmentDurationSeconds = durationSeconds;
+      totalSegmentsExpected = 1;
+    }
+  }
+
+  const remainingLogicalSec = Math.max(0, logicalDurationSeconds - segmentIndex * segmentDurationSeconds);
+  const thisSegmentDuration = Math.min(segmentDurationSeconds, remainingLogicalSec > 0 ? remainingLogicalSec : segmentDurationSeconds);
+  durationSeconds = thisSegmentDuration;
+  if (!segmentId || (segmentId === `${sessionId}-s0` && segmentIndex > 0)) {
+    segmentId = `${sessionId}-s${segmentIndex}`;
+  }
+
   return {
     transport,
     feedProvider,
@@ -313,6 +400,12 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
     ntpIntervalSeconds,
     sink,
     sessionId,
+    segmentId,
+    segmentIndex,
+    totalSegmentsExpected,
+    segmentDurationSeconds,
+    logicalDurationSeconds,
+    checkpointPath,
     comparison,
   };
 }
@@ -438,21 +531,83 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
 
   const traderPnlTracker = new TraderPnlTracker();
 
+  const seenEventIds = new Set<string>();
+  const recentEventIds: string[] = [];
+  let handoffGapMs: number | null = null;
+  let handoffOverlapCount = 0;
+  let lastEventCursor: CheckpointCursor | null = null;
+  let lastCheckpointCursor: CheckpointCursor | null = null;
+  let initialChunkIndex = 1;
+  let initialCompressedBytes = 0;
+  const initialChunks: CloudChunkMetadata[] = [];
+  const initialDiagnosticChunks: CloudDiagnosticsChunkMetadata[] = [];
+
+  if (options.checkpointPath) {
+    try {
+      console.log(`[Collector] Restoring state from checkpoint: ${options.checkpointPath}`);
+      let rawJson: string;
+      if (options.sink === "cloud") {
+        const bucket = process.env.GCS_BUCKET ?? "your-gcs-bucket";
+        const projectId = process.env.GCP_PROJECT_ID ?? "your-gcp-project-id";
+        const buffer = await downloadGcsFile(bucket, options.checkpointPath, projectId);
+        rawJson = buffer.toString("utf8");
+      } else {
+        rawJson = await readFile(resolve(options.checkpointPath), "utf8");
+      }
+      const checkpoint = deserializeCheckpoint(rawJson);
+      restoreEnginesFromCheckpoint(checkpoint, {
+        portfolios,
+        paperTrading: paperTradingEngine,
+        traderPnl: traderPnlTracker,
+      });
+      for (const id of checkpoint.recentEventIds) {
+        seenEventIds.add(id);
+      }
+      recentEventIds.push(...checkpoint.recentEventIds);
+      lastCheckpointCursor = checkpoint.cursor;
+      lastEventCursor = checkpoint.cursor;
+      sequence = checkpoint.cursor.collectorSequence;
+      initialChunkIndex = checkpoint.lastCommittedChunkIndex + 1;
+      initialCompressedBytes = checkpoint.totalCompressedBytes;
+      if (checkpoint.completedChunks) {
+        initialChunks.push(...checkpoint.completedChunks);
+      }
+      if (checkpoint.completedDiagnosticChunks) {
+        initialDiagnosticChunks.push(...checkpoint.completedDiagnosticChunks);
+      }
+      console.log(
+        `[Collector] Restored state from checkpoint "${options.checkpointPath}": cursor lastEventTimestampMs=${checkpoint.cursor.lastEventTimestampMs}, openPositions=${portfolios.summary().portfolios[0]?.openPositions ?? 0}, nextChunk=${initialChunkIndex}`
+      );
+    } catch (err) {
+      console.error(`[Collector] Failed to restore from checkpoint "${options.checkpointPath}":`, err);
+      throw err;
+    }
+  }
+
   if (options.sink === "cloud") {
     const bucket = process.env.GCS_BUCKET ?? "your-gcs-bucket";
     const projectId = process.env.GCP_PROJECT_ID ?? "your-gcp-project-id";
     telemetryReporter = new FirestoreTelemetryReporter({
       sessionId: options.sessionId,
+      segmentId: options.segmentId,
+      segmentIndex: options.segmentIndex,
+      totalSegmentsExpected: options.totalSegmentsExpected,
       mode: process.env.RESEARCH_MODE ?? "graduation-research",
       provider: options.feedProvider,
       region: process.env.GCP_REGION ?? "europe-west3",
-      requestedDurationSec: options.durationSeconds,
+      requestedDurationSec: options.logicalDurationSeconds,
       gcpProjectId: projectId,
       firestoreDatabase: process.env.FIRESTORE_DATABASE ?? "(default)",
-      heartbeatIntervalMs: Number(process.env.HEARTBEAT_INTERVAL_SECONDS ?? "15") * 1000,
-      statsIntervalMs: Number(process.env.STATS_FLUSH_INTERVAL_SECONDS ?? "5") * 1000,
+      heartbeatIntervalMs: Number(process.env.HEARTBEAT_INTERVAL_SECONDS ?? "60") * 1000,
+      statsIntervalMs: Number(process.env.STATS_FLUSH_INTERVAL_SECONDS ?? "60") * 1000,
     });
     await telemetryReporter.initialize();
+    await telemetryReporter.recordSegmentStart({
+      segmentId: options.segmentId,
+      segmentIndex: options.segmentIndex,
+      totalSegmentsExpected: options.totalSegmentsExpected,
+      checkpointPath: options.checkpointPath,
+    });
 
     cloudSink = await CloudResearchSink.create({
       directory: options.outputDirectory,
@@ -466,6 +621,10 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       gcsBucket: bucket,
       gcpProjectId: projectId,
       durationSeconds: options.durationSeconds,
+      startChunkIndex: initialChunkIndex,
+      initialChunks,
+      initialDiagnosticChunks,
+      initialCompressedBytes,
       onChunkRotated: (chunk) => {
         telemetryReporter?.updateChunkAndBytes(chunk.index, cloudSink?.getTotalCompressedBytes() ?? 0);
       },
@@ -571,6 +730,49 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     controller.abort();
   }
 
+  function handleEvents(events: readonly NormalizedMarketEvent[]): readonly NormalizedMarketEvent[] {
+    const acceptedEvents: NormalizedMarketEvent[] = [];
+    for (const event of events) {
+      if (seenEventIds.has(event.eventId)) {
+        handoffOverlapCount += 1;
+        continue;
+      }
+      seenEventIds.add(event.eventId);
+      recentEventIds.push(event.eventId);
+      if (recentEventIds.length > 10_000) {
+        recentEventIds.shift();
+      }
+
+      if (lastCheckpointCursor !== null && handoffGapMs === null) {
+        handoffGapMs = Math.max(0, event.timestamps.collectorReceivedAtUnixMs - lastCheckpointCursor.lastEventTimestampMs);
+        console.log(
+          `[Collector] Handoff gap measured: ${handoffGapMs}ms from checkpoint at ${lastCheckpointCursor.lastEventTimestampMs}`
+        );
+      }
+
+      lastEventCursor = {
+        collectorSequence: sequence,
+        transactionLogIndex: 0,
+        slot: event.ordering.slot,
+        lastEventId: event.eventId,
+        lastEventTimestampMs: event.timestamps.collectorReceivedAtUnixMs,
+      };
+
+      portfolios.onEvent(event);
+      if (event.eventType === "launch") {
+        graduationTracker.onLaunch(event);
+        paperTradingEngine.onLaunch(event);
+        traderPnlTracker.onLaunch(event);
+      } else if (event.eventType === "trade") {
+        graduationTracker.onTrade(event);
+        paperTradingEngine.onTrade(event);
+        traderPnlTracker.onTrade(event);
+      }
+      acceptedEvents.push(event);
+    }
+    return acceptedEvents;
+  }
+
   function recordNotification(message: ReceivedLogsMessage): Promise<void> {
     sequence += 1;
     const provisionalRaw: RawLogRecord = {
@@ -618,18 +820,8 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       },
     };
     const finalEvents = applyFinalCapture(normalized.events, raw);
-    for (const event of finalEvents) {
-      portfolios.onEvent(event);
-      if (event.eventType === "launch") {
-        graduationTracker.onLaunch(event);
-        paperTradingEngine.onLaunch(event);
-        traderPnlTracker.onLaunch(event);
-      } else if (event.eventType === "trade") {
-        graduationTracker.onTrade(event);
-        paperTradingEngine.onTrade(event);
-        traderPnlTracker.onTrade(event);
-      }
-    }
+    handleEvents(finalEvents);
+
     if (telemetryReporter !== null) {
       telemetryReporter.updateTelemetry(
         writer.snapshotCounts(),
@@ -698,18 +890,8 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       },
     };
     const finalEvents = applyFinalCapture(normalized.events, raw);
-    for (const event of finalEvents) {
-      portfolios.onEvent(event);
-      if (event.eventType === "launch") {
-        graduationTracker.onLaunch(event);
-        paperTradingEngine.onLaunch(event);
-        traderPnlTracker.onLaunch(event);
-      } else if (event.eventType === "trade") {
-        graduationTracker.onTrade(event);
-        paperTradingEngine.onTrade(event);
-        traderPnlTracker.onTrade(event);
-      }
-    }
+    handleEvents(finalEvents);
+
     if (telemetryReporter !== null) {
       telemetryReporter.updateTelemetry(
         writer.snapshotCounts(),
@@ -736,6 +918,12 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       bigintSafeJsonStringify({
         status: "collecting",
         dataset: options.outputDirectory,
+        sessionId: options.sessionId,
+        segmentId: options.segmentId,
+        segmentIndex: options.segmentIndex,
+        totalSegmentsExpected: options.totalSegmentsExpected,
+        segmentDurationSeconds: options.segmentDurationSeconds,
+        logicalDurationSeconds: options.logicalDurationSeconds,
         endpointLabel,
         commitment: options.commitment,
         programId: PUMP_PROGRAM_ID,
@@ -810,16 +998,23 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     }
     process.removeListener("SIGINT", stopForSignal);
     process.removeListener("SIGTERM", stopForSignal);
-    paperTradingEngine.onSessionEnd(Date.now());
-    portfolios.onSessionEnd();
-    telemetryReporter?.updatePortfolioStats(portfolios.summary(true));
+
+    const isFinalSegment = options.segmentIndex >= options.totalSegmentsExpected;
+    const hasFailure = failureState.error !== undefined || storageShutdownError !== null;
+    const isCleanSegmentComplete = !hasFailure && !stoppedBySignal;
+
+    if (isFinalSegment || !isCleanSegmentComplete) {
+      paperTradingEngine.onSessionEnd(Date.now());
+      portfolios.onSessionEnd();
+    }
+
     if (telemetryReporter !== null) {
       updatePortfolioTelemetry();
       telemetryReporter.updatePaperStats(paperTradingEngine.getStats());
       telemetryReporter.updateMarketParticipantStats(traderPnlTracker.getStats());
     }
-    storageShutdownError = null;
-    const finalStatus = failureState.error === undefined && !stoppedBySignal ? "complete" : "aborted";
+
+    const finalStatus = isCleanSegmentComplete ? "complete" : "aborted";
     try {
       await writer.close(finalStatus);
     } catch (storageErr) {
@@ -827,11 +1022,66 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       console.error("[Collector] Storage shutdown error:", storageErr);
     }
 
-    if (cloudSink !== null) {
+    let checkpointGcsPath: string | undefined;
+    if (cloudSink !== null && isCleanSegmentComplete && !isFinalSegment) {
+      try {
+        const checkpoint = createCheckpointFromEngines({
+          sessionId: options.sessionId,
+          segmentId: options.segmentId,
+          segmentIndex: options.segmentIndex,
+          cursor: lastEventCursor ?? lastCheckpointCursor ?? {
+            collectorSequence: sequence,
+            transactionLogIndex: 0,
+            lastEventTimestampMs: Date.now(),
+          },
+          recentEventIds,
+          datasetCounts: writer.snapshotCounts(),
+          lastCommittedChunkIndex: cloudSink.getLastCommittedChunkIndex(),
+          totalCompressedBytes: cloudSink.getTotalCompressedBytes(),
+          completedChunks: cloudSink.getChunks(),
+          completedDiagnosticChunks: cloudSink.getDiagnosticChunks(),
+          portfolios,
+          paperTrading: paperTradingEngine,
+          traderPnl: traderPnlTracker,
+        });
+
+        const checkpointFileName = `checkpoints/checkpoint-${options.segmentId}.json`;
+        checkpointGcsPath = `sessions/${options.sessionId}/${checkpointFileName}`;
+        await cloudSink.getUploader().uploadBuffer(
+          checkpointGcsPath,
+          Buffer.from(serializeCheckpoint(checkpoint), "utf8"),
+          "application/json"
+        );
+        console.log(`[Collector] Persisted durable checkpoint to ${checkpointGcsPath}`);
+
+        if (telemetryReporter !== null) {
+          await telemetryReporter.recordSegmentCheckpoint(checkpointGcsPath, {
+            cursor: checkpoint.cursor,
+          });
+          await telemetryReporter.recordSegmentComplete({
+            status: "completed",
+            checkpointPath: checkpointGcsPath,
+            chunksWritten: cloudSink.getChunks().length,
+            handoffGapMs,
+            handoffOverlapCount,
+            lastCommittedChunkIndex: cloudSink.getLastCommittedChunkIndex(),
+          });
+          const nextSegmentId = `${options.sessionId}-seg-${String(options.segmentIndex + 1).padStart(4, "0")}`;
+          await telemetryReporter.closeSegment(options.segmentId, options.segmentIndex, nextSegmentId);
+        }
+      } catch (checkpointErr) {
+        console.error("[Collector] Failed to persist segment checkpoint:", checkpointErr);
+        storageShutdownError = checkpointErr;
+      }
+    }
+
+    if (cloudSink !== null && isCleanSegmentComplete && isFinalSegment) {
       try {
         await cloudSink.uploadDerivedSummary("portfolio-summary", portfolios.summary());
         await cloudSink.uploadDerivedSummary("paper-trading-summary", paperTradingEngine.getStats());
         await cloudSink.uploadDerivedSummary("participant-analytics-summary", traderPnlTracker.getStats());
+        await cloudSink.syncManifest();
+        console.log(`[Collector] Final segment complete. Uploaded derived summaries and finalized manifest.`);
       } catch (err) {
         storageShutdownError = err;
         console.warn("[Collector] Failed to upload derived summaries to GCS:", err);
@@ -839,21 +1089,85 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     }
 
     if (telemetryReporter !== null) {
-      const hasFailure = failureState.error !== undefined || storageShutdownError !== null;
-      const finalStatusToReport = stoppedBySignal
-        ? "cancelled"
-        : (hasFailure ? "failed" : "completed");
-
-      if (hasFailure) {
+      if (hasFailure || stoppedBySignal) {
+        const finalStatusToReport = stoppedBySignal ? "cancelled" : "failed";
         const errorToReport = failureState.error ?? storageShutdownError;
-        const msg = errorToReport instanceof Error ? errorToReport.message : String(errorToReport);
-        telemetryReporter.reportError(msg);
+        const errorMsg =
+          errorToReport instanceof Error
+            ? errorToReport.message
+            : typeof errorToReport === "string"
+              ? errorToReport
+              : JSON.stringify(errorToReport);
+        if (errorToReport) {
+          telemetryReporter.reportError(errorMsg);
+        }
+        try {
+          await telemetryReporter.recordSegmentComplete({
+            status: finalStatusToReport,
+            checkpointPath: options.checkpointPath ?? null,
+            error: errorToReport ? errorMsg : null,
+          });
+          await telemetryReporter.close(finalStatusToReport);
+        } catch (telemetryErr) {
+          console.error("[Collector] Telemetry cleanup error during failure shutdown:", telemetryErr);
+        }
+      } else if (isFinalSegment) {
+        try {
+          await telemetryReporter.recordSegmentComplete({
+            status: "completed",
+            finalSegment: true,
+            chunksWritten: cloudSink?.getChunks().length ?? 0,
+            handoffGapMs,
+            handoffOverlapCount,
+          });
+          await telemetryReporter.close("completed");
+        } catch (telemetryErr) {
+          console.error("[Collector] Telemetry cleanup error during final shutdown:", telemetryErr);
+        }
       }
+    }
 
+    // Auto-dispatch next segment if running in cloud and segment completed cleanly:
+    if (options.sink === "cloud" && isCleanSegmentComplete && !isFinalSegment && checkpointGcsPath) {
       try {
-        await telemetryReporter.close(finalStatusToReport);
-      } catch (telemetryErr) {
-        console.error("[Collector] Telemetry cleanup error during shutdown:", telemetryErr);
+        const nextSegmentIndex = options.segmentIndex + 1;
+        const nextSegmentId = `${options.sessionId}-seg-${String(nextSegmentIndex).padStart(4, "0")}`;
+        console.log(`[Collector] Dispatching next segment ${nextSegmentIndex}/${options.totalSegmentsExpected} (${nextSegmentId})`);
+
+        const { JobsClient } = await import("@google-cloud/run");
+        const projectId = process.env.GCP_PROJECT_ID ?? "your-gcp-project-id";
+        const region = process.env.GCP_REGION ?? "europe-west3";
+        const jobName = process.env.CLOUD_RUN_JOB_NAME ?? "pump-collector-runner";
+        const jobFullName = `projects/${projectId}/locations/${region}/jobs/${jobName}`;
+
+        const jobsClient = new JobsClient();
+        const [operation] = await jobsClient.runJob({
+          name: jobFullName,
+          overrides: {
+            containerOverrides: [
+              {
+                env: [
+                  { name: "RESEARCH_SESSION_ID", value: options.sessionId },
+                  { name: "RESEARCH_SEGMENT_INDEX", value: String(nextSegmentIndex) },
+                  { name: "RESEARCH_SEGMENT_ID", value: nextSegmentId },
+                  { name: "RESEARCH_TOTAL_SEGMENTS", value: String(options.totalSegmentsExpected) },
+                  { name: "RESEARCH_SEGMENT_DURATION_SECONDS", value: String(options.segmentDurationSeconds) },
+                  { name: "RESEARCH_LOGICAL_DURATION_SECONDS", value: String(options.logicalDurationSeconds) },
+                  { name: "RESEARCH_CHECKPOINT_PATH", value: checkpointGcsPath },
+                  { name: "RESEARCH_MODE", value: process.env.RESEARCH_MODE ?? "graduation-research" },
+                  { name: "GCS_BUCKET", value: process.env.GCS_BUCKET ?? "your-gcs-bucket" },
+                  { name: "GCP_PROJECT_ID", value: projectId },
+                  { name: "GCP_REGION", value: region },
+                  { name: "BOTWINER_FEED_PROVIDER", value: options.feedProvider },
+                  { name: "BOTWINER_SINK", value: "cloud" },
+                ],
+              },
+            ],
+          },
+        });
+        console.log(`[Collector] Successfully dispatched Cloud Run Job execution for ${nextSegmentId}: ${operation.name ?? "unnamed"}`);
+      } catch (dispatchErr) {
+        console.error("[Collector] Failed to dispatch next segment Cloud Run Job:", dispatchErr);
       }
     }
   }

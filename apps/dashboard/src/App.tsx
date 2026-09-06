@@ -1,4 +1,5 @@
 import { Portfolios } from "./Portfolios.js";
+import { ResearchCommandCenter } from "./ResearchCommandCenter.js";
 import type { PortfolioSummary } from "../../../packages/research/src/portfolio-engine.js";
 import { useEffect, useState } from "react";
 import {
@@ -42,6 +43,26 @@ interface ResearchSession {
   bytesPersisted: number;
   latestEventAt: string | null;
   latestError: string | null;
+  segmentDurationSeconds?: number;
+  totalSegmentsExpected?: number;
+  currentSegmentIndex?: number;
+  currentSegmentId?: string;
+  checkpointPath?: string | null;
+}
+
+interface SegmentDoc {
+  segmentId: string;
+  segmentIndex: number;
+  status: string;
+  startedAt?: string;
+  completedAt?: string;
+  checkpointedAt?: string;
+  checkpointPath?: string;
+  chunksWritten?: number;
+  handoffGapMs?: number;
+  handoffOverlapCount?: number;
+  lastCommittedChunkIndex?: number;
+  error?: string | null;
 }
 
 interface GraduationStats {
@@ -333,9 +354,17 @@ export default function App() {
   const [creatorStats, setCreatorStats] = useState<CreatorAnalyticsData | null>(null);
   const [paperTradesList, setPaperTradesList] = useState<PaperTradeRow[]>([]);
   const [selectedSession, setSelectedSession] = useState<ResearchSession | null>(null);
+  const [sessionSegments, setSessionSegments] = useState<SegmentDoc[]>([]);
+  const [isLoadingSegments, setIsLoadingSegments] = useState(false);
+  const [selectedPortfolioStats, setSelectedPortfolioStats] = useState<PortfolioSummary | null>(null);
+  const [selectedPaperStats, setSelectedPaperStats] = useState<PaperTradingData | null>(null);
+  const [selectedMarketStats, setSelectedMarketStats] = useState<MarketParticipantData | null>(null);
+  const [selectedCreatorStats, setSelectedCreatorStats] = useState<CreatorAnalyticsData | null>(null);
+  const [selectedGradStats, setSelectedGradStats] = useState<GraduationStats | null>(null);
 
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [selectedDuration, setSelectedDuration] = useState(3600);
+  const [selectedSegmentDuration, setSelectedSegmentDuration] = useState(1800);
   const [isStarting, setIsStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [isStopping, setIsStopping] = useState(false);
@@ -619,6 +648,7 @@ export default function App() {
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           durationSeconds: selectedDuration,
+          segmentDurationSeconds: selectedSegmentDuration,
           mode: "graduation-research",
           provider: "helius",
         }),
@@ -637,6 +667,103 @@ export default function App() {
       setIsStarting(false);
     }
   };
+
+  const handleResumeSession = async (sessionId: string) => {
+    setIsStarting(true);
+    setStartError(null);
+    try {
+      const token = await getEffectiveToken();
+      if (!token) throw new Error("Authorization required. Please sign in or provide a token.");
+      const response = await fetch(`/api/sessions/${sessionId}/resume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      });
+      interface ResumeApiResponse {
+        sessionId?: string;
+        segmentIndex?: number;
+        segmentId?: string;
+        error?: string;
+      }
+      const data = (await response.json()) as ResumeApiResponse;
+      if (!response.ok) throw new Error(data.error || "Failed to resume session");
+      setSelectedSession(null);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!selectedSession) {
+      setSessionSegments([]);
+      setSelectedPortfolioStats(null);
+      setSelectedPaperStats(null);
+      setSelectedMarketStats(null);
+      setSelectedCreatorStats(null);
+      setSelectedGradStats(null);
+      return;
+    }
+    let isMounted = true;
+    setIsLoadingSegments(true);
+    void getEffectiveToken()
+      .then((tok) => {
+        const headers: Record<string, string> = tok ? { Authorization: `Bearer ${tok}` } : {};
+        const sessId = selectedSession.sessionId;
+
+        // Fetch segments
+        void fetch(`/api/sessions/${sessId}/segments`, { headers })
+          .then(async (r) => (r.ok ? (r.json() as Promise<{ segments?: SegmentDoc[] }>) : { segments: [] }))
+          .then((data: { segments?: SegmentDoc[] }) => {
+            if (isMounted && data.segments) setSessionSegments(data.segments);
+          })
+          .catch((err: unknown) => console.warn("Failed to load session segments:", err));
+
+        // If this is a historical session, load detailed analytics on-demand
+        if (sessId !== activeSession?.sessionId) {
+          void fetch(`/api/sessions/${sessId}/stats/portfolios`, { headers })
+            .then(async (r) => (r.ok ? (r.json() as Promise<{ portfolios?: PortfolioSummary | null }>) : null))
+            .then((data: { portfolios?: PortfolioSummary | null } | null) => {
+              if (isMounted && data?.portfolios) setSelectedPortfolioStats(data.portfolios);
+            })
+            .catch(() => {});
+
+          void fetch(`/api/sessions/${sessId}/stats/paper-trading`, { headers })
+            .then(async (r) => (r.ok ? (r.json() as Promise<{ paperTrading?: PaperTradingData | null }>) : null))
+            .then((data: { paperTrading?: PaperTradingData | null } | null) => {
+              if (isMounted && data?.paperTrading) setSelectedPaperStats(data.paperTrading);
+            })
+            .catch(() => {});
+
+          void fetch(`/api/sessions/${sessId}/stats/market-pnl`, { headers })
+            .then(async (r) => (r.ok ? (r.json() as Promise<{ marketPnl?: MarketParticipantData | null }>) : null))
+            .then((data: { marketPnl?: MarketParticipantData | null } | null) => {
+              if (isMounted && data?.marketPnl) setSelectedMarketStats(data.marketPnl);
+            })
+            .catch(() => {});
+
+          void fetch(`/api/sessions/${sessId}/stats/creator-analytics`, { headers })
+            .then(async (r) => (r.ok ? (r.json() as Promise<{ creatorAnalytics?: CreatorAnalyticsData | null }>) : null))
+            .then((data: { creatorAnalytics?: CreatorAnalyticsData | null } | null) => {
+              if (isMounted && data?.creatorAnalytics) setSelectedCreatorStats(data.creatorAnalytics);
+            })
+            .catch(() => {});
+
+          void fetch(`/api/sessions/${sessId}/stats`, { headers })
+            .then(async (r) => (r.ok ? (r.json() as Promise<{ stats?: GraduationStats | null }>) : null))
+            .then((data: { stats?: GraduationStats | null } | null) => {
+              if (isMounted && data?.stats) setSelectedGradStats(data.stats);
+            })
+            .catch(() => {});
+        }
+      })
+      .finally(() => {
+        if (isMounted) setIsLoadingSegments(false);
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, [selectedSession?.sessionId, activeSession?.sessionId]);
 
   const handleStopSession = async (sessionId: string) => {
     if (!confirm(`Stop active session ${sessionId}?`)) return;
@@ -1791,20 +1918,24 @@ export default function App() {
               and aggregates participant analytics.
             </div>
 
-            <label className="field-label">Target Duration</label>
+            <label className="field-label">Target Duration & Architecture</label>
             <div className="duration-selector">
               {[
-                { label: "3m (Smoke)", val: 180 },
-                { label: "15m", val: 900 },
-                { label: "1 Hour", val: 3600 },
-                { label: "6 Hours", val: 21600 },
-                { label: "24 Hours", val: 86400 },
+                { label: "3m (Smoke)", val: 180, segVal: 180 },
+                { label: "15m (1 Seg)", val: 900, segVal: 900 },
+                { label: "30m (3 × 10m Validation)", val: 1800, segVal: 600 },
+                { label: "1 Hour (2 × 30m)", val: 3600, segVal: 1800 },
+                { label: "6 Hours (12 × 30m)", val: 21600, segVal: 1800 },
+                { label: "24 Hours (48 × 30m)", val: 86400, segVal: 1800 },
               ].map((d) => (
                 <button
                   key={d.val}
                   type="button"
                   className={`duration-btn ${selectedDuration === d.val ? "selected" : ""}`}
-                  onClick={() => setSelectedDuration(d.val)}
+                  onClick={() => {
+                    setSelectedDuration(d.val);
+                    setSelectedSegmentDuration(d.segVal);
+                  }}
                 >
                   {d.label}
                 </button>
@@ -1891,60 +2022,41 @@ export default function App() {
         </div>
       )}
 
-      {/* Session details modal */}
+      {/* Professional Research Command Center */}
       {selectedSession && (
-        <div className="modal-overlay" onClick={() => setSelectedSession(null)}>
-          <div
-            className="modal-content"
-            style={{ maxWidth: "600px" }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="modal-header">
-              <h3 className="modal-title">Session Details</h3>
-              <button className="modal-close" onClick={() => setSelectedSession(null)}>
-                &times;
-              </button>
-            </div>
-
-            <div className="data-grid">
-              {[
-                ["Session ID", selectedSession.sessionId, true],
-                ["Status", selectedSession.status],
-                ["Duration", formatDuration(selectedSession.elapsedSec)],
-                ["Started At", new Date(selectedSession.startedAt).toLocaleString()],
-                ["Completed At", selectedSession.completedAt ? new Date(selectedSession.completedAt).toLocaleString() : "—"],
-                ["Total Events", selectedSession.totalEvents.toLocaleString()],
-                ["Launches", selectedSession.launchesDetected.toLocaleString()],
-                ["GCS Chunks", `${selectedSession.currentChunk} chunks`],
-                ["Total Size", formatBytes(selectedSession.bytesPersisted)],
-              ].map(([label, value, mono]) => (
-                <div key={label as string} className="data-row">
-                  <span className="field-label">{label}</span>
-                  <span className={`field-value${mono ? " field-mono" : ""}`}>{value}</span>
-                </div>
-              ))}
-            </div>
-
-            {selectedSession.latestError && (
-              <div
-                className="warning-box"
-                style={{
-                  marginTop: "1rem",
-                  borderColor: "rgba(239,68,68,0.4)",
-                  color: "#fca5a5",
-                }}
-              >
-                <strong>Error:</strong> {selectedSession.latestError}
-              </div>
-            )}
-
-            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "1.5rem" }}>
-              <button className="btn btn-secondary" onClick={() => setSelectedSession(null)}>
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
+        <ResearchCommandCenter
+          session={selectedSession}
+          segments={sessionSegments}
+          portfoliosData={
+            selectedSession.sessionId === activeSession?.sessionId
+              ? portfolioStats
+              : (selectedPortfolioStats ?? portfolioStats)
+          }
+          paperTradingData={
+            selectedSession.sessionId === activeSession?.sessionId
+              ? paperStats
+              : (selectedPaperStats ?? paperStats)
+          }
+          marketData={
+            selectedSession.sessionId === activeSession?.sessionId
+              ? marketStats
+              : (selectedMarketStats ?? marketStats)
+          }
+          creatorData={
+            selectedSession.sessionId === activeSession?.sessionId
+              ? creatorStats
+              : (selectedCreatorStats ?? creatorStats)
+          }
+          graduationStats={
+            selectedSession.sessionId === activeSession?.sessionId
+              ? gradStats
+              : (selectedGradStats ?? gradStats)
+          }
+          onClose={() => setSelectedSession(null)}
+          onResume={handleResumeSession}
+          isResuming={isStarting}
+          isLoading={isLoadingSegments}
+        />
       )}
     </div>
   );

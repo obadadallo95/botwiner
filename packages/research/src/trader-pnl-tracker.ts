@@ -881,5 +881,116 @@ export class TraderPnlTracker {
   public getCreatorAnalytics(mint: string): CreatorTokenAnalytics | undefined {
     return this.creatorPerMint.get(mint);
   }
+
+  public exportState(): SerializedTraderPnlState {
+    const creatorPerMint: SerializedCreatorTokenAnalytics[] = [];
+    for (const [mint, c] of this.creatorPerMint.entries()) {
+      creatorPerMint.push({
+        mint,
+        creatorWallet: c.creatorWallet,
+        launchTimestampUnixMs: c.launchTimestampUnixMs,
+        creatorInventoryQuality: c.creatorInventoryQuality,
+        dataQuality: c.dataQuality,
+        tokenBuys: c.tokenBuys,
+        tokenSells: c.tokenSells,
+        creatorTokensBought: c.creatorTokensBought.toString(),
+        creatorTokensSold: c.creatorTokensSold.toString(),
+        creatorInventoryUnits: c.creatorInventoryUnits.toString(),
+        solSpentLamports: c.solSpentLamports.toString(),
+        solReceivedLamports: c.solReceivedLamports.toString(),
+        observedNetSolExtractionLamports: c.observedNetSolExtractionLamports.toString(),
+        pctObservedInventorySold: c.pctObservedInventorySold,
+        firstSellDelaySec: c.firstSellDelaySec,
+        holdingStatus: c.holdingStatus,
+        lastActivityUnixMs: c.lastActivityUnixMs,
+      });
+    }
+
+    const tokenReserves = Array.from(this.tokenReserves.entries()).map(([mint, r]) => ({
+      mint,
+      virtualSolLamports: r.virtualSolLamports.toString(),
+      virtualTokenBaseUnits: r.virtualTokenBaseUnits.toString(),
+      realSolLamports: r.realSolLamports.toString(),
+      lastUpdatedUnixMs: r.lastUpdatedUnixMs,
+    }));
+
+    return {
+      sessionLaunches: Array.from(this.sessionLaunches.entries()),
+      creatorPerMint,
+      tokenReserves,
+    };
+  }
+
+  public importState(state: SerializedTraderPnlState): void {
+    this.sessionLaunches.clear();
+    for (const [mint, ts] of state.sessionLaunches) {
+      this.sessionLaunches.set(mint, ts);
+    }
+
+    this.creatorPerMint.clear();
+    for (const c of state.creatorPerMint) {
+      this.creatorPerMint.set(c.mint, {
+        mint: c.mint,
+        creatorWallet: c.creatorWallet,
+        launchTimestampUnixMs: c.launchTimestampUnixMs,
+        creatorInventoryQuality: c.creatorInventoryQuality,
+        dataQuality: c.dataQuality,
+        tokenBuys: c.tokenBuys,
+        tokenSells: c.tokenSells,
+        creatorTokensBought: BigInt(c.creatorTokensBought),
+        creatorTokensSold: BigInt(c.creatorTokensSold),
+        creatorInventoryUnits: BigInt(c.creatorInventoryUnits),
+        solSpentLamports: BigInt(c.solSpentLamports),
+        solReceivedLamports: BigInt(c.solReceivedLamports),
+        observedNetSolExtractionLamports: BigInt(c.observedNetSolExtractionLamports),
+        pctObservedInventorySold: c.pctObservedInventorySold,
+        firstSellDelaySec: c.firstSellDelaySec,
+        holdingStatus: c.holdingStatus,
+        lastActivityUnixMs: c.lastActivityUnixMs,
+      });
+    }
+
+    this.tokenReserves.clear();
+    for (const r of state.tokenReserves) {
+      this.tokenReserves.set(r.mint, {
+        virtualSolLamports: BigInt(r.virtualSolLamports),
+        virtualTokenBaseUnits: BigInt(r.virtualTokenBaseUnits),
+        realSolLamports: BigInt(r.realSolLamports),
+        lastUpdatedUnixMs: r.lastUpdatedUnixMs,
+      });
+    }
+  }
+}
+
+export interface SerializedCreatorTokenAnalytics {
+  readonly mint: string;
+  readonly creatorWallet: string;
+  readonly launchTimestampUnixMs: number;
+  creatorInventoryQuality: DataQualityState;
+  dataQuality?: DataQualityState | undefined;
+  tokenBuys: number;
+  tokenSells: number;
+  creatorTokensBought: string;
+  creatorTokensSold: string;
+  creatorInventoryUnits: string;
+  solSpentLamports: string;
+  solReceivedLamports: string;
+  observedNetSolExtractionLamports: string;
+  pctObservedInventorySold?: number | undefined;
+  firstSellDelaySec?: number | undefined;
+  holdingStatus: "holding" | "partially-exited" | "fully-exited" | "unknown-partial";
+  lastActivityUnixMs: number;
+}
+
+export interface SerializedTraderPnlState {
+  sessionLaunches: Array<[string, number]>;
+  creatorPerMint: SerializedCreatorTokenAnalytics[];
+  tokenReserves: Array<{
+    mint: string;
+    virtualSolLamports: string;
+    virtualTokenBaseUnits: string;
+    realSolLamports: string;
+    lastUpdatedUnixMs: number;
+  }>;
 }
 

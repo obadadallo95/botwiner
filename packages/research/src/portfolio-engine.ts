@@ -57,11 +57,66 @@ export interface PortfolioAuditRecord {
   action: string; mint: string | null; cashLamports: string; equityLamports: string;
   detail: Record<string, string | number>;
 }
+
+export interface SerializedPosition {
+  mint: string;
+  entryMs: number;
+  inputLamports: string;
+  outflowLamports: string;
+  quantityUnits: string;
+  markLamports: string;
+  grossMarkLamports: string;
+  exitFeeLamports: string;
+  entryLevel: number;
+  lastMarkMs: number;
+  status: "open" | "session-censored" | "migration-exit-unresolved";
+}
+
+export interface SerializedAccount {
+  id: string;
+  strategyId: string;
+  riskId: string;
+  bankroll: number;
+  startingLamports: string;
+  cashLamports: string;
+  realizedLamports: string;
+  grossLamports: string;
+  costsLamports: string;
+  peakLamports: string;
+  drawdownPct: number;
+  closedLamports: string[];
+  signals: number;
+  skips: number;
+  invalidQuotes: number;
+  curve: Array<{ timeMs: number; equitySol: number }>;
+  positions: SerializedPosition[];
+}
+
+export interface SerializedTokenState {
+  mint: string;
+  launchMs: number | null;
+  firstSlot?: number | undefined;
+  trades: number;
+  realSolLamports: string;
+  crossed: string[];
+}
+
+export interface SerializedPortfolioEngineState {
+  ended: boolean;
+  eventCount: number;
+  lastOrder: [number, number] | null;
+  timeMs: number;
+  auditCount: number;
+  auditSha256: string;
+  tokens: SerializedTokenState[];
+  accounts: SerializedAccount[];
+}
+
 export class MultiPortfolioEngine {
   private readonly eventIds = new Set<string>();
   private readonly tokens = new Map<string, Token>();
   private readonly accounts: Account[] = [];
-  private readonly audit = createHash("sha256");
+  private audit = createHash("sha256");
   private auditCount = 0;
   private eventCount = 0;
   private lastOrder: [number, number] | null = null;
@@ -87,14 +142,18 @@ export class MultiPortfolioEngine {
     this.audit.update(bigintSafeJsonStringify(record) + "\n");
     this.onAudit?.(record);
   }
-  private observe(a: Account): void {
-    const equity = this.equity(a);
-    a.peak = max(a.peak, equity);
-    a.drawdownPct = Math.max(a.drawdownPct, a.peak > 0n ? Number(a.peak - equity) / Number(a.peak) * 100 : 0);
-    const point = { timeMs: this.timeMs, equitySol: sol(equity) };
+  private updatePeakAndDrawdown(a: Account): void {
+    const eq = this.equity(a);
+    a.peak = max(a.peak, eq);
+    a.drawdownPct = Math.max(a.drawdownPct, a.peak > 0n ? Number(a.peak - eq) / Number(a.peak) * 100 : 0);
+  }
+  private recordEquityPoint(a: Account): void {
+    this.updatePeakAndDrawdown(a);
+    const eq = this.equity(a);
+    const eqSol = sol(eq);
     const last = a.curve.at(-1);
-    if (!last || Math.floor(last.timeMs / 30000) !== Math.floor(this.timeMs / 30000)) a.curve.push(point);
-    else a.curve[a.curve.length - 1] = point;
+    if (last && Math.abs(last.equitySol - eqSol) < 1e-9) return;
+    a.curve.push({ timeMs: this.timeMs, equitySol: eqSol });
   }
   public onEvent(event: NormalizedMarketEvent): void {
     if (this.ended) throw new Error("Portfolio experiment already ended");
@@ -114,8 +173,6 @@ export class MultiPortfolioEngine {
         trades: 0, real: 0n, crossed: new Set(),
       });
     } else if (event.eventType === "trade") this.trade(event);
-    // Timeout is evaluated only against a fresh quote for that mint. No synthetic stale-price fills.
-    for (const a of this.accounts) this.observe(a);
   }
   private quote(p: Position, event: TradeMarketEvent): boolean {
     const vSol = BigInt(event.reserves.virtualSolLamports ?? "0");
@@ -146,14 +203,13 @@ export class MultiPortfolioEngine {
       if (!this.quote(p, event)) {
         if (real >= PAPER_CONFIG.graduationSolThresholdLamports || this.timeMs - p.entryMs >= PAPER_CONFIG.timeoutDurationMs) {
           p.status = "migration-exit-unresolved";
-          // Capital remains locked; failed quotes cannot return spendable cash.
           p.mark = 0n;
           this.record(a, p.status, mint);
+          this.recordEquityPoint(a);
         }
         continue;
       }
-      this.record(a, "MARK", mint, { netLiquidationLamports: p.mark.toString() });
-      this.observe(a);
+      this.updatePeakAndDrawdown(a);
       const ret = Number(p.mark - p.outflow) / Number(p.outflow) * 100;
       const reason = ret >= PAPER_CONFIG.tpNetReturnPct ? "take-profit" : ret <= PAPER_CONFIG.slNetReturnPct ? "stop-loss" :
         this.timeMs - p.entryMs >= PAPER_CONFIG.timeoutDurationMs ? "timeout" : null;
@@ -168,6 +224,7 @@ export class MultiPortfolioEngine {
         a.positions.delete(mint);
         this.record(a, reason, mint, { netPnlLamports: pnl.toString(), grossPnlLamports: (p.grossMark - p.input).toString(),
           exitCostsLamports: (p.grossMark - p.mark).toString() });
+        this.recordEquityPoint(a);
       }
     }
     for (const strategy of PORTFOLIO_STRATEGIES) {
@@ -177,9 +234,10 @@ export class MultiPortfolioEngine {
       const age = event.timestamps.collectorReceivedAtUnixMs - token.launchMs;
       const eligible = age >= strategy.ageMs && token.trades >= strategy.trades && age >= 1500 &&
         !(token.firstSlot !== undefined && token.firstSlot === event.ordering.slot);
-      for (const a of this.accounts.filter(a => a.strategy.id === strategy.id)) {
-        this.record(a, "FIRST_CROSSING", mint, { eligible: eligible ? 1 : 0, ageMs: age, trades: token.trades });
-        if (eligible) this.enter(a, event);
+      if (eligible) {
+        for (const a of this.accounts.filter(a => a.strategy.id === strategy.id)) {
+          this.enter(a, event);
+        }
       }
     }
   }
@@ -209,6 +267,7 @@ export class MultiPortfolioEngine {
     a.positions.set(event.tokenMint, p);
     this.record(a, "ENTRY", event.tokenMint, { inputLamports: input.toString(), outflowLamports: outflow.toString(),
       tokenQuantity: p.quantity.toString(), entryCostsLamports: (outflow - input).toString() });
+    this.recordEquityPoint(a);
   }
   public onSessionEnd(): void {
     if (this.ended) return;
@@ -218,10 +277,136 @@ export class MultiPortfolioEngine {
         p.status = "session-censored";
         this.record(a, "session-censored", p.mint);
       }
-      this.observe(a);
+      this.recordEquityPoint(a);
       this.record(a, "SESSION_END", null);
     }
   }
+
+  public exportState(): SerializedPortfolioEngineState {
+    const serializedTokens: SerializedTokenState[] = [];
+    for (const [mint, t] of this.tokens.entries()) {
+      if (t.trades > 0 || t.launchMs !== null || t.crossed.size > 0) {
+        serializedTokens.push({
+          mint,
+          launchMs: t.launchMs,
+          firstSlot: t.firstSlot,
+          trades: t.trades,
+          realSolLamports: t.real.toString(),
+          crossed: Array.from(t.crossed),
+        });
+      }
+    }
+
+    const serializedAccounts: SerializedAccount[] = this.accounts.map((a) => {
+      const positions: SerializedPosition[] = [];
+      for (const p of a.positions.values()) {
+        positions.push({
+          mint: p.mint,
+          entryMs: p.entryMs,
+          inputLamports: p.input.toString(),
+          outflowLamports: p.outflow.toString(),
+          quantityUnits: p.quantity.toString(),
+          markLamports: p.mark.toString(),
+          grossMarkLamports: p.grossMark.toString(),
+          exitFeeLamports: p.exitFee.toString(),
+          entryLevel: p.entryLevel,
+          lastMarkMs: p.lastMarkMs,
+          status: p.status,
+        });
+      }
+      return {
+        id: a.id,
+        strategyId: a.strategy.id,
+        riskId: a.risk.id,
+        bankroll: Number(a.starting / SOL),
+        startingLamports: a.starting.toString(),
+        cashLamports: a.cash.toString(),
+        realizedLamports: a.realized.toString(),
+        grossLamports: a.gross.toString(),
+        costsLamports: a.costs.toString(),
+        peakLamports: a.peak.toString(),
+        drawdownPct: a.drawdownPct,
+        closedLamports: a.closed.map((c) => c.toString()),
+        signals: a.signals,
+        skips: a.skips,
+        invalidQuotes: a.invalidQuotes,
+        curve: [...a.curve],
+        positions,
+      };
+    });
+
+    return {
+      ended: this.ended,
+      eventCount: this.eventCount,
+      lastOrder: this.lastOrder,
+      timeMs: this.timeMs,
+      auditCount: this.auditCount,
+      auditSha256: this.audit.copy().digest("hex"),
+      tokens: serializedTokens,
+      accounts: serializedAccounts,
+    };
+  }
+
+  public importState(state: SerializedPortfolioEngineState, recentEventIds?: readonly string[]): void {
+    this.ended = state.ended;
+    this.eventCount = state.eventCount;
+    this.lastOrder = state.lastOrder;
+    this.timeMs = state.timeMs;
+    this.auditCount = state.auditCount;
+
+    if (recentEventIds) {
+      for (const id of recentEventIds) {
+        this.eventIds.add(id);
+      }
+    }
+
+    this.tokens.clear();
+    for (const t of state.tokens) {
+      this.tokens.set(t.mint, {
+        launchMs: t.launchMs,
+        firstSlot: t.firstSlot,
+        trades: t.trades,
+        real: BigInt(t.realSolLamports),
+        crossed: new Set(t.crossed),
+      });
+    }
+
+    const stateAccountMap = new Map(state.accounts.map((a) => [a.id, a]));
+    for (const a of this.accounts) {
+      const saved = stateAccountMap.get(a.id);
+      if (!saved) continue;
+      a.starting = BigInt(saved.startingLamports);
+      a.cash = BigInt(saved.cashLamports);
+      a.realized = BigInt(saved.realizedLamports);
+      a.gross = BigInt(saved.grossLamports);
+      a.costs = BigInt(saved.costsLamports);
+      a.peak = BigInt(saved.peakLamports);
+      a.drawdownPct = saved.drawdownPct;
+      a.closed = saved.closedLamports.map((c) => BigInt(c));
+      a.signals = saved.signals;
+      a.skips = saved.skips;
+      a.invalidQuotes = saved.invalidQuotes;
+      a.curve = [...saved.curve];
+
+      a.positions.clear();
+      for (const p of saved.positions) {
+        a.positions.set(p.mint, {
+          mint: p.mint,
+          entryMs: p.entryMs,
+          input: BigInt(p.inputLamports),
+          outflow: BigInt(p.outflowLamports),
+          quantity: BigInt(p.quantityUnits),
+          mark: BigInt(p.markLamports),
+          grossMark: BigInt(p.grossMarkLamports),
+          exitFee: BigInt(p.exitFeeLamports),
+          entryLevel: p.entryLevel,
+          lastMarkMs: p.lastMarkMs,
+          status: p.status,
+        });
+      }
+    }
+  }
+
   public summary(compact = false) {
     return { version: PORTFOLIO_VERSION, hypothetical: true, ended: this.ended, eventsProcessed: this.eventCount,
       lastEventTimeMs: this.timeMs, auditCount: this.auditCount, auditSha256: this.audit.copy().digest("hex"),
@@ -248,11 +433,16 @@ export class MultiPortfolioEngine {
           utilizationPct: equity > 0n ? Number(this.deployed(a)) / Number(equity) * 100 : 0,
           skippedInsufficientCapital: a.skips, invalidQuotes: a.invalidQuotes, ...outlierMetrics(a.closed),
           equityCurve: curve, positionsTruncated: compact && positions.length > 10,
-          positions: (compact ? positions.slice(0, 10) : positions).map(p => ({ mint: p.mint, entryMs: p.entryMs,
-            entryLevel: p.entryLevel, sizeSol: sol(p.input), markedPnlSol: sol(p.mark - p.outflow),
-            lastMarkMs: p.lastMarkMs, status: p.status, timeoutDue: this.timeMs - p.entryMs >= PAPER_CONFIG.timeoutDurationMs,
-            netReturnPct: Number(p.mark - p.outflow) / Number(p.outflow) * 100 })),
-          // Exact integer balances support replay auditing without display rounding.
+          positions: (compact ? positions.slice(0, 10) : positions).map(p => ({
+            mint: p.mint, status: p.status, entryMs: p.entryMs, entryLevel: p.entryLevel, entryLevelSol: p.entryLevel,
+            sizeSol: sol(p.input), inputSol: sol(p.input), outflowSol: sol(p.outflow), markSol: sol(p.mark),
+            markedPnlSol: sol(p.mark - p.outflow), unrealizedPnlSol: sol(p.mark - p.outflow),
+            returnPct: Number(p.mark - p.outflow) / Number(p.outflow) * 100,
+            netReturnPct: Number(p.mark - p.outflow) / Number(p.outflow) * 100,
+            lastMarkMs: p.lastMarkMs ?? p.entryMs,
+            timeoutDue: p.lastMarkMs >= p.entryMs + PAPER_CONFIG.timeoutDurationMs,
+            tokenQuantity: p.quantity.toString(),
+          })),
           balancesLamports: { cash: a.cash.toString(), equity: equity.toString(), realized: a.realized.toString(),
             deployed: this.deployed(a).toString(), costs: a.costs.toString(), peak: a.peak.toString() },
         };

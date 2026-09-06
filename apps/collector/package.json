@@ -8,6 +8,7 @@
     "@botwiner/pumpfun": "workspace:*",
     "@botwiner/research": "workspace:*",
     "@botwiner/solana": "workspace:*",
-    "@botwiner/storage": "workspace:*"
+    "@botwiner/storage": "workspace:*",
+    "@google-cloud/run": "^4.0.0"
   }
 }
