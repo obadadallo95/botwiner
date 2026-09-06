@@ -62,5 +62,9 @@ test("bigintSafeJsonStringify and toBigIntSafeObject handle nested BigInt values
   const line = jsonLine(payload);
   assert.ok(line.endsWith("\n"));
   assert.ok(line.includes('"bigValue":"50000000000"'));
+
+  // bigintSafeReplacer works directly with standard JSON.stringify
+  const customStr = JSON.stringify(payload, bigintSafeReplacer);
+  assert.ok(customStr.includes('"bigValue":"50000000000"'));
 });
 

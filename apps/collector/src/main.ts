@@ -503,32 +503,40 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     });
   } else {
     const recordClockSample = async (): Promise<void> => {
-    try {
-      const sample = await sampleSntpClock(options.ntpHost ?? "");
-      await writer.recordDiagnostic({
-        schemaVersion: 1,
-        kind: "diagnostic",
-        code: "clock-offset-sampled",
-        atUnixMs: sample.completedAtUnixMs,
-        message: "Recorded SNTP clock-offset sample",
-        sequence: null,
-        details: { ...sample, interpretation: "sample evidence; not a synchronization SLA" },
-      });
-    } catch (error) {
-      await writer.recordDiagnostic({
-        schemaVersion: 1,
-        kind: "diagnostic",
-        code: "clock-offset-unavailable",
-        atUnixMs: Date.now(),
-        message: "SNTP clock-offset sample failed",
-        sequence: null,
-        details: { host: options.ntpHost, error: error instanceof Error ? error.message : String(error) },
-      });
-    }
+      try {
+        const sample = await sampleSntpClock(options.ntpHost ?? "");
+        await writer.recordDiagnostic({
+          schemaVersion: 1,
+          kind: "diagnostic",
+          code: "clock-offset-sampled",
+          atUnixMs: sample.completedAtUnixMs,
+          message: "Recorded SNTP clock-offset sample",
+          sequence: null,
+          details: { ...sample, interpretation: "sample evidence; not a synchronization SLA" },
+        });
+      } catch (error) {
+        try {
+          await writer.recordDiagnostic({
+            schemaVersion: 1,
+            kind: "diagnostic",
+            code: "clock-offset-unavailable",
+            atUnixMs: Date.now(),
+            message: "SNTP clock-offset sample failed",
+            sequence: null,
+            details: { host: options.ntpHost, error: error instanceof Error ? error.message : String(error) },
+          });
+        } catch (diagErr) {
+          console.warn("[Collector] Failed to record clock-offset diagnostic:", diagErr);
+        }
+      }
     };
     await recordClockSample();
     clockSampleTimer = setInterval(() => {
-      clockSampleQueue = clockSampleQueue.then(recordClockSample);
+      clockSampleQueue = clockSampleQueue
+        .then(recordClockSample)
+        .catch((err) => {
+          console.warn("[Collector] Background clock sample queue error:", err);
+        });
     }, options.ntpIntervalSeconds * 1_000);
   }
 
@@ -795,7 +803,11 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     if (timer !== undefined) clearTimeout(timer);
     if (progressTimer !== undefined) clearInterval(progressTimer);
     if (clockSampleTimer !== undefined) clearInterval(clockSampleTimer);
-    await clockSampleQueue;
+    try {
+      await clockSampleQueue;
+    } catch (clockQueueErr) {
+      console.warn("[Collector] Clock sample queue drained with error:", clockQueueErr);
+    }
     process.removeListener("SIGINT", stopForSignal);
     process.removeListener("SIGTERM", stopForSignal);
     paperTradingEngine.onSessionEnd(Date.now());

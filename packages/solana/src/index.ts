@@ -155,7 +155,11 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 function settle(callbackResult: Promise<void> | void, pending: Set<Promise<void>>): void {
   if (!(callbackResult instanceof Promise)) return;
   pending.add(callbackResult);
-  void callbackResult.finally(() => pending.delete(callbackResult));
+  callbackResult
+    .catch(() => {
+      // Rejections are handled by the callback caller / fail() logic
+    })
+    .finally(() => pending.delete(callbackResult));
 }
 
 export function endpointLabelFromUrl(url: string): string {

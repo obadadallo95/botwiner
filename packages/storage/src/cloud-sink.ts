@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { Storage, type Bucket } from "@google-cloud/storage";
+export type { Bucket };
 
 export function generateCollisionResistantSessionId(prefix = "session", date = new Date()): string {
   const dateStr = date.toISOString().replace(/[-:T]/g, "").slice(0, 14);
@@ -147,6 +148,7 @@ export interface GcsStorageUploaderOptions {
   readonly baseDelayMs?: number;
   readonly maxDelayMs?: number;
   readonly sleepFn?: (ms: number) => Promise<void>;
+  readonly bucketFactory?: () => Bucket;
   readonly logger?: {
     warn: (message: string, meta?: Record<string, unknown>) => void;
     error: (message: string, meta?: Record<string, unknown>) => void;
@@ -158,17 +160,22 @@ export interface CloudStorageUploader {
 }
 
 export class GcsStorageUploader implements CloudStorageUploader {
-  private readonly bucket: Bucket;
+  private readonly bucketName: string;
+  private readonly projectId?: string | undefined;
+  private storage: Storage;
+  private bucket: Bucket;
   private readonly retryOptions: GcsStorageUploaderOptions;
   private readonly logger: NonNullable<GcsStorageUploaderOptions["logger"]>;
 
   public constructor(bucketName: string, projectId?: string, retryOptions: GcsStorageUploaderOptions = {}) {
+    this.bucketName = bucketName;
+    this.projectId = projectId;
     const options: ConstructorParameters<typeof Storage>[0] = {};
     if (projectId !== undefined) {
       options.projectId = projectId;
     }
-    const storage = new Storage(options);
-    this.bucket = storage.bucket(bucketName);
+    this.storage = new Storage(options);
+    this.bucket = retryOptions.bucketFactory ? retryOptions.bucketFactory() : this.storage.bucket(bucketName);
     this.retryOptions = retryOptions;
     this.logger = retryOptions.logger ?? {
       warn: (msg, meta) => console.warn(msg, meta ? bigintSafeJsonStringify(meta) : ""),
@@ -176,10 +183,30 @@ export class GcsStorageUploader implements CloudStorageUploader {
     };
   }
 
+  public recreateStorageClient(): void {
+    try {
+      if (this.retryOptions.bucketFactory) {
+        this.bucket = this.retryOptions.bucketFactory();
+      } else {
+        const options: ConstructorParameters<typeof Storage>[0] = {};
+        if (this.projectId !== undefined) {
+          options.projectId = this.projectId;
+        }
+        this.storage = new Storage(options);
+        this.bucket = this.storage.bucket(this.bucketName);
+      }
+      this.logger.warn(`[GcsStorageUploader] Re-initialized Storage client transport to flush connection pool.`);
+    } catch (recreateErr) {
+      this.logger.error(`[GcsStorageUploader] Failed to re-initialize Storage client:`, {
+        error: recreateErr instanceof Error ? recreateErr.message : String(recreateErr),
+      });
+    }
+  }
+
   public async uploadBuffer(destinationPath: string, buffer: Buffer, contentType: string): Promise<void> {
-    const maxAttempts = this.retryOptions.maxAttempts ?? 5;
+    const maxAttempts = this.retryOptions.maxAttempts ?? 8;
     const baseDelayMs = this.retryOptions.baseDelayMs ?? 1000;
-    const maxDelayMs = this.retryOptions.maxDelayMs ?? 8000;
+    const maxDelayMs = this.retryOptions.maxDelayMs ?? 15000;
     const sleep = this.retryOptions.sleepFn ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
     let attempt = 0;
@@ -209,8 +236,11 @@ export class GcsStorageUploader implements CloudStorageUploader {
           throw error;
         }
 
+        // Recreate the storage client transport to discard broken sockets / pooled keepalive connections
+        this.recreateStorageClient();
+
         const backoffMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
-        const jitterMs = Math.floor(Math.random() * 200);
+        const jitterMs = Math.floor(Math.random() * 500);
         const delayMs = backoffMs + jitterMs;
 
         this.logger.warn(
@@ -451,6 +481,7 @@ export class CloudResearchSink implements ResearchSink {
         console.error("[CloudResearchSink] periodic chunk rotation error:", err);
       });
     }, this.chunkIntervalMs);
+    this.rotationTimer.unref?.();
   }
 
   private recordDiagnosticInternal(diagnostic: DiagnosticRecord): void {
@@ -627,8 +658,12 @@ export class CloudResearchSink implements ResearchSink {
           },
           (err) => {
             const error = err instanceof Error ? err : new Error(String(err));
-            this.terminalError = error;
-            if (this.onTerminalError) {
+            let isFirst = false;
+            if (this.terminalError === null) {
+              this.terminalError = error;
+              isFirst = true;
+            }
+            if (isFirst && this.onTerminalError) {
               try {
                 this.onTerminalError(error);
               } catch (cbErr) {

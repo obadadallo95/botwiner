@@ -4,10 +4,13 @@ import {
   CloudResearchSink,
   GcsStorageUploader,
   isRetryableStorageError,
+  type Bucket,
   type CloudStorageUploader,
+  type DatasetCounts,
 } from "@botwiner/storage";
 import {
   FirestoreTelemetryReporter,
+  withTimeout,
   type FirestoreBackend,
   type ResearchSessionDocument,
   type GraduationSummaryCounters,
@@ -235,19 +238,20 @@ test("GcsStorageUploader: ECONNRESET retry succeeds on subsequent attempt", asyn
       sleepCalls.push(ms);
       return Promise.resolve();
     },
+    bucketFactory: () => mockBucket as unknown as Bucket,
     logger: {
       warn: (msg) => loggedWarnings.push(msg),
       error: () => {},
     },
   });
-  Object.assign(uploader, { bucket: mockBucket });
 
   await uploader.uploadBuffer("chunks/events-000001.jsonl.gz", Buffer.from("test"), "application/gzip");
 
   assert.equal(attempts, 3, "Should succeed on attempt 3");
   assert.equal(sleepCalls.length, 2, "Should sleep twice before attempt 3");
-  assert.equal(loggedWarnings.length, 2, "Should log 2 retry warnings");
-  assert.match(loggedWarnings[0] ?? "", /Transient upload failure for "chunks\/events-000001.jsonl.gz" on attempt 1\/5/);
+  const retryWarnings = loggedWarnings.filter((msg) => msg.includes("Transient upload failure"));
+  assert.equal(retryWarnings.length, 2, "Should log 2 retry warnings");
+  assert.match(retryWarnings[0] ?? "", /Transient upload failure for "chunks\/events-000001.jsonl.gz" on attempt 1\/5/);
 });
 
 test("GcsStorageUploader: HTTP 503 retry succeeds", async () => {
@@ -268,9 +272,9 @@ test("GcsStorageUploader: HTTP 503 retry succeeds", async () => {
     maxAttempts: 5,
     baseDelayMs: 10,
     sleepFn: () => Promise.resolve(),
+    bucketFactory: () => ({ file: () => mockFile }) as unknown as Bucket,
     logger: { warn: () => {}, error: () => {} },
   });
-  Object.assign(uploader, { bucket: { file: () => mockFile } });
 
   await uploader.uploadBuffer("chunks/events-000001.jsonl.gz", Buffer.from("test"), "application/gzip");
   assert.equal(attempts, 2, "HTTP 503 should retry and succeed on attempt 2");
@@ -290,9 +294,9 @@ test("GcsStorageUploader: permanent 403 Forbidden is NOT retried endlessly", asy
   const uploader = new GcsStorageUploader("test-bucket", "test-proj", {
     maxAttempts: 5,
     sleepFn: () => Promise.resolve(),
+    bucketFactory: () => ({ file: () => mockFile }) as unknown as Bucket,
     logger: { warn: () => {}, error: () => {} },
   });
-  Object.assign(uploader, { bucket: { file: () => mockFile } });
 
   await assert.rejects(
     async () => {
@@ -323,12 +327,12 @@ test("GcsStorageUploader: retry exhaustion fails cleanly after maxAttempts", asy
     maxAttempts: 4,
     baseDelayMs: 5,
     sleepFn: () => Promise.resolve(),
+    bucketFactory: () => ({ file: () => mockFile }) as unknown as Bucket,
     logger: {
       warn: () => {},
       error: (msg) => loggedErrors.push(msg),
     },
   });
-  Object.assign(uploader, { bucket: { file: () => mockFile } });
 
   await assert.rejects(
     async () => {
@@ -514,4 +518,492 @@ test("checkExecutionFinished: detects finished and running executions accurately
   const missingResult = await checkExecutionFinished(mock404Client, "executions/missing-1");
   assert.equal(missingResult.finished, true);
   assert.equal(missingResult.reason, "execution_not_found");
+});
+
+function makeSampleDatasetCounts(events = 1): DatasetCounts {
+  return {
+    rawNotifications: events,
+    normalizedEvents: events,
+    launches: 0,
+    trades: events,
+    duplicateEvents: 0,
+    malformedPumpEvents: 0,
+    invalidRpcMessages: 0,
+    failedTransactions: 0,
+    disconnects: 0,
+  };
+}
+
+function makeSampleGraduationCounters(tracked = 1): GraduationSummaryCounters {
+  return {
+    tokensTracked: tracked,
+    curve50PlusCount: 0,
+    curve60PlusCount: 0,
+    curve70PlusCount: 0,
+    curve80PlusCount: 0,
+    nearGraduationCount: 0,
+    graduationsDetected: 0,
+    organicGraduationsDetected: 0,
+    instantBundleGraduationsDetected: 0,
+    migrationsDetected: 0,
+    limitations: [],
+  };
+}
+
+// 6. Firestore Telemetry Concurrency & Timeout tests
+test("FirestoreTelemetryReporter: stats flush cannot overlap", async () => {
+  let inFlight = 0;
+  let maxConcurrent = 0;
+  let updateCalls = 0;
+  let resolveFirstCall: (() => void) | undefined;
+
+  const backend: FirestoreBackend = {
+    setSessionDoc: () => Promise.resolve(),
+    updateStatsDoc: () => {
+      updateCalls += 1;
+      inFlight += 1;
+      maxConcurrent = Math.max(maxConcurrent, inFlight);
+      if (updateCalls === 1) {
+        return new Promise<void>((resolve) => {
+          resolveFirstCall = () => {
+            inFlight -= 1;
+            resolve();
+          };
+        });
+      }
+      inFlight -= 1;
+      return Promise.resolve();
+    },
+    setGraduationCandidate: () => Promise.resolve(),
+  };
+
+  const telemetry = new FirestoreTelemetryReporter({
+    sessionId: "test-stats-overlap",
+    mode: "graduation-research",
+    provider: "helius",
+    region: "europe-west3",
+    requestedDurationSec: 60,
+    backend,
+    heartbeatIntervalMs: 60_000,
+    statsIntervalMs: 60_000,
+  });
+
+  telemetry.updateTelemetry(makeSampleDatasetCounts(1), makeSampleGraduationCounters(1));
+
+  // Start first flush
+  const p1 = telemetry.flushStatsNow();
+  assert.equal(telemetry.isStatsFlushInFlight(), true);
+
+  // Trigger second flush while first is in flight
+  const p2 = telemetry.flushStatsNow();
+  await p2; // Should return immediately because skipped
+
+  assert.equal(telemetry.getSkippedStatsFlushes(), 1, "Should skip the overlapping flush");
+  assert.equal(updateCalls, 1, "Should only have called backend once");
+  assert.equal(maxConcurrent, 1, "Max concurrent backend calls must be 1");
+
+  // Resolve first call
+  resolveFirstCall?.();
+  await p1;
+
+  assert.equal(telemetry.isStatsFlushInFlight(), false, "In flight should reset to false");
+  await telemetry.close("completed");
+});
+
+test("FirestoreTelemetryReporter: heartbeat flush cannot overlap", async () => {
+  let inFlight = 0;
+  let maxConcurrent = 0;
+  let setCalls = 0;
+  let resolveFirstCall: (() => void) | undefined;
+
+  const backend: FirestoreBackend = {
+    setSessionDoc: () => {
+      setCalls += 1;
+      inFlight += 1;
+      maxConcurrent = Math.max(maxConcurrent, inFlight);
+      if (setCalls === 1) {
+        return new Promise<void>((resolve) => {
+          resolveFirstCall = () => {
+            inFlight -= 1;
+            resolve();
+          };
+        });
+      }
+      inFlight -= 1;
+      return Promise.resolve();
+    },
+    updateStatsDoc: () => Promise.resolve(),
+    setGraduationCandidate: () => Promise.resolve(),
+  };
+
+  const telemetry = new FirestoreTelemetryReporter({
+    sessionId: "test-heartbeat-overlap",
+    mode: "graduation-research",
+    provider: "helius",
+    region: "europe-west3",
+    requestedDurationSec: 60,
+    backend,
+    heartbeatIntervalMs: 60_000,
+    statsIntervalMs: 60_000,
+  });
+
+  // Start first heartbeat
+  const p1 = telemetry.flushHeartbeatNow();
+  assert.equal(telemetry.isHeartbeatFlushInFlight(), true);
+
+  // Trigger second heartbeat while first is in flight
+  const p2 = telemetry.flushHeartbeatNow();
+  await p2;
+
+  assert.equal(telemetry.getSkippedHeartbeatFlushes(), 1, "Should skip overlapping heartbeat");
+  assert.equal(setCalls, 1, "Should only have called backend once");
+  assert.equal(maxConcurrent, 1, "Max concurrent backend calls must be 1");
+
+  resolveFirstCall?.();
+  await p1;
+
+  assert.equal(telemetry.isHeartbeatFlushInFlight(), false);
+  await telemetry.close("completed");
+});
+
+test("FirestoreTelemetryReporter: slow Firestore causes skipped flush rather than buildup", async () => {
+  let backendCalls = 0;
+  let resolveSlowCall: (() => void) | undefined;
+
+  const backend: FirestoreBackend = {
+    setSessionDoc: () => Promise.resolve(),
+    updateStatsDoc: () => {
+      backendCalls += 1;
+      if (backendCalls === 1) {
+        return new Promise<void>((resolve) => {
+          resolveSlowCall = resolve;
+        });
+      }
+      return Promise.resolve();
+    },
+    setGraduationCandidate: () => Promise.resolve(),
+  };
+
+  const telemetry = new FirestoreTelemetryReporter({
+    sessionId: "test-slow-firestore",
+    mode: "graduation-research",
+    provider: "helius",
+    region: "europe-west3",
+    requestedDurationSec: 60,
+    backend,
+    heartbeatIntervalMs: 60_000,
+    statsIntervalMs: 60_000,
+  });
+
+  telemetry.updateTelemetry(makeSampleDatasetCounts(1), makeSampleGraduationCounters(1));
+
+  const p1 = telemetry.flushStatsNow();
+
+  // Try 5 flushes while p1 is in progress
+  for (let i = 0; i < 5; i++) {
+    await telemetry.flushStatsNow();
+  }
+
+  assert.equal(backendCalls, 1, "Backend must only receive 1 call");
+  assert.equal(telemetry.getSkippedStatsFlushes(), 5, "5 skipped flushes counted");
+
+  resolveSlowCall?.();
+  await p1;
+
+  // Next flush after resolution should succeed
+  await telemetry.flushStatsNow();
+  assert.equal(backendCalls, 2, "Subsequent flush after completion succeeds");
+  await telemetry.close("completed");
+});
+
+test("FirestoreTelemetryReporter: timed-out Firestore write resets in-flight state", async () => {
+  let timedOutCallStarted = false;
+  const backend: FirestoreBackend = {
+    setSessionDoc: () => Promise.resolve(),
+    updateStatsDoc: () => {
+      timedOutCallStarted = true;
+      return withTimeout(
+        new Promise<void>(() => {}), // never resolves
+        20,
+        "updateStatsDoc"
+      );
+    },
+    setGraduationCandidate: () => Promise.resolve(),
+  };
+
+  const telemetry = new FirestoreTelemetryReporter({
+    sessionId: "test-timeout-reset",
+    mode: "graduation-research",
+    provider: "helius",
+    region: "europe-west3",
+    requestedDurationSec: 60,
+    backend,
+    heartbeatIntervalMs: 60_000,
+    statsIntervalMs: 60_000,
+  });
+
+  telemetry.updateTelemetry(makeSampleDatasetCounts(1), makeSampleGraduationCounters(1));
+
+  // Call flushStatsNow - it will time out internally after 20ms
+  await telemetry.flushStatsNow();
+
+  assert.equal(timedOutCallStarted, true);
+  assert.equal(telemetry.isStatsFlushInFlight(), false, "In-flight state must reset after timeout");
+
+  // Next flush should now be accepted
+  let secondCallExecuted = false;
+  backend.updateStatsDoc = () => {
+    secondCallExecuted = true;
+    return Promise.resolve();
+  };
+
+  await telemetry.flushStatsNow();
+  assert.equal(secondCallExecuted, true, "Subsequent flush after timeout succeeds");
+  await telemetry.close("completed");
+});
+
+test("FirestoreTelemetryReporter: collector continues after telemetry timeout", async () => {
+  const backend: FirestoreBackend = {
+    setSessionDoc: () =>
+      withTimeout(
+        new Promise<void>(() => {}),
+        25,
+        "setSessionDoc"
+      ),
+    updateStatsDoc: () =>
+      withTimeout(
+        new Promise<void>(() => {}),
+        25,
+        "updateStatsDoc"
+      ),
+    setGraduationCandidate: () => Promise.resolve(),
+  };
+
+  const telemetry = new FirestoreTelemetryReporter({
+    sessionId: "test-collector-continues",
+    mode: "graduation-research",
+    provider: "helius",
+    region: "europe-west3",
+    requestedDurationSec: 60,
+    backend,
+    heartbeatIntervalMs: 60_000,
+    statsIntervalMs: 60_000,
+  });
+
+  telemetry.updateTelemetry(makeSampleDatasetCounts(2), makeSampleGraduationCounters(2));
+
+  await assert.doesNotReject(async () => {
+    await telemetry.flushHeartbeatNow();
+  }, "Heartbeat timeout must not throw");
+
+  await assert.doesNotReject(async () => {
+    await telemetry.flushStatsNow();
+  }, "Stats timeout must not throw");
+
+  telemetry.updateChunkAndBytes(2, 5000);
+  assert.equal(telemetry.isHeartbeatFlushInFlight(), false);
+  assert.equal(telemetry.isStatsFlushInFlight(), false);
+
+  await assert.doesNotReject(async () => {
+    await telemetry.close("completed");
+  });
+});
+
+test("GcsStorageUploader: ECONNRESET eventually succeeds after 5 retries (within 8 maxAttempts)", async () => {
+  let attempts = 0;
+  const sleepDurations: number[] = [];
+
+  const mockFile = {
+    save: (): Promise<void> => {
+      attempts += 1;
+      if (attempts <= 5) {
+        const err = new Error("Client network socket disconnected before secure TLS connection was established");
+        Object.assign(err, { code: "ECONNRESET" });
+        return Promise.reject(err);
+      }
+      return Promise.resolve();
+    },
+  };
+
+  const uploader = new GcsStorageUploader("test-bucket", "test-proj", {
+    maxAttempts: 8,
+    baseDelayMs: 5,
+    maxDelayMs: 50,
+    sleepFn: (ms) => {
+      sleepDurations.push(ms);
+      return Promise.resolve();
+    },
+    bucketFactory: () => ({ file: () => mockFile }) as unknown as Bucket,
+    logger: {
+      warn: () => {},
+      error: () => {},
+    },
+  });
+
+  await uploader.uploadBuffer("chunks/events-000046.jsonl.gz", Buffer.from("test-chunk"), "application/gzip");
+
+  assert.equal(attempts, 6, "Succeeded on 6th attempt (after 5 transient ECONNRESETs)");
+  assert.equal(sleepDurations.length, 5, "5 backoff sleeps executed");
+});
+
+test("GcsStorageUploader: Storage client is recreated after socket-level failure", async () => {
+  let attempts = 0;
+  let recreateCount = 0;
+
+  const mockFile = {
+    save: (): Promise<void> => {
+      attempts += 1;
+      if (attempts === 1) {
+        const err = new Error("Client network socket disconnected");
+        Object.assign(err, { code: "ECONNRESET" });
+        return Promise.reject(err);
+      }
+      return Promise.resolve();
+    },
+  };
+
+  const uploader = new GcsStorageUploader("test-bucket", "test-proj", {
+    maxAttempts: 8,
+    baseDelayMs: 5,
+    sleepFn: () => Promise.resolve(),
+    bucketFactory: () => {
+      recreateCount += 1;
+      return { file: () => mockFile } as unknown as Bucket;
+    },
+    logger: { warn: () => {}, error: () => {} },
+  });
+
+  await uploader.uploadBuffer("chunks/events-000046.jsonl.gz", Buffer.from("test"), "application/gzip");
+
+  assert.equal(attempts, 2);
+  assert.equal(recreateCount, 2, "Storage client must be created on init and recreated upon socket-level error");
+});
+
+test("CloudResearchSink: terminal queue failure does not become unhandled rejection and calls onTerminalError once", async () => {
+  let terminalErrorsReported = 0;
+  let terminalErrorObj: Error | null = null;
+
+  const failingUploader: CloudStorageUploader = {
+    uploadBuffer: () => {
+      const err = new Error("Terminal GCS network failure");
+      Object.assign(err, { code: "ECONNRESET" });
+      return Promise.reject(err);
+    },
+  };
+
+  const sink = new CloudResearchSink({
+    directory: "test-dir",
+    sessionId: "test-session-promise-safety",
+    transport: "solana-rpc-websocket",
+    endpointLabel: "test",
+    commitment: "processed",
+    programId: "pump",
+    parsingVersion: "v1",
+    officialIdlRevision: "rev1",
+    uploader: failingUploader,
+    chunkMaxRecords: 1,
+    onTerminalError: (err) => {
+      terminalErrorsReported += 1;
+      terminalErrorObj = err;
+    },
+  });
+
+  const results = await Promise.allSettled([
+    sink.recordRaw({
+      raw: makeSampleRawLog(1),
+      events: [makeSampleTrade("ev-1", "mint-1")],
+      parseFailures: [],
+      invalidNotification: null,
+      transactionFailed: false,
+    }),
+    sink.recordRaw({
+      raw: makeSampleRawLog(2),
+      events: [makeSampleTrade("ev-2", "mint-1")],
+      parseFailures: [],
+      invalidNotification: null,
+      transactionFailed: false,
+    }),
+    sink.recordRaw({
+      raw: makeSampleRawLog(3),
+      events: [makeSampleTrade("ev-3", "mint-1")],
+      parseFailures: [],
+      invalidNotification: null,
+      transactionFailed: false,
+    }),
+  ]);
+
+  for (const r of results) {
+    assert.equal(r.status, "rejected");
+  }
+
+  assert.equal(terminalErrorsReported, 1, "onTerminalError must be called only once");
+  assert.ok(terminalErrorObj);
+  assert.match((terminalErrorObj as Error).message, /Terminal GCS network failure/);
+  await sink.close("failed").catch(() => {});
+});
+
+test("Collector Shutdown Resilience: terminal queued upload failure followed by shutdown still runs cleanup", async () => {
+  const backend = new MockFirestoreBackend();
+  const sessionId = "test-session-terminal-shutdown";
+
+  const telemetry = new FirestoreTelemetryReporter({
+    sessionId,
+    mode: "graduation-research",
+    provider: "helius",
+    region: "europe-west3",
+    requestedDurationSec: 300,
+    backend,
+    heartbeatIntervalMs: 50,
+    statsIntervalMs: 50,
+  });
+
+  await telemetry.initialize();
+  telemetry.markRunning();
+
+  const clockSampleQueue: Promise<void> = Promise.reject(new Error("GCS terminal queue failure"));
+  let writerClosed = false;
+  let finalStatusReported = "";
+
+  const mockWriter = {
+    close: (): Promise<void> => {
+      writerClosed = true;
+      return Promise.reject(new Error("Writer close failed due to terminal chunk"));
+    },
+  };
+
+  let executionError: unknown = null;
+  try {
+    throw new Error("Container failure: Chunk upload exhausted 8 retries");
+  } catch (err) {
+    executionError = err;
+  }
+
+  try {
+    try {
+      await clockSampleQueue;
+    } catch {
+      // Ignored non-fatal diagnostic queue error
+    }
+
+    try {
+      await mockWriter.close();
+    } catch (writerErr) {
+      if (!executionError) executionError = writerErr;
+    }
+
+    finalStatusReported = executionError ? "failed" : "completed";
+    if (executionError) {
+      telemetry.reportError((executionError as Error).message);
+    }
+    await telemetry.close(finalStatusReported as "completed" | "failed");
+  } catch (shutdownErr) {
+    assert.fail(`Shutdown cleanup must not throw: ${String(shutdownErr)}`);
+  }
+
+  assert.equal(writerClosed, true, "Writer close was invoked");
+  assert.equal(finalStatusReported, "failed");
+  assert.equal(backend.sessionDoc.status, "failed");
+  assert.ok(backend.sessionDoc.completedAt);
+  assert.match(backend.sessionDoc.latestError ?? "", /Chunk upload exhausted 8 retries/);
+  assert.equal(backend.activeLocks.get("activeSession")?.status, "released", "Active lock was released");
 });

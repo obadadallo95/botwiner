@@ -36,6 +36,20 @@ export interface ResearchSessionDocument {
   bytesPersisted: number;
   latestEventAt: string | null;
   latestError: string | null;
+  skippedStatsFlushes?: number;
+  skippedHeartbeatFlushes?: number;
+}
+
+export function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operationName: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`Firestore operation "${operationName}" timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
 }
 
 export interface FirestoreBackend {
@@ -52,65 +66,68 @@ export interface FirestoreBackend {
 }
 
 export class GoogleFirestoreBackend implements FirestoreBackend {
-  private readonly db: Firestore;
+  public readonly db: Firestore;
+  private readonly operationTimeoutMs: number;
 
-  public constructor(projectId?: string, databaseId = "(default)") {
+  public constructor(projectId?: string, databaseId = "(default)", operationTimeoutMs = 10_000) {
     const options: ConstructorParameters<typeof Firestore>[0] = { databaseId };
     if (projectId !== undefined) {
       options.projectId = projectId;
     }
     this.db = new Firestore(options);
+    this.operationTimeoutMs = operationTimeoutMs;
   }
 
   public async setSessionDoc(sessionId: string, data: Partial<ResearchSessionDocument>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId);
-    await docRef.set(toBigIntSafeObject(data), { merge: true });
+    await withTimeout(docRef.set(toBigIntSafeObject(data), { merge: true }), this.operationTimeoutMs, "setSessionDoc");
   }
 
   public async updateStatsDoc(sessionId: string, stats: GraduationSummaryCounters): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("current");
-    await docRef.set(toBigIntSafeObject(stats), { merge: true });
+    await withTimeout(docRef.set(toBigIntSafeObject(stats), { merge: true }), this.operationTimeoutMs, "updateStatsDoc");
   }
 
   public async updatePortfolioStatsDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
-    await this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("portfolios").set(toBigIntSafeObject(stats));
+    const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("portfolios");
+    await withTimeout(docRef.set(toBigIntSafeObject(stats)), this.operationTimeoutMs, "updatePortfolioStatsDoc");
   }
 
   public async updatePaperStatsDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("paperTrading");
-    await docRef.set(toBigIntSafeObject(stats), { merge: true });
+    await withTimeout(docRef.set(toBigIntSafeObject(stats), { merge: true }), this.operationTimeoutMs, "updatePaperStatsDoc");
   }
 
   public async updateMarketPnlDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("marketPnl");
-    await docRef.set(toBigIntSafeObject(stats), { merge: true });
+    await withTimeout(docRef.set(toBigIntSafeObject(stats), { merge: true }), this.operationTimeoutMs, "updateMarketPnlDoc");
   }
 
   public async updateCreatorAnalyticsDoc(sessionId: string, stats: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("stats").doc("creatorAnalytics");
-    await docRef.set(toBigIntSafeObject(stats), { merge: true });
+    await withTimeout(docRef.set(toBigIntSafeObject(stats), { merge: true }), this.operationTimeoutMs, "updateCreatorAnalyticsDoc");
   }
 
   public async savePaperTradeDoc(sessionId: string, tradeId: string, trade: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("paperTrades").doc(tradeId);
-    await docRef.set(toBigIntSafeObject(trade), { merge: true });
+    await withTimeout(docRef.set(toBigIntSafeObject(trade), { merge: true }), this.operationTimeoutMs, "savePaperTradeDoc");
   }
 
   public async setGraduationCandidate(sessionId: string, mint: string, candidate: Record<string, unknown>): Promise<void> {
     const docRef = this.db.collection("researchSessions").doc(sessionId).collection("graduations").doc(mint);
-    await docRef.set(toBigIntSafeObject(candidate), { merge: true });
+    await withTimeout(docRef.set(toBigIntSafeObject(candidate), { merge: true }), this.operationTimeoutMs, "setGraduationCandidate");
   }
 
   public async updateActiveLock(sessionId: string, data: { heartbeatAt: string; status?: string }): Promise<void> {
     const lockRef = this.db.collection("researchControl").doc("activeSession");
-    await lockRef.set(toBigIntSafeObject({ sessionId, ...data }), { merge: true });
+    await withTimeout(lockRef.set(toBigIntSafeObject({ sessionId, ...data }), { merge: true }), this.operationTimeoutMs, "updateActiveLock");
   }
 
   public async releaseActiveLock(sessionId: string): Promise<void> {
     const lockRef = this.db.collection("researchControl").doc("activeSession");
-    const doc = await lockRef.get();
+    const doc = await withTimeout(lockRef.get(), this.operationTimeoutMs, "releaseActiveLock.get");
     if (doc.exists && doc.data()?.sessionId === sessionId) {
-      await lockRef.set({ status: "released", releasedAt: new Date().toISOString() }, { merge: true });
+      await withTimeout(lockRef.set({ status: "released", releasedAt: new Date().toISOString() }, { merge: true }), this.operationTimeoutMs, "releaseActiveLock.set");
     }
   }
 }
@@ -152,6 +169,10 @@ export class FirestoreTelemetryReporter {
   private heartbeatTimer?: NodeJS.Timeout | undefined;
   private statsTimer?: NodeJS.Timeout | undefined;
   private closed = false;
+  private statsFlushInFlight = false;
+  private heartbeatFlushInFlight = false;
+  private skippedStatsFlushes = 0;
+  private skippedHeartbeatFlushes = 0;
 
   private latestCounts?: DatasetCounts | undefined;
   private latestGraduationCounters?: GraduationSummaryCounters | undefined;
@@ -176,6 +197,22 @@ export class FirestoreTelemetryReporter {
     } else {
       this.backend = new GoogleFirestoreBackend(options.gcpProjectId, options.firestoreDatabase);
     }
+  }
+
+  public getSkippedStatsFlushes(): number {
+    return this.skippedStatsFlushes;
+  }
+
+  public getSkippedHeartbeatFlushes(): number {
+    return this.skippedHeartbeatFlushes;
+  }
+
+  public isStatsFlushInFlight(): boolean {
+    return this.statsFlushInFlight;
+  }
+
+  public isHeartbeatFlushInFlight(): boolean {
+    return this.heartbeatFlushInFlight;
   }
 
   public async initialize(): Promise<void> {
@@ -203,6 +240,8 @@ export class FirestoreTelemetryReporter {
       bytesPersisted: 0,
       latestEventAt: null,
       latestError: null,
+      skippedStatsFlushes: 0,
+      skippedHeartbeatFlushes: 0,
     };
 
     try {
@@ -217,7 +256,7 @@ export class FirestoreTelemetryReporter {
 
   public markRunning(): void {
     this.status = "running";
-    this.flushHeartbeatNow().catch((err) => {
+    this.flushHeartbeatNow(true).catch((err) => {
       console.warn("[FirestoreTelemetryReporter] failed to mark running:", err);
     });
   }
@@ -225,7 +264,7 @@ export class FirestoreTelemetryReporter {
   public markReconnecting(): void {
     this.status = "reconnecting";
     this.reconnectCount += 1;
-    this.flushHeartbeatNow().catch((err) => {
+    this.flushHeartbeatNow(true).catch((err) => {
       console.warn("[FirestoreTelemetryReporter] failed to mark reconnecting:", err);
     });
   }
@@ -292,8 +331,15 @@ export class FirestoreTelemetryReporter {
     const nowIso = new Date().toISOString();
     const elapsedSec = Math.floor((Date.now() - this.startedAtUnixMs) / 1000);
 
-    // Final flush of stats and candidates
-    await this.flushStatsNow();
+    // Final flush of stats and candidates (wait briefly if background flush was active)
+    if (this.statsFlushInFlight) {
+      let waitedMs = 0;
+      while (this.statsFlushInFlight && waitedMs < 3000) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        waitedMs += 100;
+      }
+    }
+    await this.flushStatsNow(true);
 
     const finalDoc: Partial<ResearchSessionDocument> = {
       status: finalStatus,
@@ -311,6 +357,8 @@ export class FirestoreTelemetryReporter {
       reconnectCount: this.reconnectCount,
       latestEventAt: this.latestEventAtIso,
       latestError: this.latestError,
+      skippedStatsFlushes: this.skippedStatsFlushes,
+      skippedHeartbeatFlushes: this.skippedHeartbeatFlushes,
     };
 
     try {
@@ -329,6 +377,7 @@ export class FirestoreTelemetryReporter {
         console.warn("[FirestoreTelemetryReporter] heartbeat write failed:", err);
       });
     }, this.heartbeatIntervalMs);
+    this.heartbeatTimer.unref?.();
   }
 
   private startStatsLoop(): void {
@@ -337,46 +386,67 @@ export class FirestoreTelemetryReporter {
         console.warn("[FirestoreTelemetryReporter] stats write failed:", err);
       });
     }, this.statsIntervalMs);
+    this.statsTimer.unref?.();
   }
 
-  private async flushHeartbeatNow(): Promise<void> {
+  public async flushHeartbeatNow(force = false): Promise<void> {
     if (this.closed) return;
-    const nowIso = new Date().toISOString();
-    const elapsedSec = Math.floor((Date.now() - this.startedAtUnixMs) / 1000);
-
-    const partial: Partial<ResearchSessionDocument> = {
-      status: this.status,
-      lastHeartbeatAt: nowIso,
-      elapsedSec,
-      currentChunk: this.currentChunk,
-      bytesPersisted: this.bytesPersisted,
-      reconnectCount: this.reconnectCount,
-      latestError: this.latestError,
-    };
-
-    if (this.latestCounts) {
-      partial.totalEvents = this.latestCounts.normalizedEvents;
-      partial.launchesDetected = this.latestCounts.launches;
-      partial.tradesDetected = this.latestCounts.trades;
-      partial.failedTxObserved = this.latestCounts.failedTransactions;
-      partial.parserErrors = this.latestCounts.malformedPumpEvents;
-      partial.disconnectCount = this.latestCounts.disconnects;
+    if (this.heartbeatFlushInFlight && !force) {
+      this.skippedHeartbeatFlushes += 1;
+      console.warn(`[FirestoreTelemetryReporter] heartbeat flush skipped (previous flush still in-flight, total skipped: ${this.skippedHeartbeatFlushes})`);
+      return;
     }
-    if (this.latestEventAtIso) {
-      partial.latestEventAt = this.latestEventAtIso;
-    }
-
+    this.heartbeatFlushInFlight = true;
     try {
-      await this.backend.setSessionDoc(this.sessionId, partial);
-      if (this.backend.updateActiveLock) {
-        await this.backend.updateActiveLock(this.sessionId, { heartbeatAt: nowIso, status: this.status });
+      const nowIso = new Date().toISOString();
+      const elapsedSec = Math.floor((Date.now() - this.startedAtUnixMs) / 1000);
+
+      const partial: Partial<ResearchSessionDocument> = {
+        status: this.status,
+        lastHeartbeatAt: nowIso,
+        elapsedSec,
+        currentChunk: this.currentChunk,
+        bytesPersisted: this.bytesPersisted,
+        reconnectCount: this.reconnectCount,
+        latestError: this.latestError,
+        skippedStatsFlushes: this.skippedStatsFlushes,
+        skippedHeartbeatFlushes: this.skippedHeartbeatFlushes,
+      };
+
+      if (this.latestCounts) {
+        partial.totalEvents = this.latestCounts.normalizedEvents;
+        partial.launchesDetected = this.latestCounts.launches;
+        partial.tradesDetected = this.latestCounts.trades;
+        partial.failedTxObserved = this.latestCounts.failedTransactions;
+        partial.parserErrors = this.latestCounts.malformedPumpEvents;
+        partial.disconnectCount = this.latestCounts.disconnects;
       }
-    } catch (err) {
-      console.warn("[FirestoreTelemetryReporter] failed to update heartbeat:", err);
+      if (this.latestEventAtIso) {
+        partial.latestEventAt = this.latestEventAtIso;
+      }
+
+      try {
+        await this.backend.setSessionDoc(this.sessionId, partial);
+        if (this.backend.updateActiveLock) {
+          await this.backend.updateActiveLock(this.sessionId, { heartbeatAt: nowIso, status: this.status });
+        }
+      } catch (err) {
+        console.warn("[FirestoreTelemetryReporter] failed to update heartbeat:", err);
+      }
+    } finally {
+      this.heartbeatFlushInFlight = false;
     }
   }
 
-  private async flushStatsNow(): Promise<void> {
+  public async flushStatsNow(force = false): Promise<void> {
+    if (this.closed && !force) return;
+    if (this.statsFlushInFlight) {
+      this.skippedStatsFlushes += 1;
+      console.warn(`[FirestoreTelemetryReporter] stats flush skipped (previous flush still in-flight, total skipped: ${this.skippedStatsFlushes})`);
+      return;
+    }
+    this.statsFlushInFlight = true;
+    try {
     if (this.latestGraduationCounters) {
       try {
         await this.backend.updateStatsDoc(this.sessionId, this.latestGraduationCounters);
@@ -498,6 +568,9 @@ export class FirestoreTelemetryReporter {
           console.warn("[FirestoreTelemetryReporter] failed to save paper trade:", err);
         }
       }
+    }
+    } finally {
+      this.statsFlushInFlight = false;
     }
   }
 }
