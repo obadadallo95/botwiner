@@ -61,6 +61,9 @@ interface CollectorCliOptions {
   readonly ntpHost: string | null;
   readonly ntpIntervalSeconds: number;
   readonly sink: "local" | "cloud";
+  readonly telemetry: "none" | "cloud";
+  readonly telemetryHeartbeatIntervalSeconds: number;
+  readonly telemetryStatsIntervalSeconds: number;
   readonly sessionId: string;
   readonly segmentId: string;
   readonly segmentIndex: number;
@@ -98,6 +101,9 @@ function usage(): string {
     "  --ntp-interval-seconds <n>    Repeat clock-offset sampling (default: 300)",
     "  --disable-ntp                 Record that clock-offset sampling was skipped",
     "  --sink <local|cloud>          Destination sink (default: local or cloud if RESEARCH_SESSION_ID/GCS_BUCKET set)",
+    "  --telemetry <none|cloud>      Publish dashboard telemetry independently of the data sink",
+    "  --telemetry-heartbeat-seconds <n>  Dashboard heartbeat interval (default: 60)",
+    "  --telemetry-stats-seconds <n>      Dashboard stats interval (default: 1800 for local hybrid)",
     "  --session-id <id>             Explicit session identifier",
     "  --help                        Show this help",
   ].join("\n");
@@ -164,6 +170,19 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
     process.env.GCS_BUCKET !== undefined
       ? "cloud"
       : "local";
+  let telemetry: "none" | "cloud" = sink === "cloud" ? "cloud" : "none";
+  let telemetryWasExplicit = process.env.BOTWINER_TELEMETRY !== undefined;
+  if (process.env.BOTWINER_TELEMETRY !== undefined) {
+    if (process.env.BOTWINER_TELEMETRY !== "none" && process.env.BOTWINER_TELEMETRY !== "cloud") {
+      throw new Error(`invalid BOTWINER_TELEMETRY: ${process.env.BOTWINER_TELEMETRY}`);
+    }
+    telemetry = process.env.BOTWINER_TELEMETRY;
+  }
+  const configuredHeartbeatSeconds = process.env.TELEMETRY_HEARTBEAT_INTERVAL_SECONDS ?? process.env.HEARTBEAT_INTERVAL_SECONDS;
+  const configuredStatsSeconds = process.env.TELEMETRY_STATS_INTERVAL_SECONDS ?? process.env.STATS_FLUSH_INTERVAL_SECONDS;
+  let telemetryHeartbeatIntervalSeconds = configuredHeartbeatSeconds === undefined ? 60 : Number(configuredHeartbeatSeconds);
+  let telemetryStatsIntervalSeconds = configuredStatsSeconds === undefined ? 60 : Number(configuredStatsSeconds);
+  let telemetryStatsWasExplicit = configuredStatsSeconds !== undefined;
   let sessionId = process.env.RESEARCH_SESSION_ID ?? basename(outputDirectory);
   let segmentIndex = Number(process.env.RESEARCH_SEGMENT_INDEX ?? "1");
   let segmentDurationSeconds = Number(process.env.RESEARCH_SEGMENT_DURATION_SECONDS ?? "1800");
@@ -208,6 +227,9 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
         ntpHost,
         ntpIntervalSeconds,
         sink,
+        telemetry,
+        telemetryHeartbeatIntervalSeconds,
+        telemetryStatsIntervalSeconds,
         sessionId,
         segmentId,
         segmentIndex,
@@ -332,6 +354,27 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
       index += 1;
       continue;
     }
+    if (argument === "--telemetry") {
+      const t = requireNext(arguments_, index, argument);
+      if (t !== "none" && t !== "cloud") throw new Error(`invalid telemetry: ${t}`);
+      telemetry = t;
+      telemetryWasExplicit = true;
+      index += 1;
+      continue;
+    }
+    if (argument === "--telemetry-heartbeat-seconds") {
+      const raw = requireNext(arguments_, index, argument);
+      telemetryHeartbeatIntervalSeconds = Number(raw);
+      index += 1;
+      continue;
+    }
+    if (argument === "--telemetry-stats-seconds") {
+      const raw = requireNext(arguments_, index, argument);
+      telemetryStatsIntervalSeconds = Number(raw);
+      telemetryStatsWasExplicit = true;
+      index += 1;
+      continue;
+    }
     if (argument === "--session-id") {
       sessionId = requireNext(arguments_, index, argument);
       index += 1;
@@ -366,6 +409,16 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
   if (!Number.isFinite(ntpIntervalSeconds) || ntpIntervalSeconds < 30) {
     throw new Error("NTP_INTERVAL_SECONDS must be at least 30 seconds");
   }
+  if (!telemetryWasExplicit) telemetry = sink === "cloud" ? "cloud" : "none";
+  if (!telemetryStatsWasExplicit && sink === "local" && telemetry === "cloud") {
+    telemetryStatsIntervalSeconds = 1_800;
+  }
+  if (!Number.isFinite(telemetryHeartbeatIntervalSeconds) || telemetryHeartbeatIntervalSeconds < 5) {
+    throw new Error("telemetry heartbeat interval must be at least 5 seconds");
+  }
+  if (!Number.isFinite(telemetryStatsIntervalSeconds) || telemetryStatsIntervalSeconds < 1) {
+    throw new Error("telemetry stats interval must be at least 1 second");
+  }
   if (endpointLabel.length === 0 || endpointLabel.length > 100 || /[?&#@=\s]/u.test(endpointLabel)) {
     throw new Error("endpoint label must not contain credentials, query parameters, or whitespace");
   }
@@ -399,6 +452,9 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
     ntpHost,
     ntpIntervalSeconds,
     sink,
+    telemetry,
+    telemetryHeartbeatIntervalSeconds,
+    telemetryStatsIntervalSeconds,
     sessionId,
     segmentId,
     segmentIndex,
@@ -542,6 +598,30 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
   const initialChunks: CloudChunkMetadata[] = [];
   const initialDiagnosticChunks: CloudDiagnosticsChunkMetadata[] = [];
 
+  const createTelemetryReporter = (): FirestoreTelemetryReporter =>
+    new FirestoreTelemetryReporter({
+      sessionId: options.sessionId,
+      segmentId: options.segmentId,
+      segmentIndex: options.segmentIndex,
+      totalSegmentsExpected: options.totalSegmentsExpected,
+      mode: process.env.RESEARCH_MODE ?? (options.sink === "local" ? "graduation-research-local" : "graduation-research"),
+      provider: options.feedProvider,
+      region: options.sink === "local" ? "local" : process.env.GCP_REGION ?? "europe-west3",
+      requestedDurationSec: options.logicalDurationSeconds,
+      gcpProjectId: process.env.GCP_PROJECT_ID ?? "your-gcp-project-id",
+      firestoreDatabase: process.env.FIRESTORE_DATABASE ?? "(default)",
+      firestoreOperationTimeoutMs:
+        options.sink === "local"
+          ? (() => {
+              const configured = Number(process.env.TELEMETRY_OPERATION_TIMEOUT_MS ?? "5000");
+              return Number.isFinite(configured) && configured > 0 ? configured : 5_000;
+            })()
+          : undefined,
+      heartbeatIntervalMs: options.telemetryHeartbeatIntervalSeconds * 1000,
+      statsIntervalMs: options.telemetryStatsIntervalSeconds * 1000,
+      writePaperTradesImmediately: options.sink === "cloud",
+    });
+
   if (options.checkpointPath) {
     try {
       console.log(`[Collector] Restoring state from checkpoint: ${options.checkpointPath}`);
@@ -584,31 +664,25 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
     }
   }
 
+  if (options.telemetry === "cloud") {
+    telemetryReporter = createTelemetryReporter();
+    await telemetryReporter.initialize();
+    try {
+      await telemetryReporter.recordSegmentStart({
+        segmentId: options.segmentId,
+        segmentIndex: options.segmentIndex,
+        totalSegmentsExpected: options.totalSegmentsExpected,
+        checkpointPath: options.checkpointPath,
+      });
+    } catch (error) {
+      if (options.sink === "cloud") throw error;
+      console.warn("[Collector] Local capture could not publish telemetry start; continuing locally:", error);
+    }
+  }
+
   if (options.sink === "cloud") {
     const bucket = process.env.GCS_BUCKET ?? "your-gcs-bucket";
     const projectId = process.env.GCP_PROJECT_ID ?? "your-gcp-project-id";
-    telemetryReporter = new FirestoreTelemetryReporter({
-      sessionId: options.sessionId,
-      segmentId: options.segmentId,
-      segmentIndex: options.segmentIndex,
-      totalSegmentsExpected: options.totalSegmentsExpected,
-      mode: process.env.RESEARCH_MODE ?? "graduation-research",
-      provider: options.feedProvider,
-      region: process.env.GCP_REGION ?? "europe-west3",
-      requestedDurationSec: options.logicalDurationSeconds,
-      gcpProjectId: projectId,
-      firestoreDatabase: process.env.FIRESTORE_DATABASE ?? "(default)",
-      heartbeatIntervalMs: Number(process.env.HEARTBEAT_INTERVAL_SECONDS ?? "60") * 1000,
-      statsIntervalMs: Number(process.env.STATS_FLUSH_INTERVAL_SECONDS ?? "60") * 1000,
-    });
-    await telemetryReporter.initialize();
-    await telemetryReporter.recordSegmentStart({
-      segmentId: options.segmentId,
-      segmentIndex: options.segmentIndex,
-      totalSegmentsExpected: options.totalSegmentsExpected,
-      checkpointPath: options.checkpointPath,
-    });
-
     cloudSink = await CloudResearchSink.create({
       directory: options.outputDirectory,
       sessionId: options.sessionId,
@@ -634,7 +708,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       },
     });
     writer = cloudSink;
-    telemetryReporter.markRunning();
+    telemetryReporter?.markRunning();
   } else {
     writer = await DatasetWriter.create({
       directory: options.outputDirectory,
@@ -646,6 +720,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       parsingVersion: PUMP_PARSING_VERSION,
       officialIdlRevision: PUMP_IDL_REVISION,
     });
+    telemetryReporter?.markRunning();
   }
 
   let clockSampleQueue = Promise.resolve();
@@ -929,6 +1004,10 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         programId: PUMP_PROGRAM_ID,
         durationSeconds: options.durationSeconds,
         transport: options.transport,
+        sink: options.sink,
+        telemetry: options.telemetry,
+        telemetryHeartbeatIntervalSeconds: options.telemetryHeartbeatIntervalSeconds,
+        telemetryStatsIntervalSeconds: options.telemetryStatsIntervalSeconds,
       }),
     );
     if (options.transport === "yellowstone-grpc") {

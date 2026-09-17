@@ -157,8 +157,15 @@ export interface FirestoreTelemetryReporterOptions {
   readonly gcpProjectId?: string | undefined;
   readonly firestoreDatabase?: string | undefined;
   readonly backend?: FirestoreBackend | undefined;
+  readonly firestoreOperationTimeoutMs?: number | undefined;
   readonly heartbeatIntervalMs?: number | undefined;
   readonly statsIntervalMs?: number | undefined;
+  /**
+   * Local capture can keep the full event stream on disk while publishing only
+   * periodic summaries. Cloud capture keeps the historical event-driven trade
+   * writes by default; hybrid capture opts into buffered trade writes.
+   */
+  readonly writePaperTradesImmediately?: boolean | undefined;
 }
 
 export class FirestoreTelemetryReporter {
@@ -172,6 +179,8 @@ export class FirestoreTelemetryReporter {
   private readonly totalSegmentsExpected?: number | undefined;
   private readonly backend: FirestoreBackend;
   private readonly heartbeatIntervalMs: number;
+  private readonly statsIntervalMs: number;
+  private readonly writePaperTradesImmediately: boolean;
   private readonly startedAtUnixMs: number;
 
   private status: ResearchSessionStatus = "starting";
@@ -182,6 +191,7 @@ export class FirestoreTelemetryReporter {
   private reconnectCount = 0;
 
   private heartbeatTimer?: NodeJS.Timeout | undefined;
+  private statsTimer?: NodeJS.Timeout | undefined;
   private closed = false;
   private statsFlushInFlight = false;
   private heartbeatFlushInFlight = false;
@@ -206,12 +216,18 @@ export class FirestoreTelemetryReporter {
     this.segmentIndex = options.segmentIndex;
     this.totalSegmentsExpected = options.totalSegmentsExpected;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 60_000;
+    this.statsIntervalMs = options.statsIntervalMs ?? 60_000;
+    this.writePaperTradesImmediately = options.writePaperTradesImmediately ?? true;
     this.startedAtUnixMs = Date.now();
 
     if (options.backend) {
       this.backend = options.backend;
     } else {
-      this.backend = new GoogleFirestoreBackend(options.gcpProjectId, options.firestoreDatabase);
+      this.backend = new GoogleFirestoreBackend(
+        options.gcpProjectId,
+        options.firestoreDatabase,
+        options.firestoreOperationTimeoutMs,
+      );
     }
   }
 
@@ -270,6 +286,7 @@ export class FirestoreTelemetryReporter {
     }
 
     this.startHeartbeat();
+    this.startStatsFlush();
   }
 
   public async recordSegmentStart(metadata: Record<string, unknown> = {}): Promise<void> {
@@ -365,10 +382,14 @@ export class FirestoreTelemetryReporter {
 
   public queuePaperTrade(trade: PaperPosition): void {
     this.pendingPaperTrades.set(`${trade.mint}-${trade.openedAtUnixMs}`, trade);
-    // Write event-driven paper trade immediately
-    this.recordPaperTrade(trade).catch((err) => {
-      console.warn("[FirestoreTelemetryReporter] failed to write paper trade:", err);
-    });
+    if (this.writePaperTradesImmediately) {
+      // Cloud capture preserves event-driven paper-trade writes. Hybrid local
+      // capture buffers them until the periodic summary flush so a transient
+      // Firestore failure cannot add one network request per trade.
+      this.recordPaperTrade(trade).catch((err) => {
+        console.warn("[FirestoreTelemetryReporter] failed to write paper trade:", err);
+      });
+    }
   }
 
   public async recordPaperTrade(trade: PaperPosition): Promise<void> {
@@ -417,6 +438,10 @@ export class FirestoreTelemetryReporter {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = undefined;
+    }
+    if (this.statsTimer) {
+      clearInterval(this.statsTimer);
+      this.statsTimer = undefined;
     }
 
     this.status = finalStatus;
@@ -473,6 +498,10 @@ export class FirestoreTelemetryReporter {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = undefined;
     }
+    if (this.statsTimer) {
+      clearInterval(this.statsTimer);
+      this.statsTimer = undefined;
+    }
 
     const nowIso = new Date().toISOString();
     const elapsedSec = Math.floor((Date.now() - this.startedAtUnixMs) / 1000);
@@ -528,6 +557,16 @@ export class FirestoreTelemetryReporter {
       });
     }, this.heartbeatIntervalMs);
     this.heartbeatTimer.unref?.();
+  }
+
+  private startStatsFlush(): void {
+    if (!Number.isFinite(this.statsIntervalMs) || this.statsIntervalMs <= 0) return;
+    this.statsTimer = setInterval(() => {
+      this.flushStatsNow().catch((err) => {
+        console.warn("[FirestoreTelemetryReporter] stats flush failed:", err);
+      });
+    }, this.statsIntervalMs);
+    this.statsTimer.unref?.();
   }
 
   public async flushHeartbeatNow(force = false): Promise<void> {
@@ -604,10 +643,9 @@ export class FirestoreTelemetryReporter {
     }
 
     if (this.pendingCandidates.size > 0) {
-      const candidatesToFlush = Array.from(this.pendingCandidates.values());
-      this.pendingCandidates.clear();
+      const candidatesToFlush = Array.from(this.pendingCandidates.entries());
 
-      for (const candidate of candidatesToFlush) {
+      for (const [mint, candidate] of candidatesToFlush) {
         try {
           const serializable = {
             mint: candidate.mint,
@@ -629,6 +667,7 @@ export class FirestoreTelemetryReporter {
             updatedAt: new Date().toISOString(),
           };
           await this.backend.setGraduationCandidate(this.sessionId, candidate.mint, serializable);
+          if (this.pendingCandidates.get(mint) === candidate) this.pendingCandidates.delete(mint);
         } catch (err) {
           console.warn(`[FirestoreTelemetryReporter] failed to update candidate ${candidate.mint}:`, err);
         }
@@ -680,10 +719,9 @@ export class FirestoreTelemetryReporter {
     }
 
     if (this.pendingPaperTrades.size > 0 && this.backend.savePaperTradeDoc) {
-      const tradesToFlush = Array.from(this.pendingPaperTrades.values());
-      this.pendingPaperTrades.clear();
+      const tradesToFlush = Array.from(this.pendingPaperTrades.entries());
 
-      for (const trade of tradesToFlush) {
+      for (const [tradeKey, trade] of tradesToFlush) {
         try {
           const tradeId = `${trade.mint}-${trade.openedAtUnixMs}`;
           const serializable = {
@@ -712,6 +750,7 @@ export class FirestoreTelemetryReporter {
             updatedAt: new Date().toISOString(),
           };
           await this.backend.savePaperTradeDoc(this.sessionId, tradeId, serializable);
+          if (this.pendingPaperTrades.get(tradeKey) === trade) this.pendingPaperTrades.delete(tradeKey);
         } catch (err) {
           console.warn("[FirestoreTelemetryReporter] failed to save paper trade:", err);
         }

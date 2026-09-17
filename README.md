@@ -42,6 +42,30 @@ The collector records an SNTP offset sample at startup and every five minutes by
 
 Each session writes `raw.jsonl`, `events.jsonl`, `diagnostics.jsonl`, and `manifest.json`. A disconnect in diagnostics represents a collection gap because standard PubSub has no resume cursor.
 
+### Local capture with the cloud dashboard
+
+The collector can keep the authoritative dataset and paper portfolio state on the laptop while publishing dashboard telemetry to the existing Firestore-backed dashboard. This hybrid mode does not upload the event stream to GCS and telemetry failures do not stop local collection.
+
+Authenticate the local Google application credentials once:
+
+```bash
+gcloud auth application-default login
+```
+
+On macOS, keep the laptop awake for the duration and run a bounded local capture with the free public RPC feed:
+
+```bash
+caffeinate -i pnpm collector:start \
+  --provider public \
+  --sink local \
+  --telemetry cloud \
+  --duration-seconds 21600 \
+  --session-id local-6h \
+  --output data/sessions/local-6h
+```
+
+The cloud dashboard receives a heartbeat every 60 seconds and portfolio, paper-trading, market, and creator summaries every 30 minutes. The complete raw dataset remains under `data/sessions/local-6h` for replay. If the laptop loses connectivity, the collector records the gap and continues reconnecting; if Firestore is unavailable, the local files and in-memory paper portfolios continue independently.
+
 ## Replay and verify
 
 ```bash

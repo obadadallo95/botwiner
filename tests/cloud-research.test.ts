@@ -10,6 +10,7 @@ import {
   type FirestoreBackend,
   type ResearchSessionDocument,
   type GraduationSummaryCounters,
+  type PaperPosition,
 } from "@botwiner/research";
 import {
   CloudResearchSink,
@@ -448,4 +449,86 @@ test("Telemetry serializes the unchanged baseline and publishes all portfolio ac
   assert.ok(backend.paper);
   assert.match(JSON.stringify(backend.paper), /50000000000/);
   assert.equal((backend.portfolios?.portfolios as unknown[]).length, 60);
+});
+
+test("Hybrid telemetry flushes periodic summaries and buffers paper trades", async () => {
+  class HybridBackend extends MockFirestoreBackend {
+    public portfolios: Record<string, unknown> | null = null;
+    public paperTradeWrites = 0;
+
+    public updatePortfolioStatsDoc(_id: string, data: Record<string, unknown>): Promise<void> {
+      this.portfolios = data;
+      return Promise.resolve();
+    }
+
+    public savePaperTradeDoc(): Promise<void> {
+      this.paperTradeWrites += 1;
+      return Promise.resolve();
+    }
+  }
+
+  const backend = new HybridBackend();
+  const reporter = new FirestoreTelemetryReporter({
+    sessionId: "hybrid-telemetry-test",
+    mode: "graduation-research-local",
+    provider: "public",
+    region: "local",
+    requestedDurationSec: 60,
+    backend,
+    heartbeatIntervalMs: 1_000,
+    statsIntervalMs: 10,
+    writePaperTradesImmediately: false,
+  });
+
+  await reporter.initialize();
+  reporter.updatePortfolioStats(new MultiPortfolioEngine().summary(true));
+  const paperTrade = {
+    strategyId: "organic-50sol-continuation-v1",
+    mint: "hybrid-mint",
+    openedAtUnixMs: 1_700_000_000_000,
+    triggerAtUnixMs: 1_700_000_000_000,
+    triggerState: {
+      timestampUnixMs: 1_700_000_000_000,
+      mint: "hybrid-mint",
+      launchTimestampUnixMs: 1_700_000_000_000,
+      tokenAgeMs: 5_000,
+      realSolLamports: "50000000000",
+      virtualSolLamports: "30000000000",
+      virtualTokenBaseUnits: "1073000000000000",
+      tradeCount: 5,
+      buyCount: 3,
+      sellCount: 2,
+      creatorWallet: "creator",
+      classificationAtTrigger: "organic",
+    },
+    entryReserves: {
+      virtualSolLamports: 30_000_000_000n,
+      virtualTokenBaseUnits: 1_073_000_000_000_000n,
+      realSolLamports: 50_000_000_000n,
+    },
+    curveSolInputLamports: 100_000_000n,
+    entryPumpFeeLamports: 950_000n,
+    entryTxCostLamports: 5_000n,
+    totalWalletOutflowLamports: 100_955_000n,
+    tokenQuantity: 1_000_000n,
+    currentExecutableGrossValueLamports: 100_000_000n,
+    currentEstimatedNetLiquidationValueLamports: 99_000_000n,
+    unrealizedGrossPnlLamports: 0n,
+    unrealizedNetPnlLamports: 0n,
+    unrealizedNetReturnPct: 0,
+    maxFavorableExcursionPct: 0,
+    maxAdverseExcursionPct: 0,
+    lastUpdatedUnixMs: 1_700_000_000_000,
+    status: "open",
+  } as PaperPosition;
+
+  reporter.queuePaperTrade(paperTrade);
+  assert.equal(backend.paperTradeWrites, 0);
+
+  for (let attempt = 0; attempt < 20 && backend.portfolios === null; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(backend.portfolios, "periodic stats flush should publish portfolio state");
+  assert.equal(backend.paperTradeWrites, 1, "buffered paper trade should flush with the periodic summary");
+  await reporter.close("completed");
 });
