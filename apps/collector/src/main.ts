@@ -1087,18 +1087,21 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       portfolios.onSessionEnd();
     }
 
-    if (telemetryReporter !== null) {
-      updatePortfolioTelemetry();
-      telemetryReporter.updatePaperStats(paperTradingEngine.getStats());
-      telemetryReporter.updateMarketParticipantStats(traderPnlTracker.getStats());
-    }
-
     const finalStatus = isCleanSegmentComplete ? "complete" : "aborted";
     try {
       await writer.close(finalStatus);
     } catch (storageErr) {
       storageShutdownError = storageErr;
       console.error("[Collector] Storage shutdown error:", storageErr);
+    }
+
+    if (telemetryReporter !== null) {
+      // The writer queue updates counts while it drains. Refresh telemetry
+      // after close so the final dashboard summary includes the last record.
+      telemetryReporter.updateTelemetry(writer.snapshotCounts(), graduationTracker.getSummaryCounters());
+      telemetryReporter.updatePortfolioStats(portfolios.summary(true));
+      telemetryReporter.updatePaperStats(paperTradingEngine.getStats());
+      telemetryReporter.updateMarketParticipantStats(traderPnlTracker.getStats());
     }
 
     let checkpointGcsPath: string | undefined;
