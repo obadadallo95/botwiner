@@ -9,4 +9,5 @@ data/
 !.env.example
 .DS_Store
 .firebase/
+.firebaserc
 .cache/

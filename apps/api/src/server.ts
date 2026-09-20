@@ -18,8 +18,6 @@ app.use((_req, res, next) => {
 
 // Restricted CORS
 const ALLOWED_ORIGINS = new Set([
-  "https://example.invalid/your-dashboard",
-  "https://your-project-id.firebaseapp.com",
   "http://localhost:5173",
   "http://localhost:3000",
   "http://localhost:8080",
@@ -42,10 +40,28 @@ app.use(
 
 app.use(express.json());
 
-const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID ?? "your-gcp-project-id";
+const configuredGcpProjectId = process.env.GCP_PROJECT_ID?.trim();
+const configuredGcsBucket = process.env.GCS_BUCKET?.trim();
+// Keep module initialization usable for local read-only development. Cloud
+// session routes fail closed until the operator supplies their own values.
+const GCP_PROJECT_ID = configuredGcpProjectId || "local-dev";
 const GCP_REGION = process.env.GCP_REGION ?? "europe-west3";
-const GCS_BUCKET = process.env.GCS_BUCKET ?? "your-gcs-bucket";
+const GCS_BUCKET = configuredGcsBucket || "local-dev-bucket";
 const JOB_NAME = process.env.CLOUD_RUN_JOB_NAME ?? "pump-collector-runner";
+
+function requireCloudRuntimeConfig(res: Response): boolean {
+  const missing = [
+    configuredGcpProjectId ? null : "GCP_PROJECT_ID",
+    configuredGcsBucket ? null : "GCS_BUCKET",
+  ].filter((name): name is string => name !== null);
+  if (missing.length > 0) {
+    res.status(503).json({
+      error: `Cloud runtime is not configured. Set ${missing.join(" and ")} for your own project before starting a session.`,
+    });
+    return false;
+  }
+  return true;
+}
 
 // Configuration for owner authorization - fail closed if not configured in production
 const OWNER_EMAIL = process.env.OWNER_EMAIL?.trim() || undefined;
@@ -517,6 +533,7 @@ app.get("/api/sessions/:sessionId/segments", requireAuth, async (req, res) => {
 
 // Protected Start Session (with atomic concurrency lock)
 app.post("/api/sessions/start", requireAuth, async (req, res) => {
+  if (!requireCloudRuntimeConfig(res)) return;
   const sessionId = generateCollisionResistantSessionId("session");
   const lockRef = firestore.collection("researchControl").doc("activeSession");
   const sessionRef = firestore.collection("researchSessions").doc(sessionId);
@@ -749,6 +766,7 @@ app.post("/api/sessions/start", requireAuth, async (req, res) => {
 
 // Protected Resume Session (with atomic concurrency lock and durable checkpoint)
 app.post("/api/sessions/:sessionId/resume", requireAuth, async (req, res) => {
+  if (!requireCloudRuntimeConfig(res)) return;
   const rawSessionId = req.params.sessionId;
   const sessionId = typeof rawSessionId === "string" ? rawSessionId.trim() : undefined;
   if (!sessionId) {
@@ -988,6 +1006,7 @@ app.post("/api/sessions/:sessionId/resume", requireAuth, async (req, res) => {
 
 // Protected Stop Session (Authenticates owner, cancels Cloud Run execution, waits for termination, releases lock)
 app.post("/api/sessions/stop", requireAuth, async (req, res) => {
+  if (!requireCloudRuntimeConfig(res)) return;
   try {
     const body = req.body as StopSessionBody;
     const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : undefined;

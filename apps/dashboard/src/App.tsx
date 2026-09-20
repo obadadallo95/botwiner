@@ -4,6 +4,7 @@ import type { PortfolioSummary } from "../../../packages/research/src/portfolio-
 import { useEffect, useState } from "react";
 import {
   auth,
+  firebaseEnabled,
   googleProvider,
   signInWithPopup,
   signOut,
@@ -17,6 +18,9 @@ import {
   onSnapshot,
   type User,
 } from "./firebase.js";
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL?.trim().replace(/\/+$/u, "") ?? "";
+const apiUrl = (path: string): string => `${API_BASE_URL}${path}`;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -390,6 +394,10 @@ export default function App() {
 
   // Auth listener
   useEffect(() => {
+    if (!auth) {
+      setUser(null);
+      return;
+    }
     return onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
     });
@@ -404,7 +412,7 @@ export default function App() {
       if (!token) return;
 
       try {
-        const statusRes = await fetch("/api/sessions/status", {
+        const statusRes = await fetch(apiUrl("/api/sessions/status"), {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (statusRes.ok) {
@@ -414,7 +422,7 @@ export default function App() {
           }
         }
 
-        const historyRes = await fetch("/api/sessions/history", {
+        const historyRes = await fetch(apiUrl("/api/sessions/history"), {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (historyRes.ok) {
@@ -426,7 +434,7 @@ export default function App() {
 
         if (activeSession) {
           const statsRes = await fetch(
-            `/api/sessions/${activeSession.sessionId}/stats`,
+            apiUrl(`/api/sessions/${activeSession.sessionId}/stats`),
             { headers: { Authorization: `Bearer ${token}` } }
           );
           if (statsRes.ok) {
@@ -435,7 +443,7 @@ export default function App() {
           }
 
           const gradsRes = await fetch(
-            `/api/sessions/${activeSession.sessionId}/graduations`,
+            apiUrl(`/api/sessions/${activeSession.sessionId}/graduations`),
             { headers: { Authorization: `Bearer ${token}` } }
           );
           if (gradsRes.ok) {
@@ -444,7 +452,7 @@ export default function App() {
           }
 
           const portfoliosRes = await fetch(
-            `/api/sessions/${activeSession.sessionId}/stats/portfolios`,
+            apiUrl(`/api/sessions/${activeSession.sessionId}/stats/portfolios`),
             { headers: { Authorization: `Bearer ${token}` } }
           );
           if (portfoliosRes.ok) {
@@ -453,7 +461,7 @@ export default function App() {
           }
 
           const paperRes = await fetch(
-            `/api/sessions/${activeSession.sessionId}/stats/paper-trading`,
+            apiUrl(`/api/sessions/${activeSession.sessionId}/stats/paper-trading`),
             { headers: { Authorization: `Bearer ${token}` } }
           );
           if (paperRes.ok) {
@@ -462,7 +470,7 @@ export default function App() {
           }
 
           const marketRes = await fetch(
-            `/api/sessions/${activeSession.sessionId}/stats/market-pnl`,
+            apiUrl(`/api/sessions/${activeSession.sessionId}/stats/market-pnl`),
             { headers: { Authorization: `Bearer ${token}` } }
           );
           if (marketRes.ok) {
@@ -471,7 +479,7 @@ export default function App() {
           }
 
           const creatorRes = await fetch(
-            `/api/sessions/${activeSession.sessionId}/stats/creator-analytics`,
+            apiUrl(`/api/sessions/${activeSession.sessionId}/stats/creator-analytics`),
             { headers: { Authorization: `Bearer ${token}` } }
           );
           if (creatorRes.ok) {
@@ -480,7 +488,7 @@ export default function App() {
           }
 
           const tradesRes = await fetch(
-            `/api/sessions/${activeSession.sessionId}/paper-trades`,
+            apiUrl(`/api/sessions/${activeSession.sessionId}/paper-trades`),
             { headers: { Authorization: `Bearer ${token}` } }
           );
           if (tradesRes.ok) {
@@ -506,6 +514,7 @@ export default function App() {
 
   // Firestore live listeners
   useEffect(() => {
+    if (!firebaseEnabled || !db) return;
     const sessionsRef = collection(db, "researchSessions");
     const q = query(sessionsRef, orderBy("startedAt", "desc"), limit(20));
 
@@ -532,7 +541,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!activeSession) {
+    if (!firebaseEnabled || !db || !activeSession) {
       setGradStats(null);
       setPaperStats(null);
       setPortfolioStats(null);
@@ -621,6 +630,11 @@ export default function App() {
   }, [activeSession?.sessionId]);
 
   const handleSignIn = async () => {
+    if (!auth || !googleProvider) {
+      setTokenInput(authToken);
+      setIsTokenModalOpen(true);
+      return;
+    }
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
@@ -629,6 +643,7 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
+    if (!auth) return;
     try {
       await signOut(auth);
     } catch (err) {
@@ -643,7 +658,7 @@ export default function App() {
       const token = await getEffectiveToken();
       if (!token) throw new Error("Authorization required. Please sign in or provide a token.");
 
-      const response = await fetch("/api/sessions/start", {
+      const response = await fetch(apiUrl("/api/sessions/start"), {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
@@ -674,7 +689,7 @@ export default function App() {
     try {
       const token = await getEffectiveToken();
       if (!token) throw new Error("Authorization required. Please sign in or provide a token.");
-      const response = await fetch(`/api/sessions/${sessionId}/resume`, {
+      const response = await fetch(apiUrl(`/api/sessions/${sessionId}/resume`), {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       });
@@ -712,7 +727,7 @@ export default function App() {
         const sessId = selectedSession.sessionId;
 
         // Fetch segments
-        void fetch(`/api/sessions/${sessId}/segments`, { headers })
+        void fetch(apiUrl(`/api/sessions/${sessId}/segments`), { headers })
           .then(async (r) => (r.ok ? (r.json() as Promise<{ segments?: SegmentDoc[] }>) : { segments: [] }))
           .then((data: { segments?: SegmentDoc[] }) => {
             if (isMounted && data.segments) setSessionSegments(data.segments);
@@ -721,35 +736,35 @@ export default function App() {
 
         // If this is a historical session, load detailed analytics on-demand
         if (sessId !== activeSession?.sessionId) {
-          void fetch(`/api/sessions/${sessId}/stats/portfolios`, { headers })
+          void fetch(apiUrl(`/api/sessions/${sessId}/stats/portfolios`), { headers })
             .then(async (r) => (r.ok ? (r.json() as Promise<{ portfolios?: PortfolioSummary | null }>) : null))
             .then((data: { portfolios?: PortfolioSummary | null } | null) => {
               if (isMounted && data?.portfolios) setSelectedPortfolioStats(data.portfolios);
             })
             .catch(() => {});
 
-          void fetch(`/api/sessions/${sessId}/stats/paper-trading`, { headers })
+          void fetch(apiUrl(`/api/sessions/${sessId}/stats/paper-trading`), { headers })
             .then(async (r) => (r.ok ? (r.json() as Promise<{ paperTrading?: PaperTradingData | null }>) : null))
             .then((data: { paperTrading?: PaperTradingData | null } | null) => {
               if (isMounted && data?.paperTrading) setSelectedPaperStats(data.paperTrading);
             })
             .catch(() => {});
 
-          void fetch(`/api/sessions/${sessId}/stats/market-pnl`, { headers })
+          void fetch(apiUrl(`/api/sessions/${sessId}/stats/market-pnl`), { headers })
             .then(async (r) => (r.ok ? (r.json() as Promise<{ marketPnl?: MarketParticipantData | null }>) : null))
             .then((data: { marketPnl?: MarketParticipantData | null } | null) => {
               if (isMounted && data?.marketPnl) setSelectedMarketStats(data.marketPnl);
             })
             .catch(() => {});
 
-          void fetch(`/api/sessions/${sessId}/stats/creator-analytics`, { headers })
+          void fetch(apiUrl(`/api/sessions/${sessId}/stats/creator-analytics`), { headers })
             .then(async (r) => (r.ok ? (r.json() as Promise<{ creatorAnalytics?: CreatorAnalyticsData | null }>) : null))
             .then((data: { creatorAnalytics?: CreatorAnalyticsData | null } | null) => {
               if (isMounted && data?.creatorAnalytics) setSelectedCreatorStats(data.creatorAnalytics);
             })
             .catch(() => {});
 
-          void fetch(`/api/sessions/${sessId}/stats`, { headers })
+          void fetch(apiUrl(`/api/sessions/${sessId}/stats`), { headers })
             .then(async (r) => (r.ok ? (r.json() as Promise<{ stats?: GraduationStats | null }>) : null))
             .then((data: { stats?: GraduationStats | null } | null) => {
               if (isMounted && data?.stats) setSelectedGradStats(data.stats);
@@ -772,7 +787,7 @@ export default function App() {
     try {
       const token = await getEffectiveToken();
       if (!token) throw new Error("Authorization required.");
-      const response = await fetch("/api/sessions/stop", {
+      const response = await fetch(apiUrl("/api/sessions/stop"), {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ sessionId }),
@@ -881,13 +896,21 @@ export default function App() {
                 Logout
               </button>
             </div>
-          ) : (
+          ) : firebaseEnabled ? (
             <button className="btn btn-secondary" onClick={handleSignIn} id="btn-login">
               Sign In
             </button>
-          )}
+          ) : null}
         </div>
       </header>
+
+      {!firebaseEnabled && (
+        <div className="warning-box" style={{ marginBottom: "1rem" }}>
+          Firebase is not configured for this dashboard. API polling works with a token from your
+          own project; add the <code>VITE_FIREBASE_*</code> values to a local <code>.env</code> file
+          to enable Google sign-in and live Firestore updates.
+        </div>
+      )}
 
       {/* ── Active session status bar ─────────────────────────────────────────── */}
       {stopError && (
@@ -1980,8 +2003,9 @@ export default function App() {
             </div>
 
             <p style={{ color: "var(--text-secondary)", fontSize: "0.85rem", marginBottom: "1rem" }}>
-              Enter your Firebase ID token or Google ID token. Stored locally and sent in the
-              Authorization header to authenticated API endpoints.
+              Paste a Firebase ID token from your own project. It is stored only in this browser
+              and sent in the Authorization header to your API endpoints. Configure
+              <code> VITE_FIREBASE_*</code> locally to use Google sign-in instead.
             </p>
 
             <textarea

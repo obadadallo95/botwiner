@@ -28,6 +28,30 @@ Install the free open-source dependencies:
 pnpm install
 ```
 
+## Run the dashboard with your own Firebase project
+
+The repository does not include a hosted dashboard URL or a default Firebase
+project. Each operator can use a Firebase project and Firestore database that
+they control.
+
+1. Create a Firebase web app, enable Google sign-in if desired, and apply the
+   rules in `firestore.rules` to that project.
+2. Copy `.env.example` to `.env` and fill in the `VITE_FIREBASE_*` values from
+   the web app configuration. Keep this file local; it is ignored by Git.
+3. Leave `VITE_API_BASE_URL` empty when the API is served through the local
+   Vite proxy, or set it to the URL of your own API deployment.
+4. For authenticated API actions, configure `GCP_PROJECT_ID`, `GCS_BUCKET`,
+   `OWNER_EMAIL` or `OWNER_UID`, and `ALLOWED_ORIGINS` for your own deployment.
+5. Start the dashboard locally:
+
+   ```bash
+   pnpm --dir apps/dashboard dev
+   ```
+
+Without Firebase client settings, the dashboard still builds and can use API
+polling when a token from your own project is entered with **Set Token**. With
+the settings present, Google sign-in and live Firestore listeners are enabled.
+
 ## Collect live data
 
 Run until interrupted:
@@ -50,9 +74,9 @@ The collector records an SNTP offset sample at startup and every five minutes by
 
 Each session writes `raw.jsonl`, `events.jsonl`, `diagnostics.jsonl`, and `manifest.json`. A disconnect in diagnostics represents a collection gap because standard PubSub has no resume cursor.
 
-### Local capture with the cloud dashboard
+### Local capture with an operator-owned dashboard
 
-The collector can keep the authoritative dataset and paper portfolio state on the laptop while publishing dashboard telemetry to the existing Firestore-backed dashboard. This hybrid mode does not upload the event stream to GCS and telemetry failures do not stop local collection.
+The collector can keep the authoritative dataset and paper portfolio state on the laptop while publishing dashboard telemetry to a Firestore database owned by the operator. This hybrid mode does not upload the event stream to GCS and telemetry failures do not stop local collection.
 
 Authenticate the local Google application credentials once:
 
@@ -72,7 +96,7 @@ caffeinate -i pnpm collector:start \
   --output data/sessions/local-6h
 ```
 
-The cloud dashboard receives a heartbeat every 60 seconds and portfolio, paper-trading, market, and creator summaries every 30 minutes. The complete raw dataset remains under `data/sessions/local-6h` for replay. If the laptop loses connectivity, the collector records the gap and continues reconnecting; if Firestore is unavailable, the local files and in-memory paper portfolios continue independently.
+The configured Firestore database receives a heartbeat every 60 seconds and portfolio, paper-trading, market, and creator summaries every 30 minutes. The complete raw dataset remains under `data/sessions/local-6h` for replay. If the laptop loses connectivity, the collector records the gap and continues reconnecting; if Firestore is unavailable, the local files and in-memory paper portfolios continue independently.
 
 ## Replay and verify
 

@@ -83,6 +83,13 @@ interface OrchestratedWindow {
   readonly calibrationId: string;
 }
 
+const configuredGcpProjectId = process.env.GCP_PROJECT_ID?.trim();
+const configuredGcsBucket = process.env.GCS_BUCKET?.trim();
+// Local collection does not need cloud identifiers. Cloud sinks and telemetry
+// are rejected below until the operator supplies their own project settings.
+const gcpProjectId = configuredGcpProjectId ?? "local-dev";
+const gcsBucket = configuredGcsBucket ?? "local-dev-bucket";
+
 function usage(): string {
   return [
     "Usage: pnpm collector:start [options]",
@@ -413,6 +420,12 @@ function parseArguments(arguments_: readonly string[]): CollectorCliOptions {
   if (!telemetryStatsWasExplicit && sink === "local" && telemetry === "cloud") {
     telemetryStatsIntervalSeconds = 1_800;
   }
+  if (sink === "cloud" && (!configuredGcpProjectId || !configuredGcsBucket)) {
+    throw new Error("Cloud collection requires GCP_PROJECT_ID and GCS_BUCKET for your own project");
+  }
+  if (telemetry === "cloud" && !configuredGcpProjectId) {
+    throw new Error("Cloud telemetry requires GCP_PROJECT_ID for your own Firebase/GCP project");
+  }
   if (!Number.isFinite(telemetryHeartbeatIntervalSeconds) || telemetryHeartbeatIntervalSeconds < 5) {
     throw new Error("telemetry heartbeat interval must be at least 5 seconds");
   }
@@ -608,7 +621,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       provider: options.feedProvider,
       region: options.sink === "local" ? "local" : process.env.GCP_REGION ?? "europe-west3",
       requestedDurationSec: options.logicalDurationSeconds,
-      gcpProjectId: process.env.GCP_PROJECT_ID ?? "your-gcp-project-id",
+      gcpProjectId,
       firestoreDatabase: process.env.FIRESTORE_DATABASE ?? "(default)",
       firestoreOperationTimeoutMs:
         options.sink === "local"
@@ -627,9 +640,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       console.log(`[Collector] Restoring state from checkpoint: ${options.checkpointPath}`);
       let rawJson: string;
       if (options.sink === "cloud") {
-        const bucket = process.env.GCS_BUCKET ?? "your-gcs-bucket";
-        const projectId = process.env.GCP_PROJECT_ID ?? "your-gcp-project-id";
-        const buffer = await downloadGcsFile(bucket, options.checkpointPath, projectId);
+        const buffer = await downloadGcsFile(gcsBucket, options.checkpointPath, gcpProjectId);
         rawJson = buffer.toString("utf8");
       } else {
         rawJson = await readFile(resolve(options.checkpointPath), "utf8");
@@ -681,8 +692,6 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
   }
 
   if (options.sink === "cloud") {
-    const bucket = process.env.GCS_BUCKET ?? "your-gcs-bucket";
-    const projectId = process.env.GCP_PROJECT_ID ?? "your-gcp-project-id";
     cloudSink = await CloudResearchSink.create({
       directory: options.outputDirectory,
       sessionId: options.sessionId,
@@ -692,8 +701,8 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
       programId: PUMP_PROGRAM_ID,
       parsingVersion: PUMP_PARSING_VERSION,
       officialIdlRevision: PUMP_IDL_REVISION,
-      gcsBucket: bucket,
-      gcpProjectId: projectId,
+      gcsBucket,
+      gcpProjectId,
       durationSeconds: options.durationSeconds,
       startChunkIndex: initialChunkIndex,
       initialChunks,
@@ -1217,7 +1226,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
         console.log(`[Collector] Dispatching next segment ${nextSegmentIndex}/${options.totalSegmentsExpected} (${nextSegmentId})`);
 
         const { JobsClient } = await import("@google-cloud/run");
-        const projectId = process.env.GCP_PROJECT_ID ?? "your-gcp-project-id";
+        const projectId = gcpProjectId;
         const region = process.env.GCP_REGION ?? "europe-west3";
         const jobName = process.env.CLOUD_RUN_JOB_NAME ?? "pump-collector-runner";
         const jobFullName = `projects/${projectId}/locations/${region}/jobs/${jobName}`;
@@ -1237,7 +1246,7 @@ async function run(options: CollectorCliOptions, orchestratedWindow: Orchestrate
                   { name: "RESEARCH_LOGICAL_DURATION_SECONDS", value: String(options.logicalDurationSeconds) },
                   { name: "RESEARCH_CHECKPOINT_PATH", value: checkpointGcsPath },
                   { name: "RESEARCH_MODE", value: process.env.RESEARCH_MODE ?? "graduation-research" },
-                  { name: "GCS_BUCKET", value: process.env.GCS_BUCKET ?? "your-gcs-bucket" },
+                  { name: "GCS_BUCKET", value: gcsBucket },
                   { name: "GCP_PROJECT_ID", value: projectId },
                   { name: "GCP_REGION", value: region },
                   { name: "BOTWINER_FEED_PROVIDER", value: options.feedProvider },

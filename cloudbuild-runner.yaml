@@ -3,11 +3,13 @@ steps:
     args:
       - 'build'
       - '-t'
-      - 'europe-west3-docker.pkg.dev/your-gcp-project-id/botwiner-repo/pump-collector-runner:latest'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/botwiner-repo/pump-collector-runner:latest'
       - '-f'
       - 'Dockerfile.runner'
       - '.'
 images:
-  - 'europe-west3-docker.pkg.dev/your-gcp-project-id/botwiner-repo/pump-collector-runner:latest'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/botwiner-repo/pump-collector-runner:latest'
 options:
   logging: CLOUD_LOGGING_ONLY
+substitutions:
+  _REGION: europe-west3

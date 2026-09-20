@@ -274,7 +274,7 @@ export async function replayCloudSession(options: ReplayCloudOptions): Promise<R
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   let sessionId = "session-smoke-4c1-20260905192952";
-  let bucketName = "your-gcs-bucket";
+  let bucketName = process.env.GCS_BUCKET?.trim() ?? "";
   let cacheDirectory = ".cache/sessions";
   let outputPath: string | undefined;
 
@@ -292,6 +292,10 @@ async function main(): Promise<void> {
       outputPath = args[i + 1]!;
       i++;
     }
+  }
+
+  if (!bucketName) {
+    throw new Error("A bucket is required. Set GCS_BUCKET for your own project or pass --bucket.");
   }
 
   await replayCloudSession({ sessionId, bucketName, cacheDirectory, outputPath });
