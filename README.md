@@ -2,9 +2,17 @@
 
 Botwiner is a production-minded research system for testing whether an ultra-short-horizon edge exists in the first seconds of newly launched Pump.fun tokens. The correct result may be that no edge survives latency, fees, slippage, and execution uncertainty.
 
+This repository is research-only. It does not contain a trading wallet or a transaction-sending strategy, and the experiments reported here do not justify live trading.
+
+## Research result
+
+The completed capital-aware sweep did not find a stable, executable profit edge in the tested launch-and-exit rules. Idealized last-observation marks can look profitable, but the apparent edge disappears with modest latency and becomes negative when an exit is not freshly observable or migration is unresolved. This is a negative result about the tested hypothesis and data boundary; it is not a claim that every crypto strategy is impossible.
+
+Read the [negative-result report](docs/research/NEGATIVE-RESULT.md) and the [machine-readable scenario summary](docs/research/SCENARIO-SWEEP-2026-09-17.json) for the experiment design, assumptions, and results. The report is intended to help other researchers reproduce the reasoning without treating it as investment advice.
+
 ## Current scope
 
-Phase 1 collects and deterministically replays Pump bonding-curve events. Phase 2 enriches captured signatures with finalized transaction evidence, preserves separate observed and canonical views, records failed-transaction congestion inputs, detects bounded reconnect gaps, and produces a rebuildable feed-quality report. Phase 2.5B adds a controlled same-host, separate-process comparison of public Solana and Helius standard WebSockets. It contains no trading, wallet, private-key, transaction-sending, Telegram, dashboard, or strategy code.
+Phase 1 collects and deterministically replays Pump bonding-curve events. Phase 2 enriches captured signatures with finalized transaction evidence, preserves separate observed and canonical views, records failed-transaction congestion inputs, detects bounded reconnect gaps, and produces a rebuildable feed-quality report. Phase 2.5B adds a controlled same-host, separate-process comparison of public Solana and Helius standard WebSockets. The comparison code contains no trading, wallet, private-key, transaction-sending, or Telegram integration; the repository also includes a read-only research dashboard.
 
 The live source remains Solana standard `logsSubscribe`, filtered by the official Pump program ID. The decoder is pinned to the official Pump IDL revision recorded in each dataset. See [Phase 1](docs/phase-1/ARCHITECTURE.md) and [Phase 2](docs/phase-2/ARCHITECTURE.md).
 

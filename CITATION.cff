@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+title: "Botwiner research: short-horizon Pump launch strategy evaluation"
+message: "If this research or code is useful, please cite the repository and the negative-result report."
+type: software
+authors:
+  - family-names: Dallo
+    given-names: Obada
+repository-code: "https://github.com/obadadallo95/botwiner"
+abstract: >-
+  A reproducible research pipeline for collecting and replaying Pump bonding-curve
+  events, measuring feed quality, and evaluating whether ultra-short-horizon entry
+  and exit rules retain a profit edge after latency, costs, slippage, and exit
+  uncertainty. The reported capital-aware sweep is a negative result: no tested
+  configuration was production-ready under conservative execution assumptions.
+keywords:
+  - Solana
+  - Pump.fun
+  - market-data research
+  - reproducibility
+  - negative result
+license: MIT

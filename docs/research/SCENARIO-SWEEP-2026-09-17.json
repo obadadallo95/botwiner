@@ -1,0 +1,56 @@
+{
+  "experimentDate": "2026-09-17",
+  "repositoryRevision": "7f3ea36726c910813d0718381f4dd3d5ded1ca21",
+  "status": "not-ready",
+  "universe": {
+    "pathsWithAtLeastTwoNativeSolTradeStates": 15467,
+    "cloudPaths": 13687,
+    "localPaths": 1780
+  },
+  "search": {
+    "fixedHorizonCombinations": 1344,
+    "takeProfitStopLossCombinations": 256,
+    "costAudits": 72,
+    "entryThresholdsSol": [0.5, 0.75, 1, 1.5, 2, 3, 5],
+    "positionBudgetsSol": [0.01, 0.025, 0.05, 0.075, 0.1, 0.2, 0.35, 0.5],
+    "entryLatenciesMs": [0, 500, 1000, 2000],
+    "holdingPeriodsSec": [15, 30, 60, 120, 180, 300]
+  },
+  "bestObservedMark": {
+    "thresholdSol": 5,
+    "positionSol": 0.5,
+    "entryLatencyMs": 0,
+    "policy": "hold-15s",
+    "attempts": 3709,
+    "evPerAttemptSol": 0.058183,
+    "roiPct": 11.637,
+    "medianPnlSol": -0.02026,
+    "freshExitPct": 37.854,
+    "conservativeEvPerAttemptSol": -0.291466,
+    "conservativeRoiPct": -58.293
+  },
+  "bestConservativeFixedHorizon": {
+    "thresholdSol": 5,
+    "positionSol": 0.01,
+    "entryLatencyMs": 0,
+    "policy": "hold-15s",
+    "attempts": 3709,
+    "evPerAttemptSol": -0.005941,
+    "roiPct": -59.411,
+    "freshExitPct": 37.854
+  },
+  "latencySensitivity": [
+    {"thresholdSol": 5, "positionSol": 0.1, "policy": "hold-15s", "entryLatencyMs": 0, "markEvPerAttemptSol": 0.013895, "conservativeEvPerAttemptSol": -0.057554},
+    {"thresholdSol": 5, "positionSol": 0.1, "policy": "hold-15s", "entryLatencyMs": 500, "markEvPerAttemptSol": -0.004983, "conservativeEvPerAttemptSol": -0.062774},
+    {"thresholdSol": 5, "positionSol": 0.1, "policy": "hold-15s", "entryLatencyMs": 1000, "markEvPerAttemptSol": -0.004985, "conservativeEvPerAttemptSol": -0.063099},
+    {"thresholdSol": 5, "positionSol": 0.1, "policy": "hold-15s", "entryLatencyMs": 2000, "markEvPerAttemptSol": -0.004447, "conservativeEvPerAttemptSol": -0.062781}
+  ],
+  "assumptions": {
+    "nativeQuote": "SOL",
+    "mediumFixedCostSol": 0.00023,
+    "maxFreshExitGapMs": 5000,
+    "markModel": "last observed curve state at or before the deadline when no fresh state exists",
+    "conservativeModel": "full loss when no fresh state exists by the deadline or migration/exit availability is unresolved",
+    "realTrades": false
+  }
+}
