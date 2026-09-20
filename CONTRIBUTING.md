@@ -21,7 +21,7 @@ into a live trading system.
 
 ## Local checks
 
-Use Node.js 20.10+ and pnpm 11:
+Use Node.js >=22.13 and pnpm 11:
 
 ```bash
 pnpm install --frozen-lockfile

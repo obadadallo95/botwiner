@@ -38,8 +38,11 @@ jobs:
       - name: Lint
         run: pnpm lint
 
-      - name: Full check
-        run: pnpm check
+      - name: Research demo
+        run: pnpm research:demo
+
+      - name: Research figures are reproducible
+        run: pnpm research:figures && git diff --exit-code -- docs/assets
 
       - name: Build dashboard
         run: pnpm --dir apps/dashboard build

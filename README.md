@@ -4,6 +4,10 @@
 
 [![CI](https://github.com/obadadallo95/botwiner/actions/workflows/ci.yml/badge.svg)](https://github.com/obadadallo95/botwiner/actions/workflows/ci.yml)
 
+**Navigate:** [Result](#research-result) · [Reproduce](#reproduce-in-five-minutes) · [Architecture](#architecture) · [Methodology](#methodology-and-limitations) · [Research artifacts](#research-artifacts) · [Contributing](#contributing) · [Citation](#citation)
+
+Requirements: Node.js **>=22.13** and pnpm **11**.
+
 Botwiner asks a narrow question: when a newly launched Pump.fun token crosses a
 defined bonding-curve threshold, can a small, capital-aware paper portfolio
 enter and exit profitably after latency, curve price impact, fees, stale
@@ -28,9 +32,28 @@ exits had a fresh observation and the conservative treatment was
 **−0.2915 SOL**. At a 5 SOL threshold, 0.1 SOL position, and 15-second hold,
 mark EV moved from **+0.0139 SOL at 0 ms** to **−0.0050 SOL at 500 ms**.
 
+## Key finding in one chart
+
 ![Latency sensitivity](docs/assets/latency-sensitivity.svg)
 
+*For a 5 SOL threshold, 0.1 SOL position, and 15-second hold, the published
+mark EV changed as simulated entry latency increased:*
+
+| Simulated entry latency | Mark EV per attempt |
+| --- | ---: |
+| 0 ms | +0.0139 SOL |
+| 500 ms | −0.0050 SOL |
+| 1,000 ms | −0.0050 SOL |
+| 2,000 ms | −0.0044 SOL |
+
+This is a result for the captured experiment boundary, not a universal claim
+about crypto markets. It shows that the apparent short-horizon mark did not
+survive modest simulated latency.
+
 ![Observed mark versus conservative result](docs/assets/observed-vs-conservative.svg)
+
+*The strongest recorded mark becomes negative when stale or unresolved exits
+are treated conservatively.*
 
 ## Research result
 
@@ -38,7 +61,9 @@ The negative result is a boundary-specific finding, not a claim that every
 crypto strategy is impossible. The tested launch-and-exit rules did not retain
 positive expected value under conservative, execution-aware assumptions. The
 full report preserves the dataset split, causal observation boundary, cost
-model, capital constraints, right-censoring treatment, and threats to validity:
+model, capital constraints, right-censoring treatment, and threats to validity.
+
+## Research artifacts
 
 - [Negative-result paper](docs/research/NEGATIVE-RESULT.md)
 - [Machine-readable scenario sweep](docs/research/SCENARIO-SWEEP-2026-09-17.json)
@@ -59,6 +84,9 @@ the apparent edge and which observations are still missing.
 
 ![Execution-aware research pipeline](docs/assets/research-pipeline.svg)
 
+*Figure: the causal capture boundary, post-hoc enrichment boundary, and
+deterministic simulation path.*
+
 The main path is:
 
 1. **Capture** Solana `logsSubscribe` or optional Yellowstone gRPC evidence.
@@ -74,6 +102,8 @@ Standard WebSocket collection remains the default runtime feed. The
 path; it is not silently used by the default collector.
 
 ![Experimental search space](docs/assets/experimental-search-space.svg)
+
+*Figure: the published sweep size and capital-aware portfolio starting points.*
 
 ## Reproduce in five minutes
 

@@ -12,11 +12,13 @@ observations, and migration uncertainty?
 ## Methodology and scale
 
 - 15,467 token paths with at least two native-SOL trade states;
+- 13,687 cloud paths and 1,780 local paths;
 - 1,344 fixed-horizon combinations;
 - 256 take-profit/stop-loss combinations;
 - 72 cost audits;
 - cloud and local slices evaluated under causal observation boundaries;
-- deterministic replay and capital-aware paper ledgers.
+- deterministic replay and capital-aware paper ledgers;
+- published experiment revision: `7f3ea36726c910813d0718381f4dd3d5ded1ca21`.
 
 ## Result
 
@@ -32,7 +34,8 @@ The study does not measure every provider's completeness, validator-ingress
 latency, bundle membership, landing probability, or alternate-venue migration
 exit. The conservative unresolved-exit treatment is a bound, not a claim that
 every stale observation would lose the entire position. Raw captures are not
-redistributed by default.
+redistributed by default. This is a research artifact, not financial advice,
+and it does not claim universal crypto unprofitability.
 
 ## Reproduction
 
@@ -45,4 +48,6 @@ pnpm check
 Read the [negative-result paper](../research/NEGATIVE-RESULT.md),
 [scenario summary](../research/SCENARIO-SWEEP-2026-09-17.json), and
 [provenance notes](../research/PROVENANCE.md). The exact commit for the
-prepared release is reported with the final repository state; no DOI is claimed.
+prepared release is reported with the final repository state and the
+`research-v1` tag; no DOI is claimed. Zenodo archiving could assign one later,
+but no Zenodo integration is configured.

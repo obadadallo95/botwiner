@@ -2,6 +2,7 @@ cff-version: 1.2.0
 title: "Botwiner: reproducible execution-aware Pump.fun market research"
 message: "If this research or code is useful, please cite the repository and the negative-result report."
 type: software
+version: research-v1
 authors:
   - family-names: Dallo
     given-names: Obada
