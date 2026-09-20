@@ -6,7 +6,7 @@
   "description": "Execution-aware Solana/Pump.fun market research with causal capture, deterministic replay, latency simulation, and a published negative result",
   "packageManager": "pnpm@11.19.0",
   "engines": {
-    "node": ">=20.10"
+    "node": ">=22.13"
   },
   "scripts": {
     "collector:start": "node --import tsx apps/collector/src/main.ts",
