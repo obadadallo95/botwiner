@@ -1,0 +1,33 @@
+name: Research proposal
+description: Propose a falsifiable, reproducible research extension.
+title: "research: "
+labels: [research]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Research question and hypothesis
+      description: State what could be falsified and what outcome would change your view.
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Data and causal boundary
+      description: Identify observations available at decision time versus post-hoc evidence.
+    validations:
+      required: true
+  - type: textarea
+    id: execution
+    attributes:
+      label: Execution assumptions
+      description: Include latency, costs, slippage, freshness, fill, migration, and capital constraints.
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This proposal does not add live trading or wallet signing.
+          required: true

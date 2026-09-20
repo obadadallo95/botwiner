@@ -1,5 +1,9 @@
 # Public RPC versus stronger Solana feeds
 
+> Historical planning note. The later execution-aware sweep is published in
+> [`docs/research/NEGATIVE-RESULT.md`](../research/NEGATIVE-RESULT.md); this
+> document records the feed options and constraints known at the time.
+
 Research date: 2026-09-05. Prices and product terms can change; re-check before any purchase.
 
 | Option | Feed/protocol | Replay/backfill | Timestamp evidence | Mainnet/Europe | Public price/trial | Material value |

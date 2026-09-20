@@ -1,0 +1,32 @@
+name: Data quality report
+description: Report a parser, completeness, ordering, or provenance issue.
+title: "data: "
+labels: [data-quality]
+body:
+  - type: input
+    id: revision
+    attributes:
+      label: Repository revision
+    validations:
+      required: true
+  - type: textarea
+    id: artifact
+    attributes:
+      label: Artifact and provenance
+      description: Identify the sanitized fixture, manifest, or report. Do not upload private raw data.
+    validations:
+      required: true
+  - type: textarea
+    id: issue
+    attributes:
+      label: Observed quality issue
+      description: Explain the mismatch, missing evidence, ordering problem, or hash failure.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Give the smallest safe command or fixture that demonstrates it.
+    validations:
+      required: true

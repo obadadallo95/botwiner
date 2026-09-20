@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "sample-session",
+  "status": "complete",
+  "startedAt": "2026-09-17T00:00:00.000Z",
+  "endedAt": "2026-09-17T00:00:02.000Z",
+  "source": {
+    "transport": "solana-rpc-websocket",
+    "endpointLabel": "example.invalid",
+    "commitment": "processed",
+    "programId": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+  },
+  "parser": {
+    "version": "pump-idl@9c82f61cb711b044a17f770ab8ce9f9bdf78f333:phase1-v1",
+    "officialIdlRevision": "9c82f61cb711b044a17f770ab8ce9f9bdf78f333"
+  },
+  "files": {
+    "raw": "raw.jsonl",
+    "events": "events.jsonl",
+    "diagnostics": "diagnostics.jsonl"
+  },
+  "counts": {
+    "rawNotifications": 2,
+    "normalizedEvents": 2,
+    "launches": 1,
+    "trades": 1,
+    "duplicateEvents": 0,
+    "malformedPumpEvents": 0,
+    "invalidRpcMessages": 0,
+    "failedTransactions": 0,
+    "disconnects": 0
+  },
+  "limitations": [
+    "Small sanitized fixture for pipeline verification; not a market sample."
+  ]
+}

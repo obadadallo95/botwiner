@@ -1,5 +1,8 @@
 # Multi-portfolio deployment validation
 
+> Historical deployment validation record. It is not the final profitability
+> result; see [`docs/research/NEGATIVE-RESULT.md`](../research/NEGATIVE-RESULT.md).
+
 ## Implemented scope
 
 1. Strategies: aggressive-30sol-v1 (30 SOL, 3s, 3 trades), balanced-40sol-v1 (40 SOL, 4s, 4 trades), baseline-50sol-v1 (50 SOL, 5s, 5 trades), conservative-60sol-v1 (60 SOL, 7s, 7 trades). The existing organic-50sol-continuation-v1 fixed 0.10 SOL reference is unchanged.

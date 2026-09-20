@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" role="img" aria-labelledby="title desc">
+  <title id="title">Observed mark versus conservative result</title>
+  <desc id="desc">Comparison of the best observed mark and its conservative treatment.</desc>
+  <rect width="960" height="540" fill="white"/>
+  <style>
+    text { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #243b53; }
+    .title { font-size: 24px; font-weight: 700; fill: #102a43; }
+    .subtitle { font-size: 13px; fill: #627d98; }
+    .axis { font-size: 12px; fill: #627d98; }
+    .label { font-size: 13px; font-weight: 600; }
+    .value { font-size: 14px; font-weight: 700; }
+    .small { font-size: 11px; fill: #627d98; }
+  </style>
+  <text x="48" y="48" class="title">Observed mark vs conservative result</text><text x="48" y="72" class="subtitle">The highest mark row is not the executable result</text><line x1="757.7" y1="150" x2="757.7" y2="395" stroke="#243b53" stroke-dasharray="5 4"/><text x="757.7" y="137" text-anchor="middle" class="axis">0 SOL</text><text x="48" y="189" class="label">Best observed mark</text><rect x="757.7" y="165" width="48.8" height="42" rx="7" fill="#2563eb" opacity="0.92"/><text x="814.5" y="192" text-anchor="start" class="value" fill="#2563eb">+0.0582 SOL</text><text x="48" y="281" class="label">Same row, conservative</text><rect x="513.5" y="257" width="244.2" height="42" rx="7" fill="#c2413b" opacity="0.92"/><text x="505.5" y="284" text-anchor="end" class="value" fill="#c2413b">-0.2915 SOL</text><text x="48" y="425" class="small">Fresh exit observation rate for this row: 37.9%</text><text x="48" y="452" class="small">Source: docs/research/SCENARIO-SWEEP-2026-09-17.json</text>
+</svg>

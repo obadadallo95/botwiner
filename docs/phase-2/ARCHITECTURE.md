@@ -66,16 +66,20 @@ Direct checks found:
 
 Phase 1 replay remained byte-identical with SHA-256 `3b3be3b132f9b582367e2660dddb7a8c6fb5452ea26cd0b368e57fda64036537`.
 
-## Phase 3 decision gate
+## Historical Phase 3 decision gate
 
-A. The current free public-RPC dataset is trustworthy enough to develop data transformations and coarse hypotheses, but not to assert a realizable millisecond/first-slot edge.
+This section records the decision boundary as it stood after the Phase 2
+validation session. It is historical context, not the current project status.
+The subsequent execution-aware sweep is now published in
+[`docs/research/NEGATIVE-RESULT.md`](../research/NEGATIVE-RESULT.md). That
+study evaluated 15,467 token paths with explicit latency, cost, exit-freshness,
+and capital-aware scenarios and found no production-ready edge under its
+conservative assumptions.
 
-B. Missing evidence: independent-feed loss measurement, provider/validator first-arrival timestamps, competitive bundle-auction and separate-transaction tip evidence, an empirical fill/failure model, and exact Pump executable quoting across dynamic fees, Mayhem, and migration.
-
-C. Ordering, memory, default-CU fee calculation, direct-tip detection, and causal file separation are engineering problems now addressed. Silent completeness and low-latency first arrival require different or additional infrastructure. Bundle auction state and realistic landing probability require execution-path evidence not present in standard RPC.
-
-D. Primary blockers are completeness and latency; secondary blockers are execution/failure probability and complete cost/price reconstruction. Canonical ordering itself is available post hoc.
-
-E. Cheapest credible next step: a short simultaneous capture from the existing public WebSocket and an approved two-day Helius LaserStream mainnet trial in Frankfurt, followed by signature/slot/order/arrival comparisons. This requires the user to create a Helius account, obtain approval for the trial, and provide a scoped API key through an environment variable. No sign-up or paid plan has been activated.
-
-F. Verdict: **NO-GO for Phase 3 profitability simulation**. A simulator skeleton could be built, but results would not yet be credible enough for the stated research question.
+The Phase 2 gate correctly identified the evidence still missing from the
+standard feed: independent-feed loss measurement, provider/validator
+first-arrival timestamps, competitive bundle-auction and separate-transaction
+tip evidence, empirical fill/failure behavior, and exact executable quoting
+across dynamic fees, Mayhem, and migration. The final result should be read
+with those limitations; the gate should not be read as saying that the
+simulator was never run.

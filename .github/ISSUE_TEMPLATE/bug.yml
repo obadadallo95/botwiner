@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible software or documentation problem.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not include API keys, wallet addresses that identify a person, or private datasets.
+  - type: input
+    id: revision
+    attributes:
+      label: Repository revision
+      description: Commit SHA or branch where the problem occurs.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Commands, fixture, and smallest input that reproduce the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true

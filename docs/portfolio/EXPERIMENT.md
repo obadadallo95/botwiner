@@ -1,5 +1,8 @@
 # Frozen multi-portfolio experiment v1
 
+> Historical engineering contract. The completed published result is indexed
+> in [`docs/research/NEGATIVE-RESULT.md`](../research/NEGATIVE-RESULT.md).
+
 Evaluation must use one future six-hour Helius capture. Deployment and a short operational smoke test do not start that evaluation. No real trades, wallet signing, paid services, or parameter optimization are introduced. Existing Cloud Run/Firebase/GCS resources are reused; no new resources or billing plans are provisioned.
 
 The prerequisite base is a1dbd24c385814cc0d9c5a88b1de50bb91adc2ba, fetched and verified before implementation.

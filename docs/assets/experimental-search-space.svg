@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" role="img" aria-labelledby="title desc">
+  <title id="title">Experimental search space</title>
+  <desc id="desc">Scale of the published negative-result experiment.</desc>
+  <rect width="960" height="540" fill="white"/>
+  <style>
+    text { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #243b53; }
+    .title { font-size: 24px; font-weight: 700; fill: #102a43; }
+    .subtitle { font-size: 13px; fill: #627d98; }
+    .axis { font-size: 12px; fill: #627d98; }
+    .label { font-size: 13px; font-weight: 600; }
+    .value { font-size: 14px; font-weight: 700; }
+    .small { font-size: 11px; fill: #627d98; }
+  </style>
+  <text x="48" y="48" class="title">Experimental search space</text><text x="48" y="72" class="subtitle">Published capital-aware sweep · 17 September 2026</text><rect x="58" y="135" width="370" height="105" rx="12" fill="#f7fafc" stroke="#d9e2ec"/><text x="82" y="169" class="label">Token paths</text><text x="82" y="211" class="value" style="font-size:30px;fill:#102a43">15,467</text><text x="248" y="211" class="small">cloud + local</text><rect x="488" y="135" width="370" height="105" rx="12" fill="#f7fafc" stroke="#d9e2ec"/><text x="512" y="169" class="label">Fixed horizons</text><text x="512" y="211" class="value" style="font-size:30px;fill:#102a43">1,344</text><text x="678" y="211" class="small">threshold × size × latency × hold</text><rect x="58" y="280" width="370" height="105" rx="12" fill="#f7fafc" stroke="#d9e2ec"/><text x="82" y="314" class="label">TP / SL rows</text><text x="82" y="356" class="value" style="font-size:30px;fill:#102a43">256</text><text x="248" y="356" class="small">strongest candidates</text><rect x="488" y="280" width="370" height="105" rx="12" fill="#f7fafc" stroke="#d9e2ec"/><text x="512" y="314" class="label">Cost audits</text><text x="512" y="356" class="value" style="font-size:30px;fill:#102a43">72</text><text x="678" y="356" class="small">low / medium / high</text><text x="58" y="450" class="axis">Capital-aware starts: 0.5, 1, 2, and 5 SOL · real trades: false</text><text x="58" y="485" class="small">Source: docs/research/SCENARIO-SWEEP-2026-09-17.json</text>
+</svg>
